@@ -15,45 +15,6 @@ sent that should not have been, review output that is wrong or silently empty,
 secrets escaping into logs or prompts, a database that loses work, and model
 spend that runs away. Calibrate against `severity.md` accordingly.
 
-## Architecture map
-
-Ingestion, in the order a change travels:
-
-| Module | Responsibility |
-|---|---|
-| `src/ingestor.rs` | Mailing-list ingestion: lore mirroring and NNTP |
-| `src/nntp.rs` | NNTP protocol |
-| `src/fetcher.rs` | Git-based ingestion: fetches a `base..head` range and emits one event per commit |
-| `src/forge.rs` | Webhook parsing and signature verification for GitHub and GitLab |
-| `src/patch.rs` | Patch parsing |
-| `src/api.rs` | HTTP API, including `/api/submit` and `/api/webhook/{provider}` |
-
-Review, the core loop:
-
-| Module | Responsibility |
-|---|---|
-| `src/reviewer.rs` | Daemon-side orchestration: picks work, prepares a worktree, spawns a worker subprocess, persists the result, queues notifications |
-| `src/local_review.rs` | The worker side and the `sashiko review` local path |
-| `src/worker/prompts.rs` | Builds the workflow state and runs the engine |
-| `src/workflow/` | The generic, project-agnostic stage engine |
-| `src/workflows/` | The actual pipelines, per project |
-| `src/toolbox/` | The tools a stage can call: git grep, log, show, blame, read files, read prompt |
-| `src/ai/` | Provider abstraction, sessions, token budget, truncation, backoff, caching |
-| `src/baseline.rs` | Baseline commit detection |
-| `src/git_ops.rs` | Worktrees, clones, fetches, repository maintenance |
-
-Output and state:
-
-| Module | Responsibility |
-|---|---|
-| `src/db.rs` | All persistence |
-| `src/migrations/` | Schema migrations |
-| `src/email_policy.rs`, `src/email_router.rs` | Who gets told, and whether |
-| `src/worker/email.rs`, `src/worker/patchwork.rs` | Outbox delivery workers |
-| `src/settings.rs` | Configuration |
-| `src/auth.rs`, `src/access.rs` | Identity and capabilities |
-| `src/project.rs` | Which codebase this instance reviews |
-
 ## Core Priorities (Checked on Every Change)
 
 Every review must evaluate the change against this strict priority order:
@@ -93,26 +54,31 @@ authentication is a security boundary.
 Do not demand benchmark data, measurements, or manual test procedures for ordinary
 code, CLI, UI, or bug-fix commits where correctness is clear, nor for changes to
 Sashiko's own self-review prompts (`projects/sashiko/prompts/`, `sashiko_patch_review.rs`),
+nor for subsystem maintainer notes (`projects/*/prompts/maintainers/*.md`) that
+record a subsystem's subjective coding preferences, conventions, or narrowly-scoped
+policies, nor for generated code-notes snapshots (`projects/*/prompts/notes/<set>/`),
 nor for post-triage maintenance tasks (such as periodic upstream fix checks on
 already-triaged open bugs), cross-bug database deduplication against previously
 stored bugs (`DedupSession`, `BUG_DEDUP_LOCK`, `list_all_bugs_for_vector_search`),
 or filtering pre-existing issues out of patch review reports that are not
 exercised by the clean-database patch-review or initial bug-discovery benchmark
-suites (`benchmarks/`). However, any change that can meaningfully
+suites (`projects/*/benchmarks/`). However, any change that can meaningfully
 affect overall Linux AI patch-review or initial bug-discovery quality across the
 board — such as global Linux patch-review or initial bug-discovery stage
 instructions (`linux_patch_review.rs`, `linux_bug.rs`), generic workflow graph
 structure, model parameters, shared verification/deduplication logic, or broad
-Linux prompt changes (`third_party/prompts/`) — must include validation evidence
-in the commit message (either benchmark suite evaluation results or, for targeted
-false-positive prompt refinements, local re-review results on the affected Linux
-patches/series). Note that the JSON files in `benchmarks/` are static
+cross-subsystem Linux prompt changes (`projects/linux/prompts/*.md`, `general.md`) —
+must include validation evidence in the commit message (either benchmark suite
+evaluation results or, for targeted false-positive prompt refinements, local
+re-review results on the affected Linux patches/series). Note that the JSON files in `projects/*/benchmarks/` are static
 ground-truth corpora of known positive bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not store negative/false-positive test cases;
-**never** demand that a prompt or workflow commit modify or add files in the
-`benchmarks/` directory. Flag Linux review-quality changes that provide no
+**never** demand that a prompt or workflow commit modify or add files in
+`projects/*/benchmarks/`. Flag Linux review-quality changes that provide no
 validation evidence in the commit message or risk silent regressions in detection
-rate or precision as **High** severity.
+rate or precision (including over-broad suppression bullets or overly generic
+`paths`/`symbols` triggers in `projects/*/prompts/maintainers/*.md`) as
+**High** severity.
 
 **6. Zero Regressions and No Silent Failures.**
 Avoid regressions in CLI flags, `Settings.toml` parsing, or API contracts.
@@ -125,14 +91,37 @@ Every commit message must meet Sashiko's repository standards:
 - **Real-Name Signed-off-by (DCO):** Every commit must include a
   `Signed-off-by: Full Name <email>` trailer with the author's real human name
   (not a cryptic nickname, single-word handle, username, or AI/bot placeholder).
+- **No `Assisted-by:` or LLM Attribution Trailers:** Commit messages must
+  **never** include `Assisted-by: LLM` (or any `Assisted-by:`, `Generated-by:`,
+  `AI-assisted-by:`, or AI/bot `Co-authored-by:` trailer naming an LLM or coding
+  assistant). It does not matter what tools were used to author the change: the
+  human who signs off with `Signed-off-by:` holds full responsibility and must
+  not share or delegate that responsibility to an LLM.
+- **`Fixes:` Trailer on Bug Fixes:** When a commit repairs a defect introduced
+  by an identifiable earlier commit already in repository history (prior to
+  `Baseline SHA`), it must include a Linux-style `Fixes: <12-char sha> ("<subject>")`
+  trailer in the trailer block immediately before `Signed-off-by:` (plus
+  `Fixes: <project>-<uuid>` when fixing a tracked Sashiko bug). Inspect
+  `<fixes_context>` and verify with `git_blame`, `git_log`, or `git_show` before
+  reporting a missing `Fixes:` trailer at `Low` severity, and use `<fixes_context>`
+  and `git_show` to verify any existing `Fixes:` commit SHA (at least 12 hex
+  characters) and quoted subject (if a SHA is not found in the local repository
+  or via subject search, report at `Low` severity noting it may live in an
+  unindexed tree). Do **not** demand `Fixes:` on new features,
+  refactorings, documentation/prompt/config additions, or commits where no
+  specific introducing commit prior to `Baseline SHA` can be identified with
+  confidence, and **never** ask for a `Fixes:` trailer pointing to an unmerged
+  commit in the same patch series or pull request.
 - **Clear Description (When Non-Trivial):** Non-trivial code, architectural, or
   behavior changes must explain both *what* the change does and *why* it is
   necessary (motivation/rationale), rather than having an empty body or merely
   repeating a complex diff. However, trivial or self-explanatory commits — such
   as adding a mailing list to track, configuring an email policy or subsystem
-  git remote, simple configuration/deployment updates, or typo fixes — are
-  completely self-sufficient with a brief one-sentence description and must NOT
-  be flagged for lacking additional rationale.
+  git remote, adding or updating a subsystem's maintainer note in
+  `projects/*/prompts/maintainers/*.md`, simple configuration/deployment
+  updates, or typo fixes — are completely self-sufficient with a brief
+  one-sentence description and must NOT be flagged for lacking additional
+  rationale.
 - **Formatting & Wrapping:** Commit messages must never use backticks (`) to
   quote code, function names, or variables, and must not contain internal metadata
   tags (such as `TAG=` or `CONV=`). Do NOT nitpick minor line-length overruns
@@ -159,10 +148,11 @@ Evaluate every change for fundamental engineering soundness:
   operating systems. Never report Windows or non-Unix portability concerns (such as
   `tokio::signal::unix`, `rustix`, `/dev/ptmx`, `libc`, or POSIX signals/paths) as
   issues.
-- **Verify against concrete code, not assumptions.** Read the subsystem guide
-  for the area the diff touches and check every invariant. Do not give code the
-  benefit of the doubt: if a check is removed or weakened, verify the caller
-  with tools rather than assuming safety.
+- **Verify against concrete code, not assumptions.** Check the `<maintainer_notes>`
+  and `<code_notes>` for the area the diff touches and verify every invariant
+  against the repository source. Do not give code the benefit of the doubt: if a
+  check is removed or weakened, verify the caller with tools rather than
+  assuming safety.
 - **Never vibe-guess or report build, compilation, or linter bugs.** Whether
   Rust code compiles, type-checks, borrow-checks, and passes lints is verified
   deterministically (`cargo check`, `cargo test`, `cargo clippy`, `cargo fmt`).
@@ -173,8 +163,10 @@ Evaluate every change for fundamental engineering soundness:
   closed enums, Cargo dependency/feature issues, or compiler/clippy lints. If
   you think a patch fails to compile, you have misread the code or missed a
   definition, re-export, macro, or trait impl — do NOT report it. However,
-  *commit message* defects (missing/nickname SOB, missing rationale on
-  non-trivial code changes, unwrapped prose lines > 85 chars, backticks in
-  commit message) are NOT caught by `cargo fmt` and MUST be reported.
+  *commit message* defects (missing/nickname SOB, forbidden `Assisted-by:` / LLM
+  attribution trailers, missing or malformed `Fixes:` trailers on identifiable
+  bug fixes, missing rationale on non-trivial code changes, unwrapped prose
+  lines > 85 chars, backticks in commit message) are NOT caught by `cargo fmt`
+  and MUST be reported.
 - **Prefer one proven finding to three speculative ones.** Every false positive
   spends the author's trust.

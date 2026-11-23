@@ -5,7 +5,10 @@ target/
 review_trees/
 archives/
 third_party/linux/
-benchmarks/smoke-repo/
+third_party/sashiko/
+third_party/gcc/
+third_party/qemu/
+third_party/e2fsprogs/
 benchmarks/runs/
 benchmark_results.json
 *.db

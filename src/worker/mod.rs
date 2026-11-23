@@ -16,6 +16,7 @@
 pub mod bug_worker;
 #[cfg(feature = "server")]
 pub mod email;
+pub mod fixes_check;
 #[cfg(feature = "server")]
 pub mod forge;
 pub mod location_resolver;
@@ -25,6 +26,8 @@ pub mod prefetch;
 pub mod prompts;
 #[cfg(feature = "server")]
 pub mod repack;
+#[cfg(feature = "server")]
+pub mod stats_backfill;
 #[cfg(feature = "server")]
 pub mod sync;
 

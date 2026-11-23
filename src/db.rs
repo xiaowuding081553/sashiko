@@ -15,6 +15,8 @@
 #[cfg(feature = "server")]
 use crate::ReviewStatus;
 #[cfg(feature = "server")]
+use crate::patch::{RevisionStep, SubjectRevision};
+#[cfg(feature = "server")]
 use crate::settings::DatabaseSettings;
 #[cfg(feature = "server")]
 use anyhow::Context;
@@ -29,7 +31,33 @@ use std::str::FromStr;
 #[cfg(feature = "server")]
 use std::sync::Arc;
 #[cfg(feature = "server")]
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+#[cfg(feature = "server")]
+mod patch_lineage;
+#[cfg(feature = "server")]
+mod pipeline_stats;
+#[cfg(feature = "server")]
+pub use pipeline_stats::{
+    CompactPriorStat, CompactStageStat, ExtractSummaryInput, PipelineMultiWindowStats,
+    PipelineWindowAggregate, ReviewPipelineSummary, extract_review_pipeline_summary,
+    normalize_stage_name,
+};
+#[cfg(feature = "server")]
+mod preexisting_disclosures;
+#[cfg(feature = "server")]
+pub use preexisting_disclosures::{NewPreexistingDisclosure, PreexistingDisclosure};
+#[cfg(feature = "server")]
+mod prior_context_queries;
+#[cfg(feature = "server")]
+pub use prior_context_queries::PriorContextOptions;
+#[cfg(feature = "server")]
+mod stats_queries;
+#[cfg(feature = "server")]
+pub use stats_queries::{
+    BugSubsystemFacetSummary, ROLLUP_RESOLUTIONS, RollupBucketRow, RollupRowLimitExceeded,
+    canonical_labels_json, decode_labels_json,
+};
 
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
 /// that have to ask the question of a row they are updating. The two must
@@ -180,8 +208,13 @@ async fn write_patch_if_unchanged(
 }
 
 #[cfg(feature = "server")]
+const READ_POOL_SIZE: usize = 8;
+
+#[cfg(feature = "server")]
 pub struct Database {
     pub conn: libsql::Connection,
+    read_pool: std::sync::Arc<Vec<libsql::Connection>>,
+    read_cursor: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     tx_conn: libsql::Connection,
     tx_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     in_transaction: bool,
@@ -189,6 +222,8 @@ pub struct Database {
     bug_tool: String,
     bug_model: Option<String>,
     bug_claim: Option<BugAnalysisClaim>,
+    patchset_claim: Option<PatchsetReviewClaim>,
+    auto_review: bool,
 }
 
 /// Guards an open transaction on the transaction `libsql::Connection` so
@@ -278,6 +313,31 @@ struct BugAnalysisClaim {
     owner: String,
 }
 
+/// What [`Database::settle_panicked_patch_review`] did with the patch.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanickedPatchOutcome {
+    /// The in-flight review row was failed with the panic message.
+    FailedInFlightReview,
+    /// The review had already completed; it is kept and the patch is
+    /// marked Reviewed.
+    KeptCompletedReview,
+    /// The latest review row is missing or already ended without a
+    /// result; the patch is marked Failed.
+    NoUsableReview,
+    /// The claim was superseded by a rerun or cancellation; nothing changed.
+    Superseded,
+}
+
+/// Ownership of one patchset review attempt, fencing out stale writes if a
+/// concurrent `rerun_patchset` or `cancel_patchset` supersedes the worker.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy)]
+struct PatchsetReviewClaim {
+    patchset_id: i64,
+    generation: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subsystem {
     pub id: i64,
@@ -317,6 +377,15 @@ pub struct PatchsetRow {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    pub priority: Option<i64>,
+}
+
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedToApplyOutcome {
+    MarkedFailedToApply,
+    RequeuedForLateCover,
+    Superseded,
 }
 
 #[cfg(feature = "server")]
@@ -346,9 +415,70 @@ pub struct ReleaseReview {
     pub patch_id: i64,
     pub patch_message_id: String,
     pub index: i64,
+    pub has_inline_review: bool,
     pub inline_review: String,
     pub summary: String,
     pub findings: Vec<serde_json::Value>,
+}
+
+/// A completed review whose patch shares a Git patch ID with the patch
+/// under review. The patch ID is only the index: the caller compares `diff`
+/// byte for byte before trusting the match, because git patch-id ignores
+/// whitespace. Reviews with findings are included so the caller can see
+/// when the newest review of a diff was not clean.
+#[derive(Debug, Clone)]
+pub struct CleanReviewCandidate {
+    pub review_id: i64,
+    pub has_findings: bool,
+    pub patch_id: i64,
+    pub patchset_id: i64,
+    pub patchset_subject: String,
+    pub patchset_version: Option<u32>,
+    pub part_index: i64,
+    pub diff: String,
+    pub model: Option<String>,
+    pub prompts_hash: Option<String>,
+    pub baseline_commit: Option<String>,
+    pub coverage: ReviewCoverage,
+    /// Message-ID of the reviewed patch mail, for finding replies to it.
+    pub patch_message_id: String,
+}
+
+/// How much of the analysis pipeline a review ran.
+///
+/// `review.cheap` and `--stages` both narrow a review without changing
+/// the model or the prompts, so a clean verdict is only as strong as the
+/// coverage of the review that produced it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewCoverage {
+    /// The exploratory analysis stages ran as one combined pass.
+    pub cheap: bool,
+    /// The analysis stages the review was limited to, sorted and
+    /// comma-separated. `None` when it ran them all.
+    pub stages: Option<String>,
+}
+
+impl ReviewCoverage {
+    /// Builds the coverage a worker runs with from its review settings.
+    /// The stage names are sorted so that two spellings of one subset
+    /// compare equal.
+    pub fn new(cheap: bool, stages: Option<&[String]>) -> Self {
+        let stages = stages.map(|names| {
+            let mut names: Vec<&str> = names.iter().map(String::as_str).collect();
+            names.sort_unstable();
+            names.dedup();
+            names.join(",")
+        });
+        Self { cheap, stages }
+    }
+
+    /// Whether a clean verdict from a review with this coverage can stand
+    /// in for a review that would run with `wanted`. A full pass covers a
+    /// cheap one and every stage subset; a cheap pass or a subset covers
+    /// only a review narrowed the same way.
+    pub fn covers(&self, wanted: &Self) -> bool {
+        (!self.cheap || wanted.cheap) && (self.stages.is_none() || self.stages == wanted.stages)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +492,9 @@ pub enum PatchsetReviewOutcome {
 const CLEAN_PATCHSET_PREDICATE: &str = "
     EXISTS (
         SELECT 1 FROM reviews r
-        WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+        WHERE r.patchset_id = p.id
+          AND (r.status = 'Reviewed'
+               OR (r.status = 'Skipped' AND r.inherited_from_review_id IS NOT NULL))
     )
     AND NOT EXISTS (
         SELECT 1 FROM reviews r
@@ -382,13 +514,20 @@ const CLEAN_PATCHSET_PREDICATE: &str = "
           AND (
               SELECT COUNT(*) FROM reviews completed
               WHERE completed.patch_id = pa.id
-                AND completed.status = 'Reviewed'
+                AND (completed.status = 'Reviewed'
+                     OR (completed.status = 'Skipped'
+                         AND completed.inherited_from_review_id IS NOT NULL))
           ) < COALESCE(p.target_review_count, 1)
     )
     AND NOT EXISTS (
         SELECT 1 FROM reviews r
         JOIN findings f ON f.review_id = r.id
         WHERE r.patchset_id = p.id AND r.status = 'Reviewed'
+    )
+    AND NOT EXISTS (
+        SELECT 1 FROM patches pd
+        JOIN preexisting_disclosures d ON d.patch_message_id = pd.message_id
+        WHERE pd.patchset_id = p.id AND d.disclosed_at IS NULL
     )";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -487,6 +626,116 @@ impl Severity {
         } else {
             Severity::Unknown
         }
+    }
+}
+
+/// How a related pre-existing bug relates to the patch under review.
+///
+/// Serialized in PascalCase where reviews exchange it (`"SameCode"`), and
+/// stored in snake case in `preexisting_disclosures.relation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisclosureRelation {
+    /// The bug sits in code the patch touches.
+    SameCode,
+    /// The bug repeats the defect the patch fixes elsewhere.
+    SamePattern,
+    /// Related in some other way the review explained.
+    Other,
+}
+
+impl DisclosureRelation {
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            Self::SameCode => "same_code",
+            Self::SamePattern => "same_pattern",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn from_db_str(raw: &str) -> Result<Self> {
+        match raw {
+            "same_code" => Ok(Self::SameCode),
+            "same_pattern" => Ok(Self::SamePattern),
+            "other" => Ok(Self::Other),
+            _ => bail!("unknown pre-existing disclosure relation {raw:?}"),
+        }
+    }
+}
+
+/// Lowest severity a finding must have to pass a threshold.
+///
+/// Unlike [`Severity`], it has no `Unknown` variant: a threshold always names
+/// a real level. Text forms are matched case-insensitively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SeverityFloor {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+impl SeverityFloor {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
+    fn as_severity(self) -> Severity {
+        match self {
+            Self::Low => Severity::Low,
+            Self::Medium => Severity::Medium,
+            Self::High => Severity::High,
+            Self::Critical => Severity::Critical,
+        }
+    }
+
+    /// Whether `severity` is at or above this floor. `Unknown` never passes.
+    pub fn admits(self, severity: Severity) -> bool {
+        severity != Severity::Unknown && severity >= self.as_severity()
+    }
+}
+
+impl std::fmt::Display for SeverityFloor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SeverityFloor {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            _ => Err(format!(
+                "invalid severity {raw:?}: expected one of \"low\", \"medium\", \"high\", \"critical\""
+            )),
+        }
+    }
+}
+
+impl Serialize for SeverityFloor {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SeverityFloor {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -739,6 +988,117 @@ impl Bug {
         None
     }
 
+    pub fn security_evaluation(&self) -> Option<crate::security_eval::SecurityEvaluation> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+                && let Ok(eval) =
+                    serde_json::from_value::<crate::security_eval::SecurityEvaluation>(data.clone())
+            {
+                return Some(eval);
+            }
+        }
+        None
+    }
+
+    pub fn security_score_tenths(&self) -> Option<u8> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+            {
+                let raw = data
+                    .get("score_tenths")
+                    .or_else(|| data.get("security_score_tenths"))
+                    .and_then(|v| v.as_u64());
+                if let Some(val) = raw.and_then(|v| u8::try_from(v).ok())
+                    && val <= 100
+                {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn security_score(&self) -> Option<f64> {
+        self.security_score_tenths()
+            .map(|tenths| f64::from(tenths) / 10.0)
+    }
+
+    pub fn security_rating(&self) -> Option<crate::security_eval::SecurityRating> {
+        self.security_score_tenths()
+            .map(crate::security_eval::SecurityRating::from_score_tenths)
+    }
+
+    pub fn security_class(&self) -> Option<crate::security_eval::SecurityClass> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+                && let Some(cls_str) = data.get("security_class").and_then(|v| v.as_str())
+                && let Ok(cls) = cls_str.parse::<crate::security_eval::SecurityClass>()
+            {
+                return Some(cls);
+            }
+        }
+        None
+    }
+
+    pub fn cvss_vector(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation"
+                && let Some(ref data) = e.data_json
+            {
+                return data
+                    .get("cvss_vector")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+        }
+        None
+    }
+
+    pub fn security_summary(&self) -> Option<String> {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation" {
+                if let Some(content) = e
+                    .content
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    return Some(content.to_string());
+                }
+                if let Some(ref data) = e.data_json
+                    && let Some(summary) = data
+                        .get("summary")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    return Some(summary.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn security_eval_requested(&self) -> bool {
+        for e in self.enrichments.iter().rev() {
+            if e.kind == "security_evaluation" {
+                return false;
+            }
+            if e.kind == "audit"
+                && let Some(ref data) = e.data_json
+                && data.get("field").and_then(|v| v.as_str()) == Some("security_evaluation")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn description(&self) -> Option<String> {
         for e in self.enrichments.iter().rev() {
             if e.kind == "report"
@@ -800,6 +1160,36 @@ impl Bug {
             }
         }
         None
+    }
+
+    /// The files a bug is attributed by: the latest verification's or
+    /// deduplication's `source_files`, else the ones filed with the candidate.
+    /// Unlike [`Bug::source_files`], this also covers bugs folded during
+    /// deduplication or not yet verified.
+    pub fn attributable_files(&self) -> Option<Vec<String>> {
+        self.source_files()
+            .or_else(|| {
+                self.enrichments.iter().rev().find_map(|e| {
+                    if e.kind != "deduplication" {
+                        return None;
+                    }
+                    e.data_json
+                        .as_ref()?
+                        .get("source_files")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                })
+            })
+            .or_else(|| {
+                self.enrichments.iter().find_map(|e| {
+                    if e.kind != "candidate" && e.kind != "raw_candidate" {
+                        return None;
+                    }
+                    e.data_json
+                        .as_ref()?
+                        .get("source_files")
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                })
+            })
     }
 
     pub fn introduced_in_commit(&self) -> Option<String> {
@@ -977,9 +1367,10 @@ pub struct NewBug {
 
 /// Where a subsystem name attached to a bug came from.
 ///
-/// Only [`SubsystemSource::MaintainersSection`] identifies a real kernel
-/// maintainer, so only that variant can confer access to a bug. The other two
-/// are useful for display and filtering and confer nothing.
+/// Only [`SubsystemSource::MaintainersSection`] and
+/// [`SubsystemSource::UpstreamGrant`] name real kernel maintainers, so only
+/// they can confer access to a bug. The other two are useful for display and
+/// filtering and confer nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubsystemSource {
@@ -988,9 +1379,21 @@ pub enum SubsystemSource {
     /// A directory prefix derived from the touched paths, or the `kernel`
     /// sentinel used when nothing more specific could be determined.
     PathPrefix,
+    /// A MAINTAINERS section title whose maintainers hold an upstream grant
+    /// (`upstream_maintainers.toml`) over the touched files. Confers the same
+    /// access as a MAINTAINERS match. Never deserialized, so no payload or
+    /// stored JSON can claim it: only code holding the index produces it, and
+    /// it is stored in its own tables rather than in a `source` column.
+    #[serde(skip_deserializing)]
+    UpstreamGrant,
     /// Supplied verbatim by whoever filed the bug. The default, because a name
     /// of unknown origin must not be mistaken for a maintainer's jurisdiction.
+    /// Any unrecognised value deserializes to this, including
+    /// `upstream_grant`, so a serialized attribution read back loses its
+    /// authority rather than failing to parse.
     #[default]
+    // Last, because serde requires the catch-all variant to be last.
+    #[serde(other)]
     CallerSupplied,
 }
 
@@ -1000,11 +1403,13 @@ impl SubsystemSource {
             Self::MaintainersSection => "maintainers_section",
             Self::PathPrefix => "path_prefix",
             Self::CallerSupplied => "caller_supplied",
+            Self::UpstreamGrant => "upstream_grant",
         }
     }
 
     /// Parses a stored value, treating anything unrecognised as caller
-    /// supplied so that an unexpected string cannot widen access.
+    /// supplied so that an unexpected string cannot widen access. Grant rows
+    /// live in their own tables and are never read through this.
     pub fn from_stored(value: &str) -> Self {
         match value {
             "maintainers_section" => Self::MaintainersSection,
@@ -1016,7 +1421,7 @@ impl SubsystemSource {
     /// Whether a row with this provenance can grant a maintainer access to the
     /// bug it is attached to.
     pub fn confers_authority(&self) -> bool {
-        matches!(self, Self::MaintainersSection)
+        matches!(self, Self::MaintainersSection | Self::UpstreamGrant)
     }
 }
 
@@ -1038,6 +1443,59 @@ const UPSERT_BUG_SUBSYSTEM_SQL: &str = "INSERT INTO bug_subsystems (bug_id, subs
 const UPSERT_PATCHSET_SECTION_SQL: &str = "INSERT INTO patchset_maintainer_sections (patchset_id, subsystem, source) \
      VALUES (?, ?, ?) \
      ON CONFLICT(patchset_id, subsystem) DO UPDATE SET source = excluded.source";
+
+/// Records an upstream grant section on a bug. Grant rows carry no source
+/// column: being in this table is what makes them grant rows.
+#[cfg(feature = "server")]
+const INSERT_BUG_UPSTREAM_SECTION_SQL: &str =
+    "INSERT OR IGNORE INTO bug_upstream_sections (bug_id, subsystem) VALUES (?, ?)";
+
+/// The same statement for a patchset, kept separate for the reason given on
+/// [`UPSERT_PATCHSET_SECTION_SQL`].
+#[cfg(feature = "server")]
+const INSERT_PATCHSET_UPSTREAM_SECTION_SQL: &str =
+    "INSERT OR IGNORE INTO patchset_upstream_sections (patchset_id, subsystem) VALUES (?, ?)";
+
+/// The ids of bugs attributed to any of `n` section titles, through either a
+/// MAINTAINERS row or an upstream grant row. Takes `2 * n` parameters: the
+/// titles, then the same titles again.
+#[cfg(feature = "server")]
+fn authorized_bug_ids_subquery(n: usize) -> String {
+    let placeholders = vec!["?"; n].join(", ");
+    format!(
+        "SELECT bug_id FROM bug_subsystems
+          WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({placeholders})
+         UNION
+         SELECT bug_id FROM bug_upstream_sections
+          WHERE subsystem COLLATE NOCASE IN ({placeholders})",
+        SubsystemSource::MaintainersSection.as_str(),
+    )
+}
+
+/// Splits an attribution into the rows for the `source`-carrying table and
+/// the upstream grant titles, trimmed, without empties or duplicates.
+#[cfg(feature = "server")]
+fn split_upstream_grants(
+    sections: &[AttributedSubsystem],
+) -> (
+    std::collections::BTreeMap<&str, SubsystemSource>,
+    std::collections::BTreeSet<&str>,
+) {
+    let mut owned = std::collections::BTreeMap::new();
+    let mut granted = std::collections::BTreeSet::new();
+    for section in sections {
+        let name = section.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if section.source == SubsystemSource::UpstreamGrant {
+            granted.insert(name);
+        } else {
+            owned.insert(name, section.source);
+        }
+    }
+    (owned, granted)
+}
 
 /// A subsystem name together with the provenance of that name.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1063,6 +1521,12 @@ impl AttributedSubsystem {
     /// A directory prefix or sentinel derived from the touched paths.
     pub fn from_path_prefix(name: impl Into<String>) -> Self {
         Self::new(name, SubsystemSource::PathPrefix)
+    }
+
+    /// A section whose maintainers hold an upstream grant over the touched
+    /// paths.
+    pub fn from_upstream_grant(name: impl Into<String>) -> Self {
+        Self::new(name, SubsystemSource::UpstreamGrant)
     }
 }
 
@@ -1197,6 +1661,20 @@ pub struct UpstreamFixCheckParams<'a> {
     pub tokens_cached: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SecurityEvaluationRecordParams<'a> {
+    pub evaluation: &'a crate::security_eval::SecurityEvaluation,
+    pub logs: Option<&'a str>,
+    pub tokens_in: Option<usize>,
+    pub tokens_out: Option<usize>,
+    pub tokens_cached: Option<usize>,
+    /// Clears `locked_by` and `lease_expires_at` inside the same transaction
+    /// when `true`. Callers holding an outer analysis lease (such as
+    /// `BugWorker::process_claimed_bug`) pass `false` and release their lease
+    /// on exit.
+    pub release_lease: bool,
+}
+
 /// Which bugs a listing may return.
 ///
 /// The default is the empty scope rather than everything: a caller that forgets
@@ -1224,6 +1702,8 @@ pub struct ListBugsParams<'a> {
     pub page: Option<u32>,
     pub limit: Option<u32>,
     pub min_severity: Option<Severity>,
+    pub min_security_score_tenths: Option<u8>,
+    pub security_classes: Option<&'a [crate::security_eval::SecurityClass]>,
     pub subsystem: Option<&'a str>,
     pub subsystems: Option<&'a [String]>,
     pub lifecycle_status: Option<BugLifecycleStatus>,
@@ -1271,6 +1751,10 @@ pub enum EmailKind {
     /// A review result or a patchwork notification, tied to a patch.
     #[default]
     ReviewNotification,
+    /// A consolidated review summary for a multi-patch series, tied to a patchset.
+    PatchsetSummary,
+    /// An opt-in notification that a patchset failed to apply or failed review.
+    PatchsetFailure,
     /// A sign-in link, tied to a person.
     SignInLink,
     /// A notice to the person a bug was just assigned to.
@@ -1284,17 +1768,31 @@ impl EmailKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EmailKind::ReviewNotification => "review_notification",
+            EmailKind::PatchsetSummary => "patchset_summary",
+            EmailKind::PatchsetFailure => "patchset_failure",
             EmailKind::SignInLink => "sign_in_link",
             EmailKind::BugAssignment => "bug_assignment",
             EmailKind::Unrecognized => "unrecognized",
         }
     }
 
+    /// True for replies posted into a patch or series mailing-list thread
+    /// (as opposed to transactional emails sent directly to a person).
+    pub fn is_review_thread_reply(self) -> bool {
+        matches!(
+            self,
+            EmailKind::ReviewNotification | EmailKind::PatchsetSummary | EmailKind::PatchsetFailure
+        )
+    }
+
     /// The List-Id label for email sent to a person rather than to a patch's
     /// thread, or None for review notifications.
     pub fn transactional_list_label(self) -> Option<&'static str> {
         match self {
-            EmailKind::ReviewNotification | EmailKind::Unrecognized => None,
+            EmailKind::ReviewNotification
+            | EmailKind::PatchsetSummary
+            | EmailKind::PatchsetFailure
+            | EmailKind::Unrecognized => None,
             EmailKind::SignInLink => Some("sashiko-auth"),
             EmailKind::BugAssignment => Some("sashiko-bugs"),
         }
@@ -1309,6 +1807,8 @@ impl EmailKind {
             "sign_in_link" => EmailKind::SignInLink,
             "bug_assignment" => EmailKind::BugAssignment,
             "review_notification" => EmailKind::ReviewNotification,
+            "patchset_summary" => EmailKind::PatchsetSummary,
+            "patchset_failure" => EmailKind::PatchsetFailure,
             other => {
                 tracing::warn!("Unrecognized email kind {:?}, delivering plainly", other);
                 EmailKind::Unrecognized
@@ -1369,6 +1869,369 @@ pub struct ForgeOutboxRow {
     pub created_at: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct FetchQueueRow {
+    pub id: i64,
+    pub repo_url: String,
+    pub commit_range: String,
+    pub article_id: String,
+    pub mr_url: Option<String>,
+    pub mr_title: Option<String>,
+    pub mr_number: Option<i64>,
+    pub status: String,
+    pub locked_at: Option<i64>,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
+    pub error_log: Option<String>,
+    pub created_at: i64,
+}
+
+/// Maximum age of a predecessor linked only by its subject for the new
+/// version to cancel it while it is still in flight.
+#[cfg(feature = "server")]
+const SUBJECT_SUPERSEDE_MAX_AGE_SECS: i64 = 30 * 86400;
+
+/// How far back an exact subject match may find a previous version.
+#[cfg(feature = "server")]
+const SUBJECT_LINK_WINDOW_SECS: i64 = 120 * 86400;
+
+/// Postings with an unchanged version tag sent closer together than this
+/// are an accidental double send, not a new version.
+#[cfg(feature = "server")]
+const SAME_LABEL_MIN_GAP_SECS: i64 = 3600;
+
+#[cfg(feature = "server")]
+const LINEAGE_CANDIDATE_COLUMNS: &str =
+    "id, subject, subject_index, author, date, total_parts, cover_letter_message_id, version";
+
+/// Series-level signal that linked an email patchset to its previous
+/// version. Forge pull requests use their own "forge_mr" path.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionLinkSignal {
+    ChangeId,
+    MessageRef,
+    SubjectAuthor,
+}
+
+#[cfg(feature = "server")]
+impl VersionLinkSignal {
+    /// Signals from strongest to weakest; the first one with a qualifying
+    /// candidate decides.
+    const BY_RANK: [Self; 3] = [Self::ChangeId, Self::MessageRef, Self::SubjectAuthor];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ChangeId => "change_id",
+            Self::MessageRef => "message_ref",
+            Self::SubjectAuthor => "subject_author",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "change_id" => Some(Self::ChangeId),
+            "message_ref" => Some(Self::MessageRef),
+            "subject_author" => Some(Self::SubjectAuthor),
+            _ => None,
+        }
+    }
+
+    /// Whether a link through this signal is strong enough to cancel a
+    /// predecessor posted `age_secs` before the new version. An explicit
+    /// change-id or body link always is; a subject match only within the
+    /// 30 days the superseding logic used before version lineage, and
+    /// only when the subject tag moved forward: two unrelated series that
+    /// share an exact subject and tag must never cancel each other.
+    fn supersedes(self, age_secs: i64, step: RevisionStep) -> bool {
+        match self {
+            Self::ChangeId | Self::MessageRef => true,
+            Self::SubjectAuthor => {
+                step == RevisionStep::Advances && age_secs <= SUBJECT_SUPERSEDE_MAX_AGE_SECS
+            }
+        }
+    }
+
+    /// Whether this signal identifies every same-version candidate as the
+    /// same series, so the latest of them can be picked. Message
+    /// references can name unrelated patchsets, so two of them at the same
+    /// version are ambiguous.
+    fn same_version_is_same_series(self) -> bool {
+        match self {
+            Self::ChangeId | Self::SubjectAuthor => true,
+            Self::MessageRef => false,
+        }
+    }
+
+    /// Whether a candidate posted `gap_secs` before the current patchset,
+    /// whose subject tag steps to the current tag with `step`, may be its
+    /// previous version through this signal. Version tags are author-chosen
+    /// hints, so a tag that moves forward (including RFC to non-RFC) always
+    /// qualifies. A b4 change-id proves the series, so it also accepts an
+    /// unchanged tag (unless the postings look like an accidental double
+    /// send) and a tag that went backwards. Body links can name several
+    /// related series (a kernel series and its QEMU counterpart list each
+    /// other's versions), so they keep requiring a tag that moves forward.
+    /// The subject-only signal trusts an unchanged tag only with a
+    /// bracketed PATCH/RFC tag (`tagged`) within 30 days, because recurring
+    /// subjects (merge notifications, periodic fix collections) repeat
+    /// verbatim.
+    fn admits(self, step: RevisionStep, gap_secs: i64, tagged: bool) -> bool {
+        match (self, step) {
+            (_, RevisionStep::Advances) => true,
+            (Self::ChangeId, RevisionStep::SameLabel) => gap_secs >= SAME_LABEL_MIN_GAP_SECS,
+            (Self::SubjectAuthor, RevisionStep::SameLabel) => {
+                tagged
+                    && (SAME_LABEL_MIN_GAP_SECS..=SUBJECT_SUPERSEDE_MAX_AGE_SECS)
+                        .contains(&gap_secs)
+            }
+            (Self::ChangeId, RevisionStep::Regresses) => true,
+            (Self::MessageRef, RevisionStep::SameLabel | RevisionStep::Regresses)
+            | (Self::SubjectAuthor, RevisionStep::Regresses) => false,
+        }
+    }
+
+    /// Whether a later candidate whose tag follows an earlier candidate's
+    /// tag with `step` replaces the earlier one as the newest posting of
+    /// the series.
+    fn later_candidate_replaces(self, step: RevisionStep) -> bool {
+        match step {
+            RevisionStep::Advances => true,
+            RevisionStep::SameLabel => self.same_version_is_same_series(),
+            RevisionStep::Regresses => false,
+        }
+    }
+}
+
+/// What a patchset's subject row represents, for like-for-like subject
+/// matching.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectShape {
+    Cover,
+    SinglePatch,
+    Other,
+}
+
+#[cfg(feature = "server")]
+impl SubjectShape {
+    fn of(subject_index: u32, total_parts: u32) -> Self {
+        match (subject_index, total_parts) {
+            (0, _) => Self::Cover,
+            (1, 0 | 1) => Self::SinglePatch,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+fn is_placeholder_or_reply(subject: &str, subject_index: u32) -> bool {
+    subject == "(placeholder)" || (subject_index == 0 && Database::is_reply_subject(subject))
+}
+
+/// Whether a read path should lazily reconcile the lineage of a patchset:
+/// an unlinked email patchset that predates version lineage (migration 14
+/// left `version` NULL). Any version, including v1, may have predecessors
+/// (an RFC, or an earlier posting with the same tag). Reconciling stores
+/// `version`, so each row is reconciled lazily at most once.
+#[cfg(feature = "server")]
+fn needs_lazy_lineage(
+    previous_patchset_id: Option<i64>,
+    has_stored_version: bool,
+    mr_number: Option<i64>,
+) -> bool {
+    previous_patchset_id.is_none() && !has_stored_version && mr_number.is_none()
+}
+
+#[cfg(feature = "server")]
+fn effective_version(stored: Option<u32>, subject: &str) -> u32 {
+    stored
+        .filter(|&v| v > 0)
+        .or_else(|| crate::patch::parse_subject_version(subject))
+        .unwrap_or(1)
+}
+
+/// What the related pre-existing bug gate reads about a patchset.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchsetGateInfo {
+    pub effective_version: u32,
+    pub to_recipients: Option<String>,
+    pub cc_recipients: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl Database {
+    /// Version and recipients of a patchset, for deciding whether its review
+    /// reports related pre-existing bugs.
+    pub async fn get_patchset_gate_info(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Option<PatchsetGateInfo>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT version, COALESCE(subject, ''), to_recipients, cc_recipients
+                   FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let stored: Option<u32> = row.get(0)?;
+        let subject: String = row.get(1)?;
+        Ok(Some(PatchsetGateInfo {
+            effective_version: effective_version(stored, &subject),
+            to_recipients: row.get(2)?,
+            cc_recipients: row.get(3)?,
+        }))
+    }
+
+    /// Titles of the earlier postings of a patchset's series, newest first,
+    /// following `previous_patchset_id`: the pull request title for forge
+    /// revisions, the subject otherwise. Bounded, and safe against a cycle.
+    pub async fn get_patchset_predecessor_titles(&self, patchset_id: i64) -> Result<Vec<String>> {
+        const MAX_CHAIN_HOPS: usize = 32;
+        let mut seen = std::collections::HashSet::from([patchset_id]);
+        let mut titles = Vec::new();
+        let mut current = patchset_id;
+        while titles.len() < MAX_CHAIN_HOPS {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT prev.id, COALESCE(prev.mr_title, prev.subject, '')
+                       FROM patchsets cur
+                       JOIN patchsets prev ON prev.id = cur.previous_patchset_id
+                      WHERE cur.id = ?",
+                    libsql::params![current],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                break;
+            };
+            let previous: i64 = row.get(0)?;
+            if !seen.insert(previous) {
+                break;
+            }
+            titles.push(row.get(1)?);
+            current = previous;
+        }
+        Ok(titles)
+    }
+}
+
+/// The patchset being reconciled, as stored.
+#[cfg(feature = "server")]
+struct LineageSubject {
+    subject: String,
+    subject_index: u32,
+    author: String,
+    date: i64,
+    total_parts: u32,
+    received_parts: u32,
+    cover_id: Option<String>,
+    mr_url: Option<String>,
+    mr_number: Option<i64>,
+    stored_version: Option<u32>,
+    change_id: Option<String>,
+    previous_patchset_id: Option<i64>,
+    version_link_signal: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl LineageSubject {
+    fn skips_reconciliation(&self, skip_intermediate_parts: bool) -> bool {
+        skip_intermediate_parts && self.received_parts > 1 && self.received_parts < self.total_parts
+    }
+
+    fn version(&self) -> u32 {
+        effective_version(self.stored_version, &self.subject)
+    }
+}
+
+/// A patchset that may be the previous version of the one reconciled.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone)]
+struct LineageCandidate {
+    id: i64,
+    subject: String,
+    subject_index: u32,
+    author: String,
+    date: i64,
+    total_parts: u32,
+    cover_id: Option<String>,
+    version: u32,
+    revision: SubjectRevision,
+}
+
+#[cfg(feature = "server")]
+impl LineageCandidate {
+    /// Parses a row selected with `LINEAGE_CANDIDATE_COLUMNS`.
+    fn from_row(row: &libsql::Row) -> Result<Self> {
+        let subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+        let stored_version: Option<u32> = row.get(7)?;
+        let version = effective_version(stored_version, &subject);
+        Ok(Self {
+            id: row.get(0)?,
+            version,
+            revision: SubjectRevision::with_number(&subject, version),
+            subject,
+            subject_index: row.get::<Option<u32>>(2)?.unwrap_or(9999),
+            author: row.get::<Option<String>>(3)?.unwrap_or_default(),
+            date: row.get::<Option<i64>>(4)?.unwrap_or(0),
+            total_parts: row.get::<Option<u32>>(5)?.unwrap_or(1),
+            cover_id: row.get(6)?,
+        })
+    }
+}
+
+/// Explicit references and prerequisites extracted from the cover letter
+/// and patch 1 of the patchset being reconciled.
+#[cfg(feature = "server")]
+#[derive(Default)]
+struct LineageReferences {
+    version_ref_msgids: Vec<String>,
+    prereq_msgids: std::collections::HashSet<String>,
+    prereq_patch_ids: std::collections::HashSet<String>,
+    own_msgids: std::collections::HashSet<String>,
+    own_git_patch_ids: std::collections::HashSet<String>,
+    detected_change_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+struct LineageContext<'a> {
+    patchset_id: i64,
+    subject: &'a str,
+    subject_index: u32,
+    total_parts: u32,
+    author: &'a str,
+    date: i64,
+    version: u32,
+    revision: SubjectRevision,
+    change_id: Option<&'a str>,
+    refs: &'a LineageReferences,
+}
+
+#[cfg(feature = "server")]
+enum PredecessorChoice {
+    NoCandidate,
+    Ambiguous(Vec<i64>),
+    Chosen(LineageCandidate),
+}
+
+/// Two authors are the same person only if they share an email address
+/// (case-insensitively, or through the b4 web relay alias). A display name
+/// alone never matches.
+#[cfg(feature = "server")]
+fn same_author_email(a: &str, b: &str) -> bool {
+    let email_a = crate::patch::extract_email(a);
+    let email_b = crate::patch::extract_email(b);
+    email_a.contains('@')
+        && email_b.contains('@')
+        && (email_a.eq_ignore_ascii_case(&email_b) || crate::patch::authors_match(a, b))
+}
+
 #[cfg(feature = "server")]
 impl Database {
     pub fn has_bug_actor(&self) -> bool {
@@ -1391,6 +2254,8 @@ impl Database {
     pub fn with_bug_actor(&self, author: &str, tool: &str, model: Option<String>) -> Self {
         Self {
             conn: self.conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_cursor: self.read_cursor.clone(),
             tx_conn: self.tx_conn.clone(),
             tx_lock: self.tx_lock.clone(),
             in_transaction: self.in_transaction,
@@ -1398,6 +2263,8 @@ impl Database {
             bug_tool: tool.into(),
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
     }
 
@@ -1405,6 +2272,8 @@ impl Database {
     fn with_connection(&self, conn: libsql::Connection) -> Self {
         Self {
             conn: conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_cursor: self.read_cursor.clone(),
             tx_conn: conn,
             tx_lock: self.tx_lock.clone(),
             in_transaction: true,
@@ -1412,6 +2281,8 @@ impl Database {
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
     }
 
@@ -1419,6 +2290,8 @@ impl Database {
     pub fn with_bug_claim(&self, bug_id: i64, owner: &str) -> Self {
         Self {
             conn: self.conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_cursor: self.read_cursor.clone(),
             tx_conn: self.tx_conn.clone(),
             tx_lock: self.tx_lock.clone(),
             in_transaction: self.in_transaction,
@@ -1429,7 +2302,193 @@ impl Database {
                 bug_id,
                 owner: owner.into(),
             }),
+            patchset_claim: self.patchset_claim,
+            auto_review: self.auto_review,
         }
+    }
+
+    pub fn bug_claim_owner(&self) -> Option<&str> {
+        self.bug_claim.as_ref().map(|c| c.owner.as_str())
+    }
+
+    /// Binds patchset and review writes to the exact generation that claimed
+    /// this patchset for review.
+    pub fn with_patchset_claim(&self, patchset_id: i64, generation: i64) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_cursor: self.read_cursor.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
+            patchset_claim: Some(PatchsetReviewClaim {
+                patchset_id,
+                generation,
+            }),
+            auto_review: self.auto_review,
+        }
+    }
+
+    /// Scopes whether fully ingested patchsets are queued for review
+    /// automatically or wait in Awaiting Review for a manual rerun.
+    pub fn with_auto_review(&self, auto_review: bool) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            read_pool: self.read_pool.clone(),
+            read_cursor: self.read_cursor.clone(),
+            tx_conn: self.tx_conn.clone(),
+            tx_lock: self.tx_lock.clone(),
+            in_transaction: self.in_transaction,
+            bug_actor: self.bug_actor.clone(),
+            bug_tool: self.bug_tool.clone(),
+            bug_model: self.bug_model.clone(),
+            bug_claim: self.bug_claim.clone(),
+            patchset_claim: self.patchset_claim,
+            auto_review,
+        }
+    }
+
+    /// Selects a connection for `SELECT` queries.
+    ///
+    /// Inside an active transaction (`in_transaction`), returns `&self.conn`
+    /// (bound to `tx_conn`) so reads observe uncommitted writes of that
+    /// transaction. On file-backed databases outside a transaction, distributes
+    /// reads round-robin across `read_pool` so concurrent WAL readers execute
+    /// in parallel and an open cursor on one handle never pins or serializes
+    /// unrelated readers.
+    pub fn read_conn(&self) -> &libsql::Connection {
+        if self.in_transaction || self.read_pool.is_empty() {
+            &self.conn
+        } else {
+            let idx = self
+                .read_cursor
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            &self.read_pool[idx % self.read_pool.len()]
+        }
+    }
+
+    /// The status a patchset lands in once its last part arrives.
+    fn completion_status(&self) -> &'static str {
+        if self.auto_review {
+            ReviewStatus::Pending.as_str()
+        } else {
+            ReviewStatus::AwaitingReview.as_str()
+        }
+    }
+
+    pub fn has_patchset_claim(&self) -> bool {
+        self.patchset_claim.is_some()
+    }
+
+    fn claim_params(&self) -> (Option<i64>, Option<i64>) {
+        match self.patchset_claim {
+            Some(c) => (Some(c.patchset_id), Some(c.generation)),
+            None => (None, None),
+        }
+    }
+
+    /// Returns whether `patchset_id` is still actively owned by this handle
+    /// (for claimed worker handles, `patchsets.status = 'In Review'` and
+    /// `meta('patchset_active_gen:<id>')` matches the claim generation; for
+    /// unscoped handles, the patchset exists and is not `'Cancelled'`).
+    ///
+    /// Queries `tx_conn` under `tx_lock` so a concurrent open cursor on `conn`
+    /// pinning an older WAL snapshot never hides a claim just committed on
+    /// `tx_conn`.
+    pub async fn is_patchset_claim_active(&self, patchset_id: i64) -> Result<bool> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        if let Some(claim) = self.patchset_claim {
+            if claim.patchset_id != patchset_id {
+                return Ok(false);
+            }
+            let mut rows = self
+                .tx_conn
+                .query(
+                    "SELECT 1 FROM patchsets ps
+                     JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
+                     WHERE ps.id = ?
+                       AND ps.status = 'In Review'
+                       AND CAST(m.value AS INTEGER) = ?",
+                    libsql::params![claim.patchset_id, claim.generation],
+                )
+                .await?;
+            let active = rows.next().await?.is_some();
+            drop(rows);
+            Ok(active)
+        } else {
+            let tx_db = self.with_connection(self.tx_conn.clone());
+            Ok(!matches!(
+                tx_db.get_patchset_status(patchset_id).await?.as_deref(),
+                None | Some("Cancelled")
+            ))
+        }
+    }
+
+    /// Checks whether outbox writes remain permitted for this handle (including
+    /// immediately after the owning worker transitions `patchsets.status` from
+    /// `'In Review'` to `'Reviewed'` or `'Failed'`, before `release_patchset_claim`
+    /// runs).
+    async fn is_patchset_claim_active_for_outbox(
+        &self,
+        expected_patchset_id: Option<i64>,
+    ) -> Result<bool> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        if let Some(claim) = self.patchset_claim {
+            if expected_patchset_id.is_some_and(|pid| pid != claim.patchset_id) {
+                return Ok(false);
+            }
+            let mut rows = self
+                .tx_conn
+                .query(
+                    "SELECT 1 FROM patchsets ps
+                     JOIN meta m ON m.key = 'patchset_active_gen:' || CAST(ps.id AS TEXT)
+                     WHERE ps.id = ?
+                       AND ps.status IN ('In Review', 'Reviewed', 'Failed', 'Failed To Apply', 'FailedToApply')
+                       AND CAST(m.value AS INTEGER) = ?",
+                    libsql::params![claim.patchset_id, claim.generation],
+                )
+                .await?;
+            let active = rows.next().await?.is_some();
+            drop(rows);
+            Ok(active)
+        } else {
+            Ok(true)
+        }
+    }
+
+    /// Releases the active generation marker in `meta` if it still belongs to
+    /// this worker claim and the patchset has already exited `'In Review'`, so
+    /// completed patchsets leave no residual `meta` rows while a failed terminal
+    /// status write never strips the active marker from a still-`'In Review'`
+    /// patchset.
+    pub async fn release_patchset_claim(&self) -> Result<()> {
+        if let Some(claim) = self.patchset_claim {
+            self.execute(
+                "DELETE FROM meta
+                  WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)
+                    AND CAST(value AS INTEGER) = ?
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = ?
+                           AND ps.status = 'In Review'
+                    )",
+                libsql::params![claim.patchset_id, claim.generation, claim.patchset_id],
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Executes a write statement on the serialized write connection.
@@ -1539,7 +2598,7 @@ impl Database {
 
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query("SELECT MIN(date) FROM messages WHERE date > 0", ())
             .await?;
 
@@ -1551,7 +2610,7 @@ impl Database {
     }
 
     pub async fn get_message_details(&self, id: i64) -> Result<Option<MessageRow>> {
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn().query(
             "SELECT m.id, m.message_id, m.thread_id, m.in_reply_to, m.author, m.subject, m.date, m.body, m.to_recipients, m.cc_recipients, m.git_blob_hash, m.mailing_list, p.diff, m.references_hdr 
              FROM messages m 
              LEFT JOIN patches p ON m.message_id = p.message_id
@@ -1600,7 +2659,7 @@ impl Database {
             // Fetch thread messages
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn().query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -1649,7 +2708,7 @@ impl Database {
 
     pub async fn get_message_details_by_msgid(&self, msg_id: &str) -> Result<Option<MessageRow>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM messages WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -1710,12 +2769,16 @@ impl Database {
     /// is how the parts of a series without a cover letter resolve. A patch
     /// can sit in two patchsets while the database is in that state, so that
     /// lookup takes the first claimant as well.
+    ///
+    /// An injection's synthetic submission id can name an empty message in
+    /// the patchset's thread. Resolve it only when that thread has exactly
+    /// one patchset, keeping the real cover or patch identity intact.
     pub async fn find_patchset_id_by_msgid(&self, msg_id: &str) -> Result<Option<i64>> {
         let candidates = Self::get_msgid_candidates(msg_id);
 
         for clid in &candidates {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id FROM patchsets WHERE cover_letter_message_id = ?
                      ORDER BY id ASC LIMIT 1",
@@ -1729,7 +2792,7 @@ impl Database {
 
         for clid in &candidates {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT patchset_id FROM patches WHERE message_id = ?
                      ORDER BY id ASC LIMIT 1",
@@ -1738,6 +2801,27 @@ impl Database {
                 .await?;
             if let Ok(Some(row)) = rows.next().await {
                 return Ok(Some(row.get(0)?));
+            }
+        }
+
+        for clid in candidates
+            .iter()
+            .filter(|id| id.starts_with("sashiko-inject-") && id.ends_with("@sashiko.local"))
+        {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT p.id FROM messages m
+                     JOIN patchsets p ON p.thread_id = m.thread_id
+                     WHERE m.message_id = ? LIMIT 2",
+                    libsql::params![clid.clone()],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id = row.get(0)?;
+                if rows.next().await?.is_none() {
+                    return Ok(Some(id));
+                }
             }
         }
 
@@ -1758,7 +2842,7 @@ impl Database {
 
     pub async fn get_message_body(&self, msg_id: &str) -> Result<Option<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT body, git_blob_hash, mailing_list FROM messages WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -1796,30 +2880,11 @@ impl Database {
         }
     }
 
-    pub async fn new(settings: &DatabaseSettings) -> Result<Self> {
-        info!(
-            "Connecting to database at {}",
-            crate::utils::redact_secret(&settings.url)
-        );
-
-        let is_remote =
-            settings.url.starts_with("libsql://") || settings.url.starts_with("https://");
-        let db = if is_remote {
-            Builder::new_remote(settings.url.clone(), settings.token.clone())
-                .build()
-                .await?
-        } else {
-            Builder::new_local(&settings.url).build().await?
-        };
-
-        let conn = db.connect()?;
-
-        // Enable WAL mode for better concurrency
-        // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute()
-        conn.query("PRAGMA journal_mode=WAL;", ())
-            .await?
-            .next()
-            .await?;
+    async fn configure_file_connection(
+        conn: &libsql::Connection,
+        cache_kib: i64,
+        query_only: bool,
+    ) -> Result<()> {
         conn.query("PRAGMA busy_timeout = 5000;", ())
             .await?
             .next()
@@ -1828,26 +2893,72 @@ impl Database {
         // connection. Without this every ON DELETE CASCADE in the schema is
         // inert and orphaned child rows accumulate silently.
         conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
+        // In WAL mode, NORMAL syncs WAL frames at checkpoint boundaries rather
+        // than fsyncing every individual commit, preserving crash safety while
+        // avoiding per-transaction disk stalls.
+        conn.execute("PRAGMA synchronous = NORMAL;", ()).await?;
+        conn.execute("PRAGMA temp_store = MEMORY;", ()).await?;
+        conn.execute(&format!("PRAGMA cache_size = -{cache_kib};"), ())
+            .await?;
+        if query_only {
+            conn.execute("PRAGMA query_only = ON;", ()).await?;
+        }
+        Ok(())
+    }
 
-        // Open a dedicated second connection for explicit transactions on
-        // file-backed SQLite databases so active read cursors on `conn` can
-        // never block `COMMIT` with `SQL statements in progress` or collide
-        // with transaction state on the same `sqlite3*` handle.
-        let tx_conn = if !is_remote && !settings.url.contains(":memory:") {
+    pub async fn new(settings: &DatabaseSettings) -> Result<Self> {
+        debug!(
+            "Connecting to database at {}",
+            crate::utils::redact_secret(&settings.url)
+        );
+
+        let lower_url = settings.url.trim().to_ascii_lowercase();
+        if lower_url.starts_with("libsql://")
+            || lower_url.starts_with("https://")
+            || lower_url.starts_with("http://")
+        {
+            bail!("remote database URLs are not supported; configure a local SQLite file path");
+        }
+        let db = Builder::new_local(&settings.url).build().await?;
+        let conn = db.connect()?;
+
+        // Enable WAL mode for better concurrency.
+        // PRAGMA journal_mode returns a row (the new mode), so we must use query() instead of execute().
+        conn.query("PRAGMA journal_mode=WAL;", ())
+            .await?
+            .next()
+            .await?;
+
+        let (read_pool, tx_conn) = if !settings.url.contains(":memory:") {
+            Self::configure_file_connection(&conn, 32_768, false).await?;
+            let mut pool = Vec::with_capacity(READ_POOL_SIZE);
+            pool.push(conn.clone());
+            for _ in 1..READ_POOL_SIZE {
+                let reader = db.connect()?;
+                Self::configure_file_connection(&reader, 32_768, true).await?;
+                pool.push(reader);
+            }
+
+            // Open a dedicated connection for writes and explicit transactions
+            // on file-backed SQLite databases so active read cursors can never
+            // block `COMMIT` with `SQL statements in progress` or collide with
+            // transaction state on the same `sqlite3*` handle.
             let tx_conn = db.connect()?;
-            tx_conn
-                .query("PRAGMA busy_timeout = 5000;", ())
+            Self::configure_file_connection(&tx_conn, 65_536, false).await?;
+            (pool, tx_conn)
+        } else {
+            conn.query("PRAGMA busy_timeout = 5000;", ())
                 .await?
                 .next()
                 .await?;
-            tx_conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
-            tx_conn
-        } else {
-            conn.clone()
+            conn.execute("PRAGMA foreign_keys = ON;", ()).await?;
+            (Vec::new(), conn.clone())
         };
 
         Ok(Self {
             conn,
+            read_pool: std::sync::Arc::new(read_pool),
+            read_cursor: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             tx_conn,
             tx_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             in_transaction: false,
@@ -1855,12 +2966,14 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            patchset_claim: None,
+            auto_review: true,
         })
     }
 
     pub async fn migrate(&self) -> Result<()> {
         let current_version: u32 = {
-            let mut rows = self.conn.query("PRAGMA user_version", ()).await?;
+            let mut rows = self.read_conn().query("PRAGMA user_version", ()).await?;
             if let Some(row) = rows.next().await? {
                 row.get(0).unwrap_or(0)
             } else {
@@ -1896,7 +3009,7 @@ impl Database {
         // Transition legacy linux_bug* tables from intermediate branch states if present.
         let has_legacy_linux_bugs = {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'linux_bugs'",
                     (),
@@ -1922,7 +3035,7 @@ impl Database {
 
         let has_bugs = {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bugs'",
                     (),
@@ -2026,7 +3139,10 @@ impl Database {
         if current_version < 12 {
             info!("Applying database migration version 12 (Git patch IDs)...");
             let has_git_patch_id = {
-                let mut columns = self.conn.query("PRAGMA table_info(patches)", ()).await?;
+                let mut columns = self
+                    .read_conn()
+                    .query("PRAGMA table_info(patches)", ())
+                    .await?;
                 let mut found = false;
                 while let Some(row) = columns.next().await? {
                     let name: String = row.get(1)?;
@@ -2057,7 +3173,478 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        // Executed inside an atomic immediate transaction per the migration
+        // invariant so a mid-migration failure rolls back cleanly without
+        // stranding added columns before `PRAGMA user_version = 14` is recorded.
+        // Check `PRAGMA table_info(patchsets)` inside the write transaction so
+        // concurrent processes and migration tests that rewind `user_version`
+        // on an already migrated database cannot race or fail on duplicate
+        // columns.
+        if current_version < 14 {
+            info!("Applying database migration version 14 (patchset version lineage)...");
+            let tx = self.begin_immediate_transaction().await?;
+            // Another process may have migrated between the read of
+            // user_version above and this write lock; re-read under the lock
+            // so a late starter neither repeats the DDL nor writes an older
+            // version number over a newer schema.
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 14 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 14.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_previous_patchset_id = {
+                    let mut columns = tx.query("PRAGMA table_info(patchsets)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "previous_patchset_id";
+                    }
+                    found
+                };
+                if !has_previous_patchset_id {
+                    tx.execute_batch(include_str!("migrations/014_patchset_version_lineage.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 14", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 15 {
+            info!(
+                "Applying database migration version 15 (index reviews patchset patch status)..."
+            );
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 15 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 15.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!(
+                    "migrations/015_index_reviews_patchset_patch_status.sql"
+                ))
+                .await?;
+                tx.execute("PRAGMA user_version = 15", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 16 {
+            info!("Applying database migration version 16 (durable fetch queue)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 16 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 16.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/016_fetch_queue.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 16", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 17 {
+            info!(
+                "Applying database migration version 17 (forge comments and prior attribution)..."
+            );
+            // Built outside the migration transaction for the same reason as
+            // version 5: CREATE INDEX walks every row of messages, and holding
+            // a write transaction open for that would stall the shared
+            // connection. It runs before the version bump so a crash in
+            // between leaves version 16 behind and the next start rebuilds
+            // it, which IF NOT EXISTS makes idempotent.
+            let has_messages_table = {
+                let mut rows = self
+                    .read_conn()
+                    .query(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'messages'",
+                        (),
+                    )
+                    .await?;
+                rows.next().await?.is_some()
+            };
+            if has_messages_table {
+                self.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_messages_in_reply_to
+                     ON messages(in_reply_to) WHERE in_reply_to IS NOT NULL",
+                    (),
+                )
+                .await?;
+            }
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 17 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 17.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/017_forge_comments.sql"))
+                    .await?;
+                let (has_findings_table, existing_cols) = {
+                    let mut columns = tx.query("PRAGMA table_info(findings)", ()).await?;
+                    let mut table_exists = false;
+                    let mut cols = std::collections::BTreeSet::new();
+                    while let Some(row) = columns.next().await? {
+                        table_exists = true;
+                        let name: String = row.get(1)?;
+                        cols.insert(name);
+                    }
+                    (table_exists, cols)
+                };
+                if has_findings_table {
+                    for (col_name, col_type) in [
+                        ("prior_attribution", "TEXT"),
+                        ("found_by", "TEXT"),
+                        ("origin_kind", "TEXT"),
+                        ("originally_raised_by", "TEXT"),
+                        ("originally_raised_in_version", "INTEGER"),
+                        ("prior_reference_url", "TEXT"),
+                    ] {
+                        if !existing_cols.contains(col_name) {
+                            let sql =
+                                format!("ALTER TABLE findings ADD COLUMN {col_name} {col_type}");
+                            tx.execute(&sql, ()).await?;
+                        }
+                    }
+                }
+                tx.execute("PRAGMA user_version = 17", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 18 {
+            info!("Applying database migration version 18 (upstream grant sections)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 18 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 18.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/018_upstream_sections.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 18", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 19 {
+            info!("Applying database migration version 19 (pre-existing bug disclosures)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 19 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 19.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/019_preexisting_disclosures.sql"))
+                    .await?;
+                tx.execute("PRAGMA user_version = 19", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 20 {
+            info!(
+                "Applying database migration version 20 (patchset priority and fair scheduling)..."
+            );
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 20 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 20.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_priority = {
+                    let mut columns = tx.query("PRAGMA table_info(patchsets)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "priority";
+                    }
+                    found
+                };
+                if !has_priority {
+                    tx.execute_batch(include_str!("migrations/020_patchset_priority.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 20", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 21 {
+            info!("Applying database migration version 21 (bug security evaluation)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 21 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 21.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_security_score_tenths = {
+                    let mut columns = tx.query("PRAGMA table_info(bugs)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "security_score_tenths";
+                    }
+                    found
+                };
+                if !has_security_score_tenths {
+                    tx.execute_batch(include_str!("migrations/021_bug_security_evaluation.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 21", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 22 {
+            info!("Applying database migration version 22 (review reuse columns)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 22 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 22.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                // ALTER TABLE ADD COLUMN fails on a column that exists, and a
+                // test that rewinds user_version on a migrated database would
+                // otherwise fail here.
+                let has_inherited_column = {
+                    let mut columns = tx.query("PRAGMA table_info(reviews)", ()).await?;
+                    let mut found = false;
+                    while let Some(row) = columns.next().await? {
+                        let name: String = row.get(1)?;
+                        found |= name == "inherited_from_review_id";
+                    }
+                    found
+                };
+                if !has_inherited_column {
+                    tx.execute_batch(include_str!("migrations/022_review_reuse.sql"))
+                        .await?;
+                }
+                tx.execute("PRAGMA user_version = 22", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 23 {
+            info!("Applying database migration version 23 (patchset email outbox column)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 23 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 23.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                let has_email_outbox = {
+                    let mut rows = tx
+                        .query(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'email_outbox'",
+                            (),
+                        )
+                        .await?;
+                    rows.next().await?.is_some()
+                };
+                if has_email_outbox {
+                    let (has_patchset_id, has_related_count) = {
+                        let mut columns = tx.query("PRAGMA table_info(email_outbox)", ()).await?;
+                        let mut found_patchset_id = false;
+                        let mut found_related_count = false;
+                        while let Some(row) = columns.next().await? {
+                            let name: String = row.get(1)?;
+                            found_patchset_id |= name == "patchset_id";
+                            found_related_count |= name == "related_preexisting_count";
+                        }
+                        (found_patchset_id, found_related_count)
+                    };
+                    if !has_patchset_id && !has_related_count {
+                        tx.execute_batch(include_str!("migrations/023_patchset_email_outbox.sql"))
+                            .await?;
+                    } else {
+                        if !has_patchset_id {
+                            tx.execute(
+                                "ALTER TABLE email_outbox ADD COLUMN patchset_id INTEGER REFERENCES patchsets(id)",
+                                (),
+                            )
+                            .await?;
+                        }
+                        if !has_related_count {
+                            tx.execute(
+                                "ALTER TABLE email_outbox ADD COLUMN related_preexisting_count INTEGER NOT NULL DEFAULT 0",
+                                (),
+                            )
+                            .await?;
+                        }
+                        tx.execute(
+                            "CREATE INDEX IF NOT EXISTS idx_email_outbox_patchset_id ON email_outbox(patchset_id)",
+                            (),
+                        )
+                        .await?;
+                    }
+                }
+                tx.execute("PRAGMA user_version = 23", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        if current_version < 24 {
+            info!("Applying database migration version 24 (O(1) statistics rollups and gauges)...");
+            let tx = self.begin_immediate_transaction().await?;
+            let locked_version: u32 = {
+                let mut rows = tx.query("PRAGMA user_version", ()).await?;
+                match rows.next().await? {
+                    Some(row) => row.get(0)?,
+                    None => 0,
+                }
+            };
+            if locked_version >= 24 {
+                debug!(
+                    "Database already at version {} under the migration lock; skipping version 24.",
+                    locked_version
+                );
+                tx.rollback().await?;
+            } else {
+                tx.execute_batch(include_str!("migrations/024_stats_rollups.sql"))
+                    .await?;
+                stats_queries::apply_migration_24_seeds_and_triggers(&tx).await?;
+                tx.execute("PRAGMA user_version = 24", ()).await?;
+                tx.commit().await?;
+            }
+        }
+
+        let has_patchwork_outbox = {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'patchwork_outbox'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_patchwork_outbox {
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_patchwork_outbox_patch_msg_id ON patchwork_outbox(patch_msg_id)",
+                (),
+            )
+            .await?;
+        }
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_rollups_cover ON stats_rollups(resolution_secs, series_id, bucket_ts, value)",
+            (),
+        )
+        .await?;
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_stats_bug_subsys_cover ON stats_bug_subsystem_facets(is_authorizing, subsystem, lifecycle_status, severity_int, security_rating, count)",
+            (),
+        )
+        .await?;
+        let has_bugs = {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'bugs'",
+                    (),
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+        if has_bugs {
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_bugs_fixed_updated ON bugs(updated_at, id) WHERE lifecycle_status = 'fixed'",
+                (),
+            )
+            .await?;
+        }
+
+        debug!("Database schema is up to date at version 23.");
 
         Ok(())
     }
@@ -2098,7 +3685,7 @@ impl Database {
     /// configured for different projects from sharing the same SQLite database.
     pub async fn ensure_project_stamp(&self, project: crate::project::ProjectId) -> Result<()> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query("SELECT value FROM meta WHERE key = 'project'", ())
             .await?;
         if let Some(row) = rows.next().await? {
@@ -2123,7 +3710,7 @@ impl Database {
 
     pub async fn get_mailing_list_id_by_name(&self, name: &str) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM mailing_lists WHERE nntp_group = ?",
                 libsql::params![name],
@@ -2151,7 +3738,7 @@ impl Database {
 
     pub async fn get_mailing_lists(&self) -> Result<Vec<(String, String)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT name, nntp_group
                  FROM mailing_lists
@@ -2182,10 +3769,10 @@ impl Database {
     ) -> Result<Option<i64>> {
         let mut rows = match patch_id {
             Some(pid) => {
-                self.conn.query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status = 'Pending' LIMIT 1", libsql::params![patchset_id, pid]).await?
+                self.read_conn().query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status = 'Pending' LIMIT 1", libsql::params![patchset_id, pid]).await?
             }
             None => {
-                self.conn.query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id IS NULL AND status = 'Pending' LIMIT 1", libsql::params![patchset_id]).await?
+                self.read_conn().query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id IS NULL AND status = 'Pending' LIMIT 1", libsql::params![patchset_id]).await?
             }
         };
         if let Ok(Some(row)) = rows.next().await {
@@ -2193,6 +3780,129 @@ impl Database {
         } else {
             Ok(None)
         }
+    }
+
+    async fn claim_pending_review_id_in_tx(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let id_opt = self
+            .query_returning_i64(
+                "UPDATE reviews
+                    SET status = 'In Review', interaction_id = NULL,
+                        inherited_from_review_id = NULL, baseline_commit = NULL,
+                        cheap = 0, stages = NULL
+                  WHERE id = (
+                      SELECT id FROM reviews
+                       WHERE patchset_id = ?
+                         AND patch_id IS ?
+                         AND status = 'Pending'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM patchsets ps
+                              WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                         )
+                       ORDER BY id ASC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
+        if let Some(id) = id_opt {
+            self.clear_aborted_review_artifacts_in_tx(id).await?;
+        }
+        Ok(id_opt)
+    }
+
+    /// Atomically claims a `Pending` review row for `(patchset_id, patch_id)`
+    /// (including interrupted `In Review` rows reset to `Pending` on startup
+    /// by `reset_reviewing_status`) by transitioning its status to `'In Review'`,
+    /// clearing any partial artifacts from prior aborted attempts, and
+    /// returning its ID.
+    pub async fn claim_pending_review_id(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+    ) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if self.patchset_claim.is_some() && !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let id_opt = tx_db
+            .claim_pending_review_id_in_tx(patchset_id, patch_id)
+            .await?;
+        tx.commit().await?;
+        Ok(id_opt)
+    }
+
+    /// Atomically claims an existing `Pending` review row for
+    /// `(patchset_id, patch_id)` (transitioning it to `'In Review'`, refreshing
+    /// its execution metadata, and clearing any partial artifacts) or inserts a
+    /// new review row directly in `'In Review'` status inside the same immediate
+    /// transaction.
+    pub async fn claim_or_create_in_review(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        provider: &str,
+        model: &str,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<i64> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            bail!(
+                "patchset {} no longer exists or was cancelled/superseded",
+                patchset_id
+            );
+        }
+        let id = if let Some(id) = tx_db
+            .claim_pending_review_id_in_tx(patchset_id, patch_id)
+            .await?
+        {
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?
+                      WHERE id = ?",
+                    libsql::params![provider, model, baseline_id, prompts_hash, id],
+                )
+                .await?;
+            id
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            tx_db
+                .query_returning_i64(
+                    "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+                     VALUES (
+                         MAX(
+                             COALESCE((SELECT MAX(id) FROM reviews), 0),
+                             COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'reviews_max_id'), 0)
+                         ) + 1,
+                         ?, ?, 'In Review', ?, ?, ?, ?, ?
+                     )
+                     RETURNING id",
+                    libsql::params![
+                        patchset_id,
+                        patch_id,
+                        now,
+                        provider,
+                        model,
+                        baseline_id,
+                        prompts_hash
+                    ],
+                )
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Failed to get review ID"))?
+        };
+        tx.commit().await?;
+        Ok(id)
     }
 
     pub async fn create_review(
@@ -2205,8 +3915,15 @@ impl Database {
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
         self.query_returning_i64(
-            "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
-             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
+             VALUES (
+                 MAX(
+                     COALESCE((SELECT MAX(id) FROM reviews), 0),
+                     COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'reviews_max_id'), 0)
+                 ) + 1,
+                 ?, ?, 'Pending', ?, ?, ?, ?, ?
+             )
+             RETURNING id",
             libsql::params![
                 patchset_id,
                 patch_id,
@@ -2235,15 +3952,24 @@ impl Database {
             > 0)
     }
 
+    /// Counts the finished reviews of a patch toward its target review
+    /// count. A Skipped row that inherited a clean verdict counts as one:
+    /// it is the pass that stood in for a model run, and a rerun that
+    /// raises the target expects it to be counted so the model runs once
+    /// more, not twice.
     pub async fn count_successful_reviews(
         &self,
         patchset_id: i64,
         patch_id: i64,
         _baseline_id: Option<i64>,
     ) -> Result<usize> {
-        let mut rows = self.conn
+        let mut rows = self
+            .read_conn()
             .query(
-                "SELECT COUNT(*) FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status = 'Reviewed'",
+                "SELECT COUNT(*) FROM reviews
+                 WHERE patchset_id = ? AND patch_id = ?
+                   AND (status = 'Reviewed'
+                        OR (status = 'Skipped' AND inherited_from_review_id IS NOT NULL))",
                 libsql::params![patchset_id, patch_id],
             )
             .await?;
@@ -2262,7 +3988,8 @@ impl Database {
         patch_id: i64,
         _baseline_id: Option<i64>,
     ) -> Result<bool> {
-        let mut rows = self.conn
+        let mut rows = self
+            .read_conn()
             .query(
                 "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
                 libsql::params![patchset_id, patch_id],
@@ -2278,21 +4005,89 @@ impl Database {
         status: &str,
         logs: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let cancel_guard = "(? = 'Cancelled' AND EXISTS (
+                SELECT 1 FROM patchsets ps
+                 WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+            ))
+            OR (? != 'Cancelled'
+                AND COALESCE(status, '') != 'Cancelled'
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                )
+                AND (? IS NULL OR (
+                    reviews.patchset_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps_claim
+                        JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                        WHERE ps_claim.id = reviews.patchset_id
+                          AND ps_claim.status = 'In Review'
+                          AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                )))";
         if let Some(l) = logs {
             let compressed_logs = crate::compression::compress_string_async(l).await;
             self.execute(
-                "UPDATE reviews SET status = ?, logs = ? WHERE id = ?",
-                libsql::params![status, compressed_logs, review_id],
+                &format!(
+                    "UPDATE reviews SET status = ?, logs = ? WHERE id = ? AND ({cancel_guard})"
+                ),
+                libsql::params![
+                    status,
+                    compressed_logs,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
             )
             .await?;
         } else {
             self.execute(
-                "UPDATE reviews SET status = ? WHERE id = ?",
-                libsql::params![status, review_id],
+                &format!("UPDATE reviews SET status = ? WHERE id = ? AND ({cancel_guard})"),
+                libsql::params![
+                    status,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
             )
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn mark_review_in_review_if_active(&self, review_id: i64) -> Result<bool> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let updated = self
+            .execute(
+                "UPDATE reviews
+                    SET status = 'In Review'
+                  WHERE id = ?
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                    AND (? IS NULL OR (
+                        reviews.patchset_id = ?
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?
+                        )
+                    ))",
+                libsql::params![review_id, claim_ps_id, claim_ps_id, claim_gen],
+            )
+            .await?;
+        Ok(updated > 0)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2306,22 +4101,56 @@ impl Database {
         inline_review: Option<&str>,
         logs: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let compressed_inline_review =
             crate::compression::compress_opt_string_async(inline_review).await;
         let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
-        self.execute(
-            "UPDATE reviews SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ? WHERE id = ?",
-            libsql::params![
-                status,
-                result,
-                summary,
-                interaction_id,
-                compressed_inline_review,
-                compressed_logs,
-                review_id
-            ],
-        )
-        .await?;
+        let updated = self
+            .execute(
+                "UPDATE reviews
+                    SET status = ?, result_description = ?, summary = ?, interaction_id = ?, inline_review = ?, logs = ?
+                  WHERE id = ?
+                    AND (
+                        (? = 'Cancelled' AND EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                        ))
+                        OR (? != 'Cancelled'
+                            AND COALESCE(status, '') != 'Cancelled'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM patchsets ps
+                                 WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                            )
+                            AND (? IS NULL OR (
+                                reviews.patchset_id = ?
+                                AND EXISTS (
+                                    SELECT 1 FROM patchsets ps_claim
+                                    JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                    WHERE ps_claim.id = reviews.patchset_id
+                                      AND ps_claim.status = 'In Review'
+                                      AND CAST(m_claim.value AS INTEGER) = ?
+                                )
+                            )))
+                    )",
+                libsql::params![
+                    status,
+                    result,
+                    summary,
+                    interaction_id,
+                    compressed_inline_review,
+                    compressed_logs,
+                    review_id,
+                    status,
+                    status,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen
+                ],
+            )
+            .await?;
+        if updated == 0 {
+            bail!("review {} no longer exists or was superseded", review_id);
+        }
         Ok(())
     }
 
@@ -2352,9 +4181,27 @@ impl Database {
     }
 
     pub async fn create_tool_usage(&self, usage: ToolUsage) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
             "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+             FROM reviews
+             WHERE id = ?1
+               AND COALESCE(status, '') != 'Cancelled'
+               AND NOT EXISTS (
+                   SELECT 1 FROM patchsets ps
+                    WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+               )
+               AND (?8 IS NULL OR (
+                   reviews.patchset_id = ?8
+                   AND EXISTS (
+                       SELECT 1 FROM patchsets ps_claim
+                       JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                       WHERE ps_claim.id = reviews.patchset_id
+                         AND ps_claim.status = 'In Review'
+                         AND CAST(m_claim.value AS INTEGER) = ?9
+                   )
+               ))",
             libsql::params![
                 usage.review_id,
                 usage.provider,
@@ -2362,7 +4209,9 @@ impl Database {
                 usage.tool_name,
                 usage.arguments,
                 usage.output_length,
-                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64,
+                claim_ps_id,
+                claim_gen
             ],
         ).await?;
         Ok(())
@@ -2390,24 +4239,271 @@ impl Database {
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
+        self.create_finding_with_attribution(finding, None).await
+    }
+
+    pub async fn create_finding_with_attribution(
+        &self,
+        finding: Finding,
+        prior_attribution: Option<&crate::prior_context::PriorAttribution>,
+    ) -> Result<()> {
+        let found_by = prior_attribution
+            .and_then(|attr| attr.found_by)
+            .map(|fb| fb.as_str());
+        self.create_finding_with_provenance(finding, prior_attribution, found_by)
+            .await
+    }
+
+    pub async fn create_finding_with_provenance(
+        &self,
+        finding: Finding,
+        prior_attribution: Option<&crate::prior_context::PriorAttribution>,
+        found_by: Option<&str>,
+    ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        self.execute(
-            "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            libsql::params![
-                finding.review_id,
-                finding.severity as i32,
-                finding.severity_explanation,
-                finding.problem,
-                val,
-                locations_val,
-            ],
-        )
-        .await?;
+        let attribution_val = prior_attribution.and_then(|attr| serde_json::to_string(attr).ok());
+        let found_by_val = found_by
+            .or_else(|| {
+                prior_attribution
+                    .and_then(|attr| attr.found_by)
+                    .map(|fb| fb.as_str())
+            })
+            .map(str::to_string);
+        let origin_kind_val = prior_attribution.map(|attr| attr.origin_kind.as_str().to_string());
+        let raised_by_val = prior_attribution.map(|attr| attr.originally_raised_by.clone());
+        let raised_in_version_val =
+            prior_attribution.map(|attr| i64::from(attr.originally_raised_in_version));
+        let reference_url_val = prior_attribution.and_then(|attr| attr.reference_url.clone());
+        let inserted = self
+            .execute(
+                "INSERT INTO findings (
+                    review_id, severity, severity_explanation, problem, preexisting,
+                    locations, prior_attribution, found_by, origin_kind,
+                    originally_raised_by, originally_raised_in_version, prior_reference_url
+                 )
+                 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                 FROM reviews
+                 WHERE id = ?
+                   AND COALESCE(status, '') != 'Cancelled'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchsets ps
+                        WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                   )
+                   AND (? IS NULL OR (
+                       reviews.patchset_id = ?
+                       AND EXISTS (
+                           SELECT 1 FROM patchsets ps_claim
+                           JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                           WHERE ps_claim.id = reviews.patchset_id
+                             AND ps_claim.status = 'In Review'
+                             AND CAST(m_claim.value AS INTEGER) = ?
+                       )
+                   ))",
+                libsql::params![
+                    finding.review_id,
+                    finding.severity as i32,
+                    finding.severity_explanation,
+                    finding.problem,
+                    val,
+                    locations_val,
+                    attribution_val,
+                    found_by_val,
+                    origin_kind_val,
+                    raised_by_val,
+                    raised_in_version_val,
+                    reference_url_val,
+                    finding.review_id,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen,
+                ],
+            )
+            .await?;
+        if inserted == 0 {
+            bail!(
+                "review {} no longer exists for finding insertion",
+                finding.review_id
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn insert_prior_feedback_resolutions(
+        &self,
+        review_id: i64,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        resolutions: &[serde_json::Value],
+    ) -> Result<()> {
+        if resolutions.is_empty() {
+            return Ok(());
+        }
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        tx_db
+            .execute(
+                "DELETE FROM prior_feedback_resolutions
+                  WHERE review_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM reviews
+                         WHERE reviews.id = ?
+                           AND COALESCE(reviews.status, '') != 'Cancelled'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM patchsets ps
+                                WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                           )
+                           AND (? IS NULL OR (
+                               reviews.patchset_id = ?
+                               AND EXISTS (
+                                   SELECT 1 FROM patchsets ps_claim
+                                   JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                   WHERE ps_claim.id = reviews.patchset_id
+                                     AND ps_claim.status = 'In Review'
+                                     AND CAST(m_claim.value AS INTEGER) = ?
+                               )
+                           ))
+                    )",
+                libsql::params![
+                    review_id,
+                    review_id,
+                    claim_ps_id,
+                    claim_ps_id,
+                    claim_gen,
+                ],
+            )
+            .await?;
+
+        for res in resolutions {
+            let prior_id = res
+                .get("prior_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            if prior_id.is_empty() {
+                continue;
+            }
+            let origin_kind = res.get("origin_kind").and_then(|v| v.as_str()).unwrap_or(
+                if prior_id.starts_with("PF") {
+                    "sashiko_review"
+                } else {
+                    "human_reviewer"
+                },
+            );
+            let version = res
+                .get("version")
+                .and_then(|v| v.as_i64())
+                .filter(|&v| v > 0);
+            let author = res
+                .get("thread_participants")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let message_id = res
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let reference_url = res
+                .get("reference_url")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let verdict = res
+                .get("verdict")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let summary = res
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let reasoning = res
+                .get("reasoning")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let quote = res
+                .get("quote")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let also_found = i64::from(
+                res.get("also_found_by_sashiko")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            );
+            let v_n_outcome = res
+                .get("v_n_outcome")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let inserted = tx_db
+                .execute(
+                    "INSERT INTO prior_feedback_resolutions (
+                        review_id, patchset_id, patch_id, prior_id, origin_kind,
+                        version, author, message_id, reference_url, verdict,
+                        summary, reasoning, quote, also_found_by_sashiko, v_n_outcome
+                     )
+                     SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                     FROM reviews
+                     WHERE id = ?
+                       AND COALESCE(status, '') != 'Cancelled'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM patchsets ps
+                            WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                       )
+                       AND (? IS NULL OR (
+                           reviews.patchset_id = ?
+                           AND EXISTS (
+                               SELECT 1 FROM patchsets ps_claim
+                               JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                               WHERE ps_claim.id = reviews.patchset_id
+                                 AND ps_claim.status = 'In Review'
+                                 AND CAST(m_claim.value AS INTEGER) = ?
+                           )
+                       ))",
+                    libsql::params![
+                        review_id,
+                        patchset_id,
+                        patch_id,
+                        prior_id,
+                        origin_kind,
+                        version,
+                        author,
+                        message_id,
+                        reference_url,
+                        verdict,
+                        summary,
+                        reasoning,
+                        quote,
+                        also_found,
+                        v_n_outcome,
+                        review_id,
+                        claim_ps_id,
+                        claim_ps_id,
+                        claim_gen,
+                    ],
+                )
+                .await?;
+            if inserted == 0 {
+                bail!(
+                    "review {} no longer exists for prior_feedback_resolutions insertion",
+                    review_id
+                );
+            }
+        }
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
         Ok(())
     }
 
@@ -2430,6 +4526,69 @@ impl Database {
         }
         tx.commit().await?;
         Ok(id)
+    }
+
+    /// Creates a bug like [`Self::create_bug_with_enrichment`] and returns
+    /// the stored row.
+    ///
+    /// The row is read inside the inserting transaction. Reading it back
+    /// through `conn` after the commit is unsafe: an open cursor held by
+    /// any other task keeps `conn` on an older WAL snapshot, in which the
+    /// new bug does not exist yet.
+    pub async fn create_bug_with_enrichment_returning(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+    ) -> Result<Bug> {
+        let tx = self.begin_transaction().await?;
+        let scoped = self.with_connection((*tx).clone());
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.insert_bug_enrichment(id, enrichment).await?;
+        }
+        let stored = scoped
+            .get_bug(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Bug {id} is missing inside its own transaction"))?;
+        tx.commit().await?;
+        Ok(stored)
+    }
+
+    /// Atomically inserts a candidate bug, records its initial enrichment, and
+    /// claims an active worker lease on the row within a single transaction so no
+    /// concurrent `BugWorker` can claim the row before synchronous deduplication.
+    pub async fn create_claimed_bug_with_enrichment(
+        &self,
+        bug: &NewBug,
+        enrichment: Option<&NewBugEnrichment>,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Bug> {
+        let tx = self.begin_transaction().await?;
+        let scoped = self.with_connection((*tx).clone());
+        let id = scoped.insert_bug(bug).await?;
+        if let Some(enrichment) = enrichment {
+            scoped.insert_bug_enrichment(id, enrichment).await?;
+        }
+        let now = chrono::Utc::now().timestamp();
+        scoped
+            .execute(
+                "UPDATE bugs
+                    SET pipeline_state = 'running',
+                        locked_by = ?1,
+                        lease_expires_at = ?2,
+                        attempt_count = 1,
+                        updated_at = ?3
+                  WHERE id = ?4",
+                libsql::params![worker_id, now + lease_ttl_seconds, now, id],
+            )
+            .await?;
+        let claimed = scoped
+            .get_bug(id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Claimed bug {} disappeared inside transaction", id))?;
+        tx.commit().await?;
+        Ok(claimed)
     }
 
     async fn insert_bug(&self, bug: &NewBug) -> Result<i64> {
@@ -2483,7 +4642,16 @@ impl Database {
 
         for sub in &bug.subsystems {
             let trimmed = sub.name.trim();
-            if !trimmed.is_empty() {
+            if trimmed.is_empty() {
+                continue;
+            }
+            if sub.source == SubsystemSource::UpstreamGrant {
+                self.execute(
+                    INSERT_BUG_UPSTREAM_SECTION_SQL,
+                    libsql::params![id, trimmed],
+                )
+                .await?;
+            } else {
                 self.execute(
                     UPSERT_BUG_SUBSYSTEM_SQL,
                     libsql::params![id, trimmed, sub.source.as_str()],
@@ -2597,6 +4765,15 @@ impl Database {
             || enrichment.tokens_out.is_some()
             || enrichment.tokens_cached.is_some()
         {
+            let ti = enrichment.tokens_in.unwrap_or(0) as u64;
+            let to = enrichment.tokens_out.unwrap_or(0) as u64;
+            let tc = enrichment.tokens_cached.unwrap_or(0) as u64;
+            crate::metrics::add_ai_tokens(
+                crate::metrics::AiWorkload::Bug,
+                ti.saturating_sub(tc),
+                tc,
+                to,
+            );
             let interaction_id = format!("bug_enrichment:{id}");
             self.execute(
                 "INSERT OR REPLACE INTO ai_interactions (
@@ -2624,7 +4801,7 @@ impl Database {
 
     pub async fn get_bug_enrichments(&self, bug_id: i64) -> Result<Vec<BugEnrichment>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json,
                         tokens_in, tokens_out, tokens_cached, NULL as logs
@@ -2690,7 +4867,7 @@ impl Database {
 
     pub async fn get_bug(&self, id: i64) -> Result<Option<Bug>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE id = ?"),
                 libsql::params![id],
@@ -2712,7 +4889,7 @@ impl Database {
 
     pub async fn get_bug_by_bugid(&self, bugid: &str) -> Result<Option<Bug>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 &format!("SELECT {BUG_ROW_COLUMNS} FROM bugs WHERE bugid = ?"),
                 libsql::params![bugid],
@@ -2738,7 +4915,7 @@ impl Database {
 
     pub async fn get_subsystems_for_bug(&self, bug_id: i64) -> Result<Vec<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT subsystem FROM bug_subsystems WHERE bug_id = ? ORDER BY subsystem ASC",
                 libsql::params![bug_id],
@@ -2777,18 +4954,23 @@ impl Database {
             return Ok(sections);
         }
         let placeholders = vec!["?"; bug_ids.len()].join(", ");
+        // Upstream grant rows confer the same authority as MAINTAINERS rows.
+        // UNION also drops a title that both tables hold.
         let sql = format!(
             "SELECT bug_id, subsystem FROM bug_subsystems
-             WHERE source = '{}' AND bug_id IN ({})
+              WHERE source = '{}' AND bug_id IN ({placeholders})
+             UNION
+             SELECT bug_id, subsystem FROM bug_upstream_sections
+              WHERE bug_id IN ({placeholders})
              ORDER BY subsystem ASC",
             SubsystemSource::MaintainersSection.as_str(),
-            placeholders
         );
         let params: Vec<libsql::Value> = bug_ids
             .iter()
+            .chain(bug_ids)
             .map(|&id| libsql::Value::Integer(id))
             .collect();
-        let mut rows = self.conn.query(&sql, params).await?;
+        let mut rows = self.read_conn().query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
             let bug_id: i64 = row.get(0)?;
             let subsystem: String = row.get(1)?;
@@ -2818,6 +5000,14 @@ impl Database {
             if name.is_empty() {
                 continue;
             }
+            if section.source == SubsystemSource::UpstreamGrant {
+                self.execute(
+                    INSERT_PATCHSET_UPSTREAM_SECTION_SQL,
+                    libsql::params![patchset_id, name],
+                )
+                .await?;
+                continue;
+            }
             self.execute(
                 UPSERT_PATCHSET_SECTION_SQL,
                 libsql::params![patchset_id, name, section.source.as_str()],
@@ -2833,24 +5023,43 @@ impl Database {
     /// every stored diff in one pass and a stale row from an earlier attempt
     /// must not survive. Pruning matters for the same reason the bug side
     /// prunes: a section that no longer matches has to stop conferring
-    /// authority.
+    /// authority. Upstream grant entries replace the patchset's grant rows
+    /// the same way.
     pub async fn replace_patchset_maintainer_sections(
         &self,
         patchset_id: i64,
         sections: &[AttributedSubsystem],
     ) -> Result<()> {
-        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = sections
-            .iter()
-            .map(|s| (s.name.trim(), s.source))
-            .filter(|(name, _)| !name.is_empty())
-            .collect();
+        // Two tables change together, so a reader must never see one updated
+        // and the other not, and a failure must leave neither half applied.
+        if self.in_transaction {
+            return self
+                .write_patchset_maintainer_sections(patchset_id, sections)
+                .await;
+        }
+        let tx = self.begin_transaction().await?;
+        self.with_connection((*tx).clone())
+            .write_patchset_maintainer_sections(patchset_id, sections)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_patchset_maintainer_sections(
+        &self,
+        patchset_id: i64,
+        sections: &[AttributedSubsystem],
+    ) -> Result<()> {
+        let (wanted, granted) = split_upstream_grants(sections);
+        self.write_patchset_upstream_sections(patchset_id, &granted)
+            .await?;
 
         // The read is drained and the cursor dropped before any write, because
         // libsql refuses to commit a transaction that still has a statement in
         // progress, and deleting while iterating leaves the cursor open.
         let existing: Vec<String> = {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT subsystem FROM patchset_maintainer_sections WHERE patchset_id = ?",
                     libsql::params![patchset_id],
@@ -2883,6 +5092,167 @@ impl Database {
         Ok(())
     }
 
+    /// Sets a patchset's upstream grant sections to exactly `granted`, in one
+    /// transaction so that access is never seen revoked in between.
+    pub async fn replace_patchset_upstream_sections<S: AsRef<str>>(
+        &self,
+        patchset_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        let granted: Vec<String> = granted
+            .into_iter()
+            .map(|g| g.as_ref().to_string())
+            .collect();
+        if self.in_transaction {
+            return self
+                .write_patchset_upstream_sections(patchset_id, &granted)
+                .await;
+        }
+        let tx = self.begin_transaction().await?;
+        self.with_connection((*tx).clone())
+            .write_patchset_upstream_sections(patchset_id, &granted)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn write_patchset_upstream_sections<S: AsRef<str>>(
+        &self,
+        patchset_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        self.execute(
+            "DELETE FROM patchset_upstream_sections WHERE patchset_id = ?",
+            libsql::params![patchset_id],
+        )
+        .await?;
+        for name in granted {
+            let name = name.as_ref().trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.execute(
+                INSERT_PATCHSET_UPSTREAM_SECTION_SQL,
+                libsql::params![patchset_id, name],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Sets a bug's upstream grant sections to exactly `granted`. Callers
+    /// hold a transaction: the bug attribution writer and the batch below.
+    async fn write_bug_upstream_sections<S: AsRef<str>>(
+        &self,
+        bug_id: i64,
+        granted: impl IntoIterator<Item = S>,
+    ) -> Result<()> {
+        self.execute(
+            "DELETE FROM bug_upstream_sections WHERE bug_id = ?",
+            libsql::params![bug_id],
+        )
+        .await?;
+        for name in granted {
+            let name = name.as_ref().trim();
+            if name.is_empty() {
+                continue;
+            }
+            self.execute(
+                INSERT_BUG_UPSTREAM_SECTION_SQL,
+                libsql::params![bug_id, name],
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Deletes every upstream grant row, for when no grant is configured, in
+    /// one transaction so that bugs and patchsets lose their grants together.
+    pub async fn clear_upstream_sections(&self) -> Result<()> {
+        const DELETES: [&str; 2] = [
+            "DELETE FROM bug_upstream_sections",
+            "DELETE FROM patchset_upstream_sections",
+        ];
+        if self.in_transaction {
+            for sql in DELETES {
+                self.execute(sql, ()).await?;
+            }
+            return Ok(());
+        }
+        let tx = self.begin_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for sql in DELETES {
+            tx_db.execute(sql, ()).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replaces the upstream grant rows of a page of bugs in one short
+    /// transaction.
+    pub async fn replace_bug_upstream_sections_batch(
+        &self,
+        rows: &[(i64, Vec<String>)],
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for (bug_id, granted) in rows {
+            tx_db.write_bug_upstream_sections(*bug_id, granted).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Replaces the upstream grant rows of a page of patchsets in one short
+    /// transaction.
+    pub async fn replace_patchset_upstream_sections_batch(
+        &self,
+        rows: &[(i64, Vec<String>)],
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        for (patchset_id, granted) in rows {
+            tx_db
+                .write_patchset_upstream_sections(*patchset_id, granted)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Bug ids greater than `after_id`, ascending, for walks over every bug.
+    pub async fn bug_ids_after(&self, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        self.ids_after(
+            "SELECT id FROM bugs WHERE id > ? ORDER BY id ASC LIMIT ?",
+            after_id,
+            limit,
+        )
+        .await
+    }
+
+    /// Patchset ids greater than `after_id`, ascending, for walks over every
+    /// patchset.
+    pub async fn patchset_ids_after(&self, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        self.ids_after(
+            "SELECT id FROM patchsets WHERE id > ? ORDER BY id ASC LIMIT ?",
+            after_id,
+            limit,
+        )
+        .await
+    }
+
+    async fn ids_after(&self, sql: &str, after_id: i64, limit: usize) -> Result<Vec<i64>> {
+        let mut rows = self
+            .read_conn()
+            .query(sql, libsql::params![after_id, limit as i64])
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get(0)?);
+        }
+        Ok(ids)
+    }
+
     /// Returns the MAINTAINERS section titles that grant authority over this
     /// patchset.
     ///
@@ -2910,18 +5280,22 @@ impl Database {
             return Ok(sections);
         }
         let placeholders = vec!["?"; patchset_ids.len()].join(", ");
+        // Upstream grant rows confer the same authority as MAINTAINERS rows.
         let sql = format!(
             "SELECT patchset_id, subsystem FROM patchset_maintainer_sections
-             WHERE source = '{}' AND patchset_id IN ({})
+              WHERE source = '{}' AND patchset_id IN ({placeholders})
+             UNION
+             SELECT patchset_id, subsystem FROM patchset_upstream_sections
+              WHERE patchset_id IN ({placeholders})
              ORDER BY subsystem ASC",
             SubsystemSource::MaintainersSection.as_str(),
-            placeholders
         );
         let params: Vec<libsql::Value> = patchset_ids
             .iter()
+            .chain(patchset_ids)
             .map(|&id| libsql::Value::Integer(id))
             .collect();
-        let mut rows = self.conn.query(&sql, params).await?;
+        let mut rows = self.read_conn().query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
             let patchset_id: i64 = row.get(0)?;
             let subsystem: String = row.get(1)?;
@@ -2958,7 +5332,7 @@ impl Database {
             .iter()
             .map(|&id| libsql::Value::Integer(id))
             .collect();
-        let mut rows = self.conn.query(&sql, params).await?;
+        let mut rows = self.read_conn().query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
             let patchset_id: i64 = row.get(0)?;
             let low: i64 = row.get(1)?;
@@ -2978,7 +5352,7 @@ impl Database {
         patchset_id: i64,
     ) -> Result<Vec<AttributedSubsystem>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT subsystem, source FROM patchset_maintainer_sections
                  WHERE patchset_id = ? ORDER BY subsystem ASC",
@@ -3001,7 +5375,7 @@ impl Database {
     /// UNION makes historical malformed duplicate graphs terminate safely.
     pub async fn bug_family(&self, id: i64, raw: bool) -> Result<Vec<Bug>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "WITH RECURSIVE ancestors(id, parent) AS (
                 SELECT id, duplicate_of_id FROM bugs WHERE id = ?
@@ -3017,7 +5391,7 @@ impl Database {
         while let Some(row) = rows.next().await? {
             if let Some(mut bug) = self.get_bug(row.get(0)?).await? {
                 if raw {
-                    let mut records = self.conn.query("SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json, tokens_in, tokens_out, tokens_cached, logs FROM bug_enrichments WHERE bug_id = ? ORDER BY created_at, id", libsql::params![bug.id]).await?;
+                    let mut records = self.read_conn().query("SELECT id, bug_id, kind, tool, model, author, created_at, content, data_json, tokens_in, tokens_out, tokens_cached, logs FROM bug_enrichments WHERE bug_id = ? ORDER BY created_at, id", libsql::params![bug.id]).await?;
                     bug.enrichments.clear();
                     while let Some(record) = records.next().await? {
                         bug.enrichments
@@ -3035,7 +5409,7 @@ impl Database {
         &self,
         ids: &[i64],
     ) -> Result<std::collections::HashMap<i64, serde_json::Value>> {
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn().query(
             "WITH RECURSIVE ancestors(root, id, parent) AS (
                 SELECT b.id, b.id, b.duplicate_of_id FROM bugs b JOIN json_each(?1) requested ON b.id = requested.value
                 UNION SELECT a.root, b.id, b.duplicate_of_id FROM bugs b JOIN ancestors a ON b.id = a.parent
@@ -3051,9 +5425,9 @@ impl Database {
                       ) AS model,
                       COALESCE(
                           NULLIF(NULLIF(trim(e.tool), ''), 'sashiko'),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = f.id LIMIT 1),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = f.id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                          (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1),
                           NULLIF(trim(e.tool), '')
                       ) AS tool
                FROM family f
@@ -3093,12 +5467,54 @@ impl Database {
             .collect()
     }
 
+    /// Returns `(root_bug_id, family_member_id, enrichment_kind)` tuples for
+    /// reproducer and proposed-fix attachments across each requested bug's
+    /// duplicate family without loading attachment bodies or interaction logs.
+    pub async fn bug_family_attachment_candidates(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<(i64, i64, String)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .read_conn()
+            .query(
+                "WITH RECURSIVE ancestors(root, id, parent) AS (
+                    SELECT b.id, b.id, b.duplicate_of_id
+                      FROM bugs b
+                      JOIN json_each(?1) requested ON b.id = requested.value
+                    UNION
+                    SELECT a.root, b.id, b.duplicate_of_id
+                      FROM bugs b
+                      JOIN ancestors a ON b.id = a.parent
+                 ), family(root, id) AS (
+                    SELECT root, id FROM ancestors
+                    UNION
+                    SELECT f.root, b.id
+                      FROM bugs b
+                      JOIN family f ON b.duplicate_of_id = f.id
+                 )
+                 SELECT DISTINCT f.root, f.id, e.kind
+                   FROM family f
+                   JOIN bug_enrichments e ON e.bug_id = f.id
+                  WHERE e.kind IN ('reproducer', 'testcase', 'poc', 'proposed_fix', 'suggested_fix')",
+                libsql::params![serde_json::to_string(ids)?],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get(0)?, row.get(1)?, row.get(2)?));
+        }
+        Ok(out)
+    }
+
     pub async fn resolve_bug_model_and_tool(
         &self,
         bug_id: i64,
     ) -> Result<Option<(Option<String>, Option<String>)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT
                     COALESCE(
@@ -3107,9 +5523,9 @@ impl Database {
                         (SELECT r.model FROM reviews r WHERE r.patchset_id = b.discovered_in_patchset_id AND r.model IS NOT NULL AND trim(r.model) != '' LIMIT 1)
                     ) AS model,
                     COALESCE(
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.id LIMIT 1),
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
-                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM bug_reviews rb JOIN reviews r ON r.id = rb.review_id LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE rb.bug_id = b.duplicate_of_id LIMIT 1),
+                        (SELECT CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR b.bugid LIKE 'sashiko-%' OR b.audit_tool LIKE 'sashiko:sashiko%' OR p.slug LIKE 'sashiko-%' OR p.mr_url LIKE '%/sashiko/%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_patch_review' WHEN ?2 LIKE 'sashiko:gcc%' OR b.bugid LIKE 'gcc-%' OR b.audit_tool LIKE 'sashiko:gcc%' OR p.slug LIKE 'gcc-%' OR p.mr_url LIKE '%/gcc/%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_patch_review' WHEN ?2 LIKE 'sashiko:qemu%' OR b.bugid LIKE 'qemu-%' OR b.audit_tool LIKE 'sashiko:qemu%' OR p.slug LIKE 'qemu-%' OR p.mr_url LIKE '%/qemu/%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_patch_review' WHEN ?2 LIKE 'sashiko:zephyr%' OR b.bugid LIKE 'zephyr-%' OR b.audit_tool LIKE 'sashiko:zephyr%' OR p.slug LIKE 'zephyr-%' OR p.mr_url LIKE '%/zephyr/%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_patch_review' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR b.bugid LIKE 'e2fsprogs-%' OR b.audit_tool LIKE 'sashiko:e2fsprogs%' OR p.slug LIKE 'e2fsprogs-%' OR p.mr_url LIKE '%/e2fsprogs/%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_patch_review' ELSE 'sashiko:linux_patch_review' END FROM reviews r LEFT JOIN patchsets p ON p.id = r.patchset_id WHERE r.patchset_id = b.discovered_in_patchset_id LIMIT 1)
                     ) AS tool
                  FROM bugs b WHERE b.id = ?1",
                 libsql::params![bug_id, self.bug_tool.as_str()],
@@ -3157,7 +5573,7 @@ impl Database {
         let mut logged_records = std::collections::HashSet::<i64>::new();
         if !family_ids.is_empty() {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id FROM bug_enrichments
                      WHERE bug_id IN (SELECT value FROM json_each(?))
@@ -3290,6 +5706,36 @@ impl Database {
                     };
                     event["fixed_in_commit"] = json!(fixed_ref);
                 }
+                if enrichment.kind == "security_evaluation"
+                    && let Some(data) = &enrichment.data_json
+                {
+                    if let Some(cls) = data.get("security_class") {
+                        event["security_class"] = cls.clone();
+                    }
+                    if let Some(score) = data.get("score") {
+                        event["security_score"] = score.clone();
+                    }
+                    if let Some(tenths) = data.get("score_tenths") {
+                        event["security_score_tenths"] = tenths.clone();
+                    }
+                    if let Some(rating) = data.get("qualitative_rating") {
+                        event["security_rating"] = rating.clone();
+                    }
+                    if let Some(vec_str) = data.get("cvss_vector").filter(|v| !v.is_null()) {
+                        event["cvss_vector"] = vec_str.clone();
+                    }
+                    if let Some(boundary) = data.get("trust_boundary").filter(|v| !v.is_null()) {
+                        event["trust_boundary"] = boundary.clone();
+                    }
+                    if let Some(attacker) = data.get("attacker_model").filter(|v| !v.is_null()) {
+                        event["attacker_model"] = attacker.clone();
+                    }
+                    if let Some(justifications) =
+                        data.get("metric_justifications").filter(|v| !v.is_null())
+                    {
+                        event["metric_justifications"] = justifications.clone();
+                    }
+                }
                 if enrichment.kind == "audit"
                     && let Some(data) = &enrichment.data_json
                 {
@@ -3309,6 +5755,20 @@ impl Database {
                                 "Title changed to {}",
                                 data["new"].as_str().unwrap_or("untitled")
                             ))
+                        }
+                        Some("security_evaluation") => {
+                            let content = match data
+                                .get("reason")
+                                .and_then(|v| v.as_str())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                Some(reason) => {
+                                    format!("Security re-evaluation requested: {reason}")
+                                }
+                                None => "Security re-evaluation requested".to_string(),
+                            };
+                            event["content"] = json!(content);
                         }
                         _ => {}
                     }
@@ -3332,7 +5792,7 @@ impl Database {
             let mut review_links: std::collections::HashMap<i64, (Option<i64>, Option<i64>)> =
                 std::collections::HashMap::new();
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT rb.bug_id, r.patchset_id, r.patch_id
                      FROM bug_reviews rb
@@ -3371,7 +5831,7 @@ impl Database {
         if !patch_ids_to_query.is_empty() {
             let pids: Vec<i64> = patch_ids_to_query.into_iter().collect();
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id, patchset_id, part_index
                      FROM patches
@@ -3387,6 +5847,43 @@ impl Database {
             }
         }
 
+        let mut ps_ids_to_query = std::collections::HashSet::new();
+        for raw in &raw_discoveries {
+            if let Some(ps_id) = raw.patchset_id {
+                ps_ids_to_query.insert(ps_id);
+            }
+            if let Some(pid) = raw.patch_id
+                && let Some(&(Some(p_ps_id), _)) = patch_info.get(&pid)
+            {
+                ps_ids_to_query.insert(p_ps_id);
+            }
+        }
+        let mut patchset_refs: std::collections::HashMap<i64, String> =
+            std::collections::HashMap::new();
+        if !ps_ids_to_query.is_empty() {
+            let ps_ids: Vec<i64> = ps_ids_to_query.into_iter().collect();
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT ps.id,
+                            COALESCE(
+                                ps.slug,
+                                ps.cover_letter_message_id,
+                                (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = ps.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)
+                            )
+                     FROM patchsets ps
+                     WHERE ps.id IN (SELECT value FROM json_each(?))",
+                    libsql::params![serde_json::to_string(&ps_ids)?],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                let ps_id: i64 = row.get(0)?;
+                if let Some(ps_ref) = row.get::<Option<String>>(1).ok().flatten() {
+                    patchset_refs.insert(ps_id, ps_ref);
+                }
+            }
+        }
+
         let mut discoveries = Vec::new();
         for raw in raw_discoveries {
             let mut patchset_id = raw.patchset_id;
@@ -3399,6 +5896,7 @@ impl Database {
                 }
                 patch_part = part;
             }
+            let patchset_ref = patchset_id.and_then(|id| patchset_refs.get(&id).cloned());
 
             let author = raw
                 .record
@@ -3425,6 +5923,7 @@ impl Database {
                 "model": raw.model,
                 "created_at": raw.record.map(|e| e.created_at).unwrap_or(raw.reported_at),
                 "patchset_id": patchset_id,
+                "patchset_ref": patchset_ref,
                 "patch_id": raw.patch_id,
                 "patch_part": patch_part,
                 "commit": raw.commit,
@@ -3560,7 +6059,7 @@ impl Database {
 
     pub async fn get_bug_logs(&self, id: i64) -> Result<Option<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT tool, logs FROM bug_enrichments
                  WHERE bug_id = ? AND logs IS NOT NULL
@@ -3606,6 +6105,20 @@ impl Database {
         self.get_bug_logs_by_bugid(slug).await
     }
 
+    /// Reads a bug on the write connection.
+    ///
+    /// Use this to read back a bug just written through `tx_conn`. The
+    /// shared read connection can be pinned to an older WAL snapshot by an
+    /// open cursor in any other task, and then does not see the write.
+    pub async fn get_bug_on_write_conn(&self, id: i64) -> Result<Option<Bug>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        self.with_connection(self.tx_conn.clone()).get_bug(id).await
+    }
+
     /// Claims the oldest bug awaiting analysis, taking a lease on it.
     ///
     /// The claim is a single statement so that two workers racing for the same
@@ -3623,15 +6136,6 @@ impl Database {
     ///
     /// `worker_id` identifies the holder so that a stuck lease can be traced
     /// back to a process.
-    async fn get_bug_on_write_conn(&self, id: i64) -> Result<Option<Bug>> {
-        let _guard = if self.in_transaction {
-            None
-        } else {
-            Some(self.tx_lock.lock().await)
-        };
-        self.with_connection(self.tx_conn.clone()).get_bug(id).await
-    }
-
     pub async fn claim_pending_bug(
         &self,
         worker_id: &str,
@@ -3648,7 +6152,7 @@ impl Database {
                         attempt_count = attempt_count + 1,
                         updated_at = ?3,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?5 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?5 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?5 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?5 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' WHEN ?5 LIKE 'sashiko:zephyr%' OR bugid LIKE 'zephyr-%' OR audit_tool LIKE 'sashiko:zephyr%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_bug' WHEN ?5 LIKE 'sashiko:e2fsprogs%' OR bugid LIKE 'e2fsprogs-%' OR audit_tool LIKE 'sashiko:e2fsprogs%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE id = (
                       SELECT id FROM bugs
@@ -3688,6 +6192,81 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Acquires a cross-process deduplication lease in the `meta` table so that
+    /// a standalone CLI process (`sashiko scan --submit-bugs`) and the `sashiko`
+    /// server daemon's `BugWorker` cannot concurrently query open bug vectors,
+    /// run `DedupSession`, and commit duplicate open canonical bugs.
+    ///
+    /// `lease_ttl_seconds` governs crash-recovery expiration of the lease row
+    /// (renewed while the holder is active via [`Self::renew_bug_dedup_lease`]),
+    /// whereas contending callers wait up to `max(lease_ttl_seconds, 600)`
+    /// seconds so slow or rate-limited `DedupSession` calls do not cause
+    /// premature acquisition timeouts.
+    pub async fn acquire_bug_dedup_lease(&self, owner: &str, lease_ttl_seconds: i64) -> Result<()> {
+        let ttl = lease_ttl_seconds.max(5);
+        let wait_secs = (ttl as u64).max(600);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+        loop {
+            let now = chrono::Utc::now().timestamp();
+            let lease_val = format!("{}:{}", now + ttl, owner);
+            let acquired = self
+                .query_returning_i64(
+                    "INSERT INTO meta (key, value)
+                     VALUES ('bug_dedup_lease', ?1)
+                     ON CONFLICT(key) DO UPDATE
+                        SET value = excluded.value
+                      WHERE CAST(substr(meta.value, 1, instr(meta.value, ':') - 1) AS INTEGER) <= ?2
+                         OR substr(meta.value, instr(meta.value, ':') + 1) = ?3
+                     RETURNING 1",
+                    libsql::params![lease_val.as_str(), now, owner],
+                )
+                .await?;
+            if acquired.is_some() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "Timed out waiting {}s to acquire cross-process bug_dedup_lease for {}",
+                    wait_secs,
+                    owner
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Extends the cross-process deduplication lease in `meta` if still owned
+    /// and unexpired by `owner`.
+    pub async fn renew_bug_dedup_lease(&self, owner: &str, lease_ttl_seconds: i64) -> Result<bool> {
+        let ttl = lease_ttl_seconds.max(5);
+        let now = chrono::Utc::now().timestamp();
+        let lease_val = format!("{}:{}", now + ttl, owner);
+        let renewed = self
+            .query_returning_i64(
+                "UPDATE meta
+                    SET value = ?1
+                  WHERE key = 'bug_dedup_lease'
+                    AND substr(value, instr(value, ':') + 1) = ?2
+                    AND CAST(substr(value, 1, instr(value, ':') - 1) AS INTEGER) >= ?3
+                  RETURNING 1",
+                libsql::params![lease_val.as_str(), owner, now],
+            )
+            .await?;
+        Ok(renewed.is_some())
+    }
+
+    /// Releases the cross-process deduplication lease in `meta` if still owned by `owner`.
+    pub async fn release_bug_dedup_lease(&self, owner: &str) -> Result<()> {
+        self.execute(
+            "DELETE FROM meta
+              WHERE key = 'bug_dedup_lease'
+                AND substr(value, instr(value, ':') + 1) = ?1",
+            libsql::params![owner],
+        )
+        .await?;
         Ok(())
     }
 
@@ -3736,7 +6315,7 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?3 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?3 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?3 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?3 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' WHEN ?3 LIKE 'sashiko:zephyr%' OR bugid LIKE 'zephyr-%' OR audit_tool LIKE 'sashiko:zephyr%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_bug' WHEN ?3 LIKE 'sashiko:e2fsprogs%' OR bugid LIKE 'e2fsprogs-%' OR audit_tool LIKE 'sashiko:e2fsprogs%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE attempt_count >= ?2
                     AND (pipeline_state IN ('pending', 'failed')
@@ -3778,7 +6357,7 @@ impl Database {
                         lease_expires_at = NULL,
                         updated_at = ?1,
                         audit_author = 'system',
-                        audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' ELSE 'sashiko:linux_bug' END,
+                        audit_tool = CASE WHEN ?2 LIKE 'sashiko:sashiko%' OR bugid LIKE 'sashiko-%' OR audit_tool LIKE 'sashiko:sashiko%' OR (SELECT value FROM meta WHERE key = 'project') = 'sashiko' THEN 'sashiko:sashiko_bug' WHEN ?2 LIKE 'sashiko:gcc%' OR bugid LIKE 'gcc-%' OR audit_tool LIKE 'sashiko:gcc%' OR (SELECT value FROM meta WHERE key = 'project') = 'gcc' THEN 'sashiko:gcc_bug' WHEN ?2 LIKE 'sashiko:qemu%' OR bugid LIKE 'qemu-%' OR audit_tool LIKE 'sashiko:qemu%' OR (SELECT value FROM meta WHERE key = 'project') = 'qemu' THEN 'sashiko:qemu_bug' WHEN ?2 LIKE 'sashiko:zephyr%' OR bugid LIKE 'zephyr-%' OR audit_tool LIKE 'sashiko:zephyr%' OR (SELECT value FROM meta WHERE key = 'project') = 'zephyr' THEN 'sashiko:zephyr_bug' WHEN ?2 LIKE 'sashiko:e2fsprogs%' OR bugid LIKE 'e2fsprogs-%' OR audit_tool LIKE 'sashiko:e2fsprogs%' OR (SELECT value FROM meta WHERE key = 'project') = 'e2fsprogs' THEN 'sashiko:e2fsprogs_bug' ELSE 'sashiko:linux_bug' END,
                         audit_model = NULL
                   WHERE pipeline_state = 'running'
                     AND (lease_expires_at IS NULL OR lease_expires_at < ?1)",
@@ -3883,18 +6462,17 @@ impl Database {
         subsystems: &[AttributedSubsystem],
     ) -> Result<()> {
         self.execute("UPDATE bugs SET audit_author = ?, audit_tool = ?, audit_model = ?, updated_at = ? WHERE id = ?", libsql::params![self.bug_actor.as_str(), self.bug_tool.as_str(), self.bug_model.clone(), chrono::Utc::now().timestamp(), id]).await?;
-        let wanted: std::collections::BTreeMap<&str, SubsystemSource> = subsystems
-            .iter()
-            .map(|s| (s.name.trim(), s.source))
-            .filter(|(name, _)| !name.is_empty())
-            .collect();
+        // Grant entries replace the bug's grant rows; the rest go through the
+        // provenance-carrying table below.
+        let (wanted, granted) = split_upstream_grants(subsystems);
+        self.write_bug_upstream_sections(id, &granted).await?;
 
         // The read is drained and the cursor dropped before any write, because
         // libsql refuses to commit a transaction that still has a statement in
         // progress, and deleting while iterating leaves the cursor open.
         let existing: Vec<String> = {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT subsystem FROM bug_subsystems WHERE bug_id = ?",
                     libsql::params![id],
@@ -4149,7 +6727,7 @@ impl Database {
               LIMIT ?5"
         );
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 &select_sql,
                 libsql::params![linus, now, after_updated_at, after_id, capped_limit],
@@ -4175,7 +6753,7 @@ impl Database {
                 .iter()
                 .map(|&id| libsql::Value::Integer(id))
                 .collect();
-            let mut enr_rows = self.conn.query(&enrichments_sql, enr_params).await?;
+            let mut enr_rows = self.read_conn().query(&enrichments_sql, enr_params).await?;
             let mut enrichments_map: std::collections::HashMap<i64, Vec<BugEnrichment>> =
                 std::collections::HashMap::new();
             while let Some(row) = enr_rows.next().await? {
@@ -4531,6 +7109,290 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically claims the highest-priority canonical verified bug needing a
+    /// security evaluation or manual re-evaluation.
+    ///
+    /// Leaves `pipeline_state` and `updated_at` untouched so background
+    /// security backfills never disturb initial bug triage or periodic upstream
+    /// fix check cursors.
+    pub async fn claim_bug_for_security_eval(
+        &self,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+        max_attempts: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(5, 86_400);
+        let capped_attempts = max_attempts.max(1);
+        let id_opt = self
+            .query_returning_i64(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        security_eval_attempts = security_eval_attempts + 1
+                  WHERE id = (
+                      SELECT id FROM bugs
+                       WHERE duplicate_of_id IS NULL
+                         AND pipeline_state = 'succeeded'
+                         AND lifecycle_status IN ('open', 'fixed', 'closed')
+                         AND (security_score_tenths IS NULL OR security_eval_requested = 1)
+                         AND security_eval_attempts < ?4
+                         AND (lease_expires_at IS NULL OR lease_expires_at <= ?3)
+                       ORDER BY security_eval_requested DESC,
+                                CASE lifecycle_status
+                                    WHEN 'open' THEN 0
+                                    WHEN 'fixed' THEN 1
+                                    ELSE 2
+                                END ASC,
+                                severity_int DESC,
+                                id DESC
+                       LIMIT 1
+                  )
+                  RETURNING id",
+                libsql::params![worker_id, now.saturating_add(ttl), now, capped_attempts],
+            )
+            .await?;
+        match id_opt {
+            Some(id) => self.get_bug_on_write_conn(id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Atomically claims a specific canonical verified bug by internal `bug_id`
+    /// for an explicit security evaluation run.
+    pub async fn claim_specific_bug_for_security_eval(
+        &self,
+        bug_id: i64,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<Option<Bug>> {
+        let now = chrono::Utc::now().timestamp();
+        let ttl = lease_ttl_seconds.clamp(5, 86_400);
+        let updated = self
+            .execute(
+                "UPDATE bugs
+                    SET locked_by = ?1,
+                        lease_expires_at = ?2,
+                        security_eval_attempts = security_eval_attempts + 1
+                  WHERE id = ?4
+                    AND duplicate_of_id IS NULL
+                    AND pipeline_state = 'succeeded'
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')
+                    AND (locked_by IS NULL OR lease_expires_at IS NULL OR lease_expires_at <= ?3)",
+                libsql::params![worker_id, now.saturating_add(ttl), now, bug_id],
+            )
+            .await?;
+        if updated > 0 {
+            self.get_bug_on_write_conn(bug_id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Persists a `security_evaluation` enrichment (which projects score,
+    /// classification, and CVSS vector onto `bugs` via trigger and clears
+    /// `security_eval_requested`).
+    ///
+    /// Returns `Ok(false)` without writing the enrichment if the bug was
+    /// concurrently marked `duplicate` or `dismissed`.
+    pub async fn record_bug_security_evaluation(
+        &self,
+        id: i64,
+        params: SecurityEvaluationRecordParams<'_>,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = if self.bug_claim.is_some() {
+            self.begin_bug_write(id).await?
+        } else {
+            self.begin_immediate_transaction().await?
+        };
+
+        let eligible = {
+            let mut rows = tx
+                .query(
+                    "SELECT 1 FROM bugs
+                      WHERE id = ?1
+                        AND duplicate_of_id IS NULL
+                        AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                    libsql::params![id],
+                )
+                .await?;
+            rows.next().await?.is_some()
+        };
+
+        if !eligible {
+            if params.release_lease {
+                tx.execute(
+                    "UPDATE bugs
+                        SET locked_by = NULL,
+                            lease_expires_at = NULL,
+                            security_eval_requested = 0
+                      WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await?;
+            } else {
+                tx.execute(
+                    "UPDATE bugs SET security_eval_requested = 0 WHERE id = ?1",
+                    libsql::params![id],
+                )
+                .await?;
+            }
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        let data_json = serde_json::to_value(params.evaluation)?;
+        self.with_connection((*tx).clone())
+            .insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "security_evaluation".to_string(),
+                    tool: self.bug_tool.clone(),
+                    author: Some(self.bug_actor.clone()),
+                    model: self.bug_model.clone(),
+                    created_at: now,
+                    content: Some(params.evaluation.summary.clone()),
+                    data_json: Some(data_json),
+                    tokens_in: params.tokens_in,
+                    tokens_out: params.tokens_out,
+                    tokens_cached: params.tokens_cached,
+                    logs: params.logs.map(str::to_string),
+                },
+            )
+            .await?;
+
+        if params.release_lease {
+            tx.execute(
+                "UPDATE bugs
+                    SET locked_by = NULL,
+                        lease_expires_at = NULL
+                  WHERE id = ?1",
+                libsql::params![id],
+            )
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Releases a standalone security-evaluation lease, optionally applying a
+    /// short cooldown window before another background sweep retries the bug.
+    pub async fn release_security_eval_lease(&self, id: i64, cooldown_seconds: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let owner = self.bug_claim.as_ref().map(|c| c.owner.as_str());
+        let next_expiry = if cooldown_seconds > 0 {
+            Some(now.saturating_add(cooldown_seconds))
+        } else {
+            None
+        };
+        self.execute(
+            "UPDATE bugs
+                SET locked_by = NULL,
+                    lease_expires_at = ?1
+              WHERE id = ?2
+                AND (?3 IS NULL OR locked_by = ?3)",
+            libsql::params![next_expiry, id, owner],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Flags a canonical bug for security re-evaluation, resets its automatic
+    /// attempt counter, and records an audit enrichment in one transaction.
+    pub async fn request_bug_security_eval(&self, id: i64, reason: Option<&str>) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_immediate_transaction().await?;
+        let updated = tx
+            .execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE id = ?1
+                    AND duplicate_of_id IS NULL
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                libsql::params![id],
+            )
+            .await?;
+        if updated == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let clean_reason = reason.map(str::trim).filter(|s| !s.is_empty());
+        let content = match clean_reason {
+            Some(r) => format!("Security re-evaluation requested: {r}"),
+            None => "Security re-evaluation requested".to_string(),
+        };
+        let mut data = serde_json::json!({
+            "field": "security_evaluation",
+            "action": "requested",
+        });
+        if let Some(r) = clean_reason {
+            data["reason"] = serde_json::json!(r);
+        }
+        self.with_connection((*tx).clone())
+            .insert_bug_enrichment(
+                id,
+                &NewBugEnrichment {
+                    kind: "audit".to_string(),
+                    tool: self.bug_tool.clone(),
+                    author: Some(self.bug_actor.clone()),
+                    model: self.bug_model.clone(),
+                    created_at: now,
+                    content: Some(content),
+                    data_json: Some(data),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Marks canonical verified bugs for forced security re-evaluation (for
+    /// example after a threat-model update via `sashiko bugs evaluate-security --re-evaluate`).
+    pub async fn queue_bugs_for_security_reeval(&self, limit: Option<usize>) -> Result<usize> {
+        let updated = if let Some(max_rows) = limit {
+            if max_rows == 0 {
+                return Ok(0);
+            }
+            self.execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE id IN (
+                      SELECT id FROM bugs
+                       WHERE duplicate_of_id IS NULL
+                         AND pipeline_state = 'succeeded'
+                         AND lifecycle_status IN ('open', 'fixed', 'closed')
+                       ORDER BY CASE lifecycle_status
+                                    WHEN 'open' THEN 0
+                                    WHEN 'fixed' THEN 1
+                                    ELSE 2
+                                END ASC,
+                                severity_int DESC,
+                                id DESC
+                       LIMIT ?1
+                  )",
+                libsql::params![max_rows as i64],
+            )
+            .await?
+        } else {
+            self.execute(
+                "UPDATE bugs
+                    SET security_eval_requested = 1,
+                        security_eval_attempts = 0
+                  WHERE duplicate_of_id IS NULL
+                    AND pipeline_state = 'succeeded'
+                    AND lifecycle_status IN ('open', 'fixed', 'closed')",
+                (),
+            )
+            .await?
+        };
+        Ok(updated as usize)
+    }
+
     pub async fn list_bugs(&self, params: ListBugsParams<'_>) -> Result<(Vec<Bug>, usize)> {
         let limit_val = params.limit.unwrap_or(50) as i64;
         let page_val = params.page.unwrap_or(1) as i64;
@@ -4551,17 +7413,9 @@ impl Database {
             if titles.is_empty() {
                 return Ok((Vec::new(), 0));
             }
-            let placeholders = vec!["?"; titles.len()].join(", ");
-            conditions.push(
-                format!(
-                    "id IN (SELECT bug_id FROM bug_subsystems
-                            WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
-                    SubsystemSource::MaintainersSection.as_str(),
-                    placeholders
-                )
-                .into(),
-            );
-            for title in titles {
+            let subquery = authorized_bug_ids_subquery(titles.len());
+            conditions.push(format!("id IN ({subquery})").into());
+            for title in titles.iter().chain(&titles) {
                 query_params.push(libsql::Value::Text(title.to_string()));
             }
         }
@@ -4626,6 +7480,29 @@ impl Database {
             query_params.push(libsql::Value::Integer(min_sev as i64));
         }
 
+        if let Some(min_sec_tenths) = params.min_security_score_tenths {
+            conditions.push("security_score_tenths >= ?".into());
+            query_params.push(libsql::Value::Integer(i64::from(min_sec_tenths)));
+        }
+
+        if let Some(classes) = params.security_classes {
+            if classes.is_empty() {
+                return Ok((Vec::new(), 0));
+            }
+            let mut unique: Vec<&'static str> = Vec::with_capacity(3);
+            for cls in classes {
+                let s = cls.as_str();
+                if !unique.contains(&s) {
+                    unique.push(s);
+                }
+            }
+            let placeholders = vec!["?"; unique.len()].join(", ");
+            conditions.push(format!("security_class IN ({placeholders})").into());
+            for s in unique {
+                query_params.push(libsql::Value::Text(s.to_string()));
+            }
+        }
+
         if let Some(status) = params.lifecycle_status {
             conditions.push("lifecycle_status = ?".into());
             query_params.push(libsql::Value::Text(status.as_str().to_string()));
@@ -4639,7 +7516,7 @@ impl Database {
         match params.assignee {
             Some(AssigneeFilter::Unassigned) => conditions.push("assignee IS NULL".into()),
             Some(AssigneeFilter::Is(who)) => {
-                conditions.push("assignee = ?".into());
+                conditions.push("assignee = ? COLLATE NOCASE".into());
                 query_params.push(libsql::Value::Text(who.trim().to_string()));
             }
             None => {}
@@ -4665,6 +7542,10 @@ impl Database {
         let order_clause = match params.sort_by.map(|s| s.to_ascii_lowercase()).as_deref() {
             // Sorts straight off the projected column, which idx_bugs_severity covers.
             Some("severity") => format!("ORDER BY severity_int {}, id {}", sort_dir, sort_dir),
+            Some("security_score") | Some("security") => format!(
+                "ORDER BY security_score_tenths IS NULL, security_score_tenths {}, severity_int DESC, id {}",
+                sort_dir, sort_dir
+            ),
             Some("title") | Some("problem") => {
                 format!("ORDER BY title {}, created_at DESC, id DESC", sort_dir)
             }
@@ -4677,7 +7558,7 @@ impl Database {
                 sort_dir
             ),
             Some("assignee") => format!(
-                "ORDER BY assignee IS NULL, assignee {}, created_at DESC, id DESC",
+                "ORDER BY assignee IS NULL, assignee COLLATE NOCASE {}, created_at DESC, id DESC",
                 sort_dir
             ),
             Some("id") => format!("ORDER BY id {}", sort_dir),
@@ -4705,7 +7586,10 @@ impl Database {
         };
 
         let count_sql = format!("SELECT COUNT(*) FROM bugs {}", where_clause);
-        let mut count_rows = self.conn.query(&count_sql, query_params.clone()).await?;
+        let mut count_rows = self
+            .read_conn()
+            .query(&count_sql, query_params.clone())
+            .await?;
         let total: usize = if let Some(row) = count_rows.next().await? {
             row.get::<i64>(0).unwrap_or(0) as usize
         } else {
@@ -4724,7 +7608,7 @@ impl Database {
         query_params.push(libsql::Value::Integer(limit_val));
         query_params.push(libsql::Value::Integer(offset_val));
 
-        let mut rows = self.conn.query(&select_sql, query_params).await?;
+        let mut rows = self.read_conn().query(&select_sql, query_params).await?;
         let mut bugs = Vec::new();
         while let Some(row) = rows.next().await? {
             bugs.push(Self::parse_bug_row_core(&row)?);
@@ -4753,7 +7637,7 @@ impl Database {
                 .iter()
                 .map(|&id| libsql::Value::Integer(id))
                 .collect();
-            let mut subs_rows = self.conn.query(&subs_sql, subs_params).await?;
+            let mut subs_rows = self.read_conn().query(&subs_sql, subs_params).await?;
             let mut subs_map: std::collections::HashMap<i64, Vec<String>> =
                 std::collections::HashMap::new();
             while let Some(row) = subs_rows.next().await? {
@@ -4775,7 +7659,7 @@ impl Database {
                 .iter()
                 .map(|&id| libsql::Value::Integer(id))
                 .collect();
-            let mut enr_rows = self.conn.query(&enrichments_sql, enr_params).await?;
+            let mut enr_rows = self.read_conn().query(&enrichments_sql, enr_params).await?;
             let mut enrichments_map: std::collections::HashMap<i64, Vec<BugEnrichment>> =
                 std::collections::HashMap::new();
             while let Some(row) = enr_rows.next().await? {
@@ -4819,16 +7703,11 @@ impl Database {
                 if titles.is_empty() {
                     return Ok(Vec::new());
                 }
-                let placeholders = vec!["?"; titles.len()].join(", ");
-                for title in &titles {
+                let subquery = authorized_bug_ids_subquery(titles.len());
+                for title in titles.iter().chain(&titles) {
                     params.push(libsql::Value::Text((*title).to_string()));
                 }
-                format!(
-                    " AND b.id IN (SELECT bug_id FROM bug_subsystems
-                                   WHERE source = '{}' AND subsystem COLLATE NOCASE IN ({}))",
-                    SubsystemSource::MaintainersSection.as_str(),
-                    placeholders
-                )
+                format!(" AND b.id IN ({subquery})")
             }
         };
         let sql = format!(
@@ -4841,7 +7720,7 @@ impl Database {
                    ORDER BY bug_count DESC, bs.subsystem ASC",
             scope_clause
         );
-        let mut rows = self.conn.query(&sql, params).await?;
+        let mut rows = self.read_conn().query(&sql, params).await?;
         let mut results = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let name: String = row.get(0)?;
@@ -4880,19 +7759,66 @@ impl Database {
         Ok(())
     }
 
+    /// Like [`Self::link_review_to_bug`], and in the same write also links
+    /// the related pre-existing disclosure the review recorded under
+    /// `disclosure_fingerprint` to the bug. Under a bug claim both happen in
+    /// the claim-checked transaction, so a worker whose lease expired, or a
+    /// bug folded in the meantime, cannot leave the disclosure pointing at
+    /// the wrong bug.
+    pub async fn link_review_and_disclosure_to_bug(
+        &self,
+        review_id: i64,
+        bug_id: i64,
+        is_newly_discovered: bool,
+        disclosure_fingerprint: &str,
+    ) -> Result<()> {
+        let tx = match &self.bug_claim {
+            Some(claim) => self.begin_bug_write(claim.bug_id).await?,
+            None => self.begin_immediate_transaction().await?,
+        };
+        let tx_db = self.with_connection((*tx).clone());
+        tx_db
+            .insert_bug_review(review_id, bug_id, is_newly_discovered)
+            .await?;
+        tx_db
+            .link_preexisting_disclosure_to_bug(review_id, disclosure_fingerprint, bug_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn insert_bug_review(
         &self,
         review_id: i64,
         bug_id: i64,
         is_newly_discovered: bool,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
             "INSERT INTO bug_reviews (review_id, bug_id, is_newly_discovered)
-                 VALUES (?1, ?2, ?3)
+                 SELECT id, ?2, ?3 FROM reviews
+                  WHERE id = ?1
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND (?4 IS NULL OR (
+                        reviews.patchset_id = ?4
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?5
+                        )
+                    ))
                  ON CONFLICT(review_id, bug_id) DO UPDATE
                     SET is_newly_discovered =
                         MAX(is_newly_discovered, excluded.is_newly_discovered)",
-            libsql::params![review_id, bug_id, if is_newly_discovered { 1 } else { 0 }],
+            libsql::params![
+                review_id,
+                bug_id,
+                if is_newly_discovered { 1 } else { 0 },
+                claim_ps_id,
+                claim_gen
+            ],
         )
         .await?;
         Ok(())
@@ -4903,6 +7829,19 @@ impl Database {
     /// This single Transaction boundary guarantees tearing cannot occur during deduplication.
     /// Returns false when automatic deduplication preserves existing triage.
     pub async fn mark_bug_as_duplicate(&self, params: MarkDuplicateBugParams<'_>) -> Result<bool> {
+        self.mark_bug_as_duplicate_with_attribution(params, None, None)
+            .await
+    }
+
+    /// Transitions a bug into `Duplicate` while atomically updating its
+    /// verified subsystem attribution and `source_files` inside the same
+    /// transaction.
+    pub async fn mark_bug_as_duplicate_with_attribution(
+        &self,
+        params: MarkDuplicateBugParams<'_>,
+        subsystems: Option<&[AttributedSubsystem]>,
+        source_files: Option<&[String]>,
+    ) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.begin_bug_write(params.ephemeral_id).await?;
 
@@ -4941,6 +7880,12 @@ impl Database {
             return Ok(false);
         }
 
+        if let Some(subs) = subsystems {
+            self.with_connection((*tx).clone())
+                .replace_bug_subsystems(params.ephemeral_id, subs)
+                .await?;
+        }
+
         // Folding a bug into a canonical one ends its pipeline, so the
         // analysis state is retired in the same statement as the triage state.
         // Leaving it behind strands the row: the dedup stage returns before the
@@ -4971,6 +7916,7 @@ impl Database {
         )
         .await?;
 
+        let data_json = source_files.map(|files| serde_json::json!({ "source_files": files }));
         self.with_connection((*tx).clone())
             .insert_bug_enrichment(
                 params.ephemeral_id,
@@ -4981,11 +7927,11 @@ impl Database {
                     model: self.bug_model.clone(),
                     created_at: now,
                     content: Some(params.reasoning.to_string()),
+                    data_json,
                     tokens_in: params.tokens_in,
                     tokens_out: params.tokens_out,
                     tokens_cached: params.tokens_cached,
                     logs: params.logs.map(str::to_string),
-                    ..Default::default()
                 },
             )
             .await?;
@@ -5005,12 +7951,31 @@ impl Database {
             libsql::params![params.ephemeral_id],
         )
         .await?;
+        tx.execute(
+            "UPDATE preexisting_disclosures SET bug_id = ?1 WHERE bug_id = ?2",
+            libsql::params![params.canonical_id, params.ephemeral_id],
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(true)
     }
 
+    /// Moves a bug's review links and related-bug disclosures to another
+    /// bug, all or nothing.
     pub async fn migrate_review_bugs(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
+        if self.in_transaction {
+            return self.migrate_review_bugs_in(from_bug_id, to_bug_id).await;
+        }
+        let tx = self.begin_immediate_transaction().await?;
+        self.with_connection((*tx).clone())
+            .migrate_review_bugs_in(from_bug_id, to_bug_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn migrate_review_bugs_in(&self, from_bug_id: i64, to_bug_id: i64) -> Result<()> {
         self.execute(
             "INSERT OR IGNORE INTO bug_reviews (review_id, bug_id, is_newly_discovered)
              SELECT review_id, ?, 0 FROM bug_reviews WHERE bug_id = ?",
@@ -5022,12 +7987,17 @@ impl Database {
             libsql::params![from_bug_id],
         )
         .await?;
+        self.execute(
+            "UPDATE preexisting_disclosures SET bug_id = ?1 WHERE bug_id = ?2",
+            libsql::params![to_bug_id, from_bug_id],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn list_duplicates_for_bug(&self, canonical_id: i64) -> Result<Vec<Bug>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM bugs WHERE duplicate_of_id = ? ORDER BY id ASC",
                 libsql::params![canonical_id],
@@ -5045,7 +8015,7 @@ impl Database {
 
     pub async fn list_bugs_for_review(&self, review_id: i64) -> Result<Vec<(Bug, bool)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
@@ -5076,7 +8046,7 @@ impl Database {
 
     pub async fn list_bugs_for_patchset(&self, patchset_id: i64) -> Result<Vec<(Bug, bool)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT DISTINCT pb.id, rpb.is_newly_discovered
                  FROM bugs pb
@@ -5119,7 +8089,7 @@ impl Database {
     /// a side table rather than on the core row.
     pub async fn list_all_bugs_for_vector_search(&self) -> Result<Vec<Bug>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT b.id, b.bugid, b.title, b.lifecycle_status, b.pipeline_state,
                         b.reporter, b.reported_at, b.assignee, b.assigned_at,
@@ -5218,217 +8188,27 @@ impl Database {
     }
 
     pub async fn get_timeline_stats(&self, subsystem_id: Option<i64>) -> Result<serde_json::Value> {
-        let mut messages_data = Vec::new();
-
-        if let Some(sid) = subsystem_id {
-            let sql_msgs =
-                "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, count(*) FROM messages m
-             JOIN messages_subsystems ms ON m.id = ms.message_id
-             WHERE ms.subsystem_id = ?
-             GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    messages_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        } else {
-            let sql_msgs = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, count(*) FROM messages GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql_msgs, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    messages_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        }
-
-        let mut patchsets_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, status, count(*) FROM patchsets p
-             JOIN patchsets_subsystems ps ON p.id = ps.patchset_id
-             WHERE ps.subsystem_id = ?
-             GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: Option<String> = row.get(1).ok();
-                    let count: i64 = row.get(2)?;
-                    patchsets_data.push(
-                        json!({"day": day, "status": status.unwrap_or_default(), "count": count}),
-                    );
-                }
-            }
-        } else {
-            let sql = "SELECT strftime('%Y-%m-%d', date, 'unixepoch') as day, status, count(*) FROM patchsets GROUP BY day, status ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: Option<String> = row.get(1).ok();
-                    let count: i64 = row.get(2)?;
-                    patchsets_data.push(
-                        json!({"day": day, "status": status.unwrap_or_default(), "count": count}),
-                    );
-                }
-            }
-        }
-
-        // Patches stats (individual patches)
-        let mut patches_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql =
-                "SELECT strftime('%Y-%m-%d', m.date, 'unixepoch') as day, count(*) FROM patches p
-              JOIN messages m ON p.message_id = m.message_id
-              JOIN patches_subsystems ps ON p.id = ps.patch_id
-              WHERE ps.subsystem_id = ?
-              GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    patches_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        } else {
-            let sql =
-                "SELECT strftime('%Y-%m-%d', m.date, 'unixepoch') as day, count(*) FROM patches p
-              JOIN messages m ON p.message_id = m.message_id
-              GROUP BY day ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let count: i64 = row.get(1)?;
-                    patches_data.push(json!({"day": day, "count": count}));
-                }
-            }
-        }
-
-        // Reviews stats (outcomes over time)
-        let mut reviews_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                r.status,
-                COUNT(*) as count
-            FROM reviews r
-            JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id
-            WHERE ps.subsystem_id = ?
-            GROUP BY day, status
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    reviews_data.push(json!({"day": day, "status": status, "count": count}));
-                }
-            }
-        } else {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                r.status,
-                COUNT(*) as count
-            FROM reviews r
-            GROUP BY day, status
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let status: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    reviews_data.push(json!({"day": day, "status": status, "count": count}));
-                }
-            }
-        }
-
-        // Findings stats
-        let mut findings_data = Vec::new();
-        if let Some(sid) = subsystem_id {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                CASE f.severity 
-                    WHEN 1 THEN 'low' 
-                    WHEN 2 THEN 'medium' 
-                    WHEN 3 THEN 'high' 
-                    WHEN 4 THEN 'critical' 
-                    ELSE 'unknown' 
-                END as severity,
-                COUNT(*) as count
-            FROM findings f
-            JOIN reviews r ON f.review_id = r.id
-            JOIN patchsets_subsystems ps ON r.patchset_id = ps.patchset_id
-            WHERE ps.subsystem_id = ?
-            GROUP BY day, severity
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, libsql::params![sid]).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    findings_data.push(json!({"day": day, "severity": severity, "count": count}));
-                }
-            }
-        } else {
-            let sql = "SELECT 
-                strftime('%Y-%m-%d', r.created_at, 'unixepoch') as day,
-                CASE f.severity 
-                    WHEN 1 THEN 'low' 
-                    WHEN 2 THEN 'medium' 
-                    WHEN 3 THEN 'high' 
-                    WHEN 4 THEN 'critical' 
-                    ELSE 'unknown' 
-                END as severity,
-                COUNT(*) as count
-            FROM findings f
-            JOIN reviews r ON f.review_id = r.id
-            GROUP BY day, severity
-            ORDER BY day";
-            let mut rows = self.conn.query(sql, ()).await?;
-            while let Ok(Some(row)) = rows.next().await {
-                if let Ok(day) = row.get::<String>(0) {
-                    let severity: String = row.get(1).unwrap_or_else(|_| "unknown".to_string());
-                    let count: i64 = row.get(2)?;
-                    findings_data.push(json!({"day": day, "severity": severity, "count": count}));
-                }
-            }
-        }
-
-        Ok(json!({
-            "messages": messages_data,
-            "patchsets": patchsets_data,
-            "patches": patches_data,
-            "reviews": reviews_data,
-            "findings": findings_data
-        }))
+        self.get_timeline_stats_o1(subsystem_id).await
     }
 
     pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
-        let mut total_rows = self
-            .conn
-            .query(
-                "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review')",
-                (),
-            )
+        let gauge_rows = self
+            .get_state_gauges_by_metric("sashiko_reviews_stored")
             .await?;
-        let total_reviews: i64 = if let Ok(Some(row)) = total_rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
-
-        let mut failed_rows = self
-            .conn
-            .query(
-                "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review') AND (lower(status) LIKE '%failed%' OR lower(status) LIKE '%error%')",
-                (),
-            )
-            .await?;
-        let total_failures: i64 = if let Ok(Some(row)) = failed_rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
+        let mut total_reviews: i64 = 0;
+        let mut total_failures: i64 = 0;
+        for (lj, val) in gauge_rows {
+            let labels = decode_labels_json(&lj);
+            let st = labels.get("status").map_or("", String::as_str);
+            if matches!(st, "Pending" | "In Review") {
+                continue;
+            }
+            total_reviews += val;
+            let low = st.to_ascii_lowercase();
+            if low.contains("failed") || low.contains("error") {
+                total_failures += val;
+            }
+        }
 
         let sql = "WITH last_reviews AS (
             SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
@@ -5445,7 +8225,7 @@ impl Database {
         LEFT JOIN ai_interactions ai INDEXED BY idx_ai_interactions_tokens ON r.interaction_id = ai.id
         GROUP BY r.provider, r.model, r.status";
 
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.read_conn().query(sql, ()).await?;
         let mut stats = Vec::new();
         #[allow(clippy::similar_names)]
         while let Ok(Some(row)) = rows.next().await {
@@ -5481,7 +8261,7 @@ impl Database {
         JOIN bug_enrichments e INDEXED BY idx_bug_enrichments_bug_id ON e.bug_id = b.id
         WHERE e.tokens_in IS NOT NULL OR e.tokens_out IS NOT NULL OR e.tokens_cached IS NOT NULL";
 
-        let mut bug_rows = self.conn.query(bug_sql, ()).await?;
+        let mut bug_rows = self.read_conn().query(bug_sql, ()).await?;
         let (bug_count, bug_stage_count, bug_tokens_in, bug_tokens_out, bug_tokens_cached) =
             if let Ok(Some(row)) = bug_rows.next().await {
                 (
@@ -5514,10 +8294,10 @@ impl Database {
                        SELECT id FROM reviews ORDER BY id DESC LIMIT 1000 \
                    ) \
                    SELECT tu.provider, tu.model, tu.tool_name, count(*), avg(tu.output_length) \
-                   FROM tool_usages tu \
-                   JOIN last_reviews r ON tu.review_id = r.id \
+                   FROM last_reviews r \
+                   JOIN tool_usages tu INDEXED BY idx_tool_usages_review ON tu.review_id = r.id \
                    GROUP BY tu.provider, tu.model, tu.tool_name";
-        let mut rows = self.conn.query(sql, ()).await?;
+        let mut rows = self.read_conn().query(sql, ()).await?;
         let mut stats = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             let provider: Option<String> = row.get(0).ok();
@@ -5541,7 +8321,7 @@ impl Database {
         let email = email.trim();
         {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id FROM people WHERE email = ?",
                     libsql::params![email],
@@ -5597,7 +8377,7 @@ impl Database {
     pub async fn ensure_subsystem(&self, name: &str, mailing_list_address: &str) -> Result<i64> {
         {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id FROM subsystems WHERE mailing_list_address = ?",
                     libsql::params![mailing_list_address],
@@ -5677,12 +8457,20 @@ impl Database {
     }
 
     pub async fn add_subsystem_to_patch(&self, patch_id: i64, subsystem_id: i64) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
-            libsql::params![patch_id, subsystem_id],
+        if self.in_transaction {
+            self.execute(
+                "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id) VALUES (?, ?)",
+                libsql::params![patch_id, subsystem_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        self.add_subsystem_link_with_rollup(
+            stats_queries::SubsystemLinkTarget::Patch,
+            patch_id,
+            subsystem_id,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn add_subsystem_to_patchset(
@@ -5690,17 +8478,25 @@ impl Database {
         patchset_id: i64,
         subsystem_id: i64,
     ) -> Result<()> {
-        self.execute(
-            "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
-            libsql::params![patchset_id, subsystem_id],
+        if self.in_transaction {
+            self.execute(
+                "INSERT OR IGNORE INTO patchsets_subsystems (patchset_id, subsystem_id) VALUES (?, ?)",
+                libsql::params![patchset_id, subsystem_id],
+            )
+            .await?;
+            return Ok(());
+        }
+        self.add_subsystem_link_with_rollup(
+            stats_queries::SubsystemLinkTarget::Patchset,
+            patchset_id,
+            subsystem_id,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     pub async fn get_message_id_by_msg_id(&self, msg_id: &str) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM messages WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -5737,7 +8533,7 @@ impl Database {
 
     pub async fn get_last_article_num(&self, group: &str) -> Result<u64> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT last_article_num FROM mailing_lists WHERE nntp_group = ?",
                 libsql::params![group],
@@ -5777,7 +8573,7 @@ impl Database {
 
     pub async fn get_thread_id_for_message(&self, message_id: &str) -> Result<Option<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT thread_id FROM messages WHERE message_id = ?",
                 libsql::params![message_id],
@@ -5791,28 +8587,29 @@ impl Database {
     }
 
     pub async fn ensure_thread_for_message(&self, message_id: &str, date: i64) -> Result<i64> {
-        // 1. Check if message exists
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let thread_id = tx_db
+            .ensure_thread_for_message_in_tx(message_id, date)
+            .await?;
+        tx.commit().await?;
+        Ok(thread_id)
+    }
+
+    async fn ensure_thread_for_message_in_tx(&self, message_id: &str, date: i64) -> Result<i64> {
         if let Some(tid) = self.get_thread_id_for_message(message_id).await? {
             return Ok(tid);
         }
 
-        // 2. Not found, create new thread and placeholder message
         let thread_id = self
             .create_thread(message_id, "(placeholder)", date)
             .await?;
 
-        self.create_message(
-            message_id,
-            thread_id,
-            None,
-            "unknown",
-            "(placeholder)",
-            date,
-            "",
-            "",
-            "",
-            None,
-            None,
+        self.execute(
+            "INSERT INTO messages (message_id, thread_id, author, subject, date, body, to_recipients, cc_recipients)
+             VALUES (?, ?, 'unknown', '(placeholder)', ?, '', '', '')
+             ON CONFLICT(message_id) DO NOTHING",
+            libsql::params![message_id, thread_id, date],
         )
         .await?;
 
@@ -5888,7 +8685,7 @@ impl Database {
         if let Some(old_thread_id) = old_thread_id
             && old_thread_id != thread_id
         {
-            info!("Merging thread {} into {}", old_thread_id, thread_id);
+            debug!("Merging thread {} into {}", old_thread_id, thread_id);
             // 1. Move messages
             tx.execute(
                 "UPDATE messages SET thread_id = ? WHERE thread_id = ?",
@@ -5964,7 +8761,7 @@ impl Database {
     ) -> Result<i64> {
         {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT id FROM baselines WHERE repo_url IS ? AND branch IS ? AND last_known_commit IS ?",
                     libsql::params![repo_url, branch, commit],
@@ -5986,7 +8783,7 @@ impl Database {
 
     pub async fn get_baseline_commit(&self, id: i64) -> Result<Option<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT last_known_commit FROM baselines WHERE id = ?",
                 libsql::params![id],
@@ -6046,7 +8843,7 @@ impl Database {
         version: Option<u32>,
     ) -> Result<bool> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT subject, author FROM messages WHERE message_id = ?",
                 libsql::params![candidate_msg_id],
@@ -6065,6 +8862,94 @@ impl Database {
             && total == total_parts
             && crate::patch::parse_subject_version(&subject).unwrap_or(1) == version.unwrap_or(1)
             && crate::patch::authors_match(&candidate_author, author))
+    }
+
+    /// Check whether an in-thread reply carrying a diff is an updated version
+    /// of an existing single-patch submission in `thread_id` from the same
+    /// author with the same cleaned subject, and return the next version number.
+    pub async fn find_in_thread_followup_version(
+        &self,
+        thread_id: i64,
+        message_id: &str,
+        author: &str,
+        subject: &str,
+        git_patch_id: Option<&str>,
+        diff: &str,
+    ) -> Result<Option<u32>> {
+        let target_clean = crate::patch::clean_subject(subject);
+        if target_clean.is_empty() {
+            return Ok(None);
+        }
+
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT id, cover_letter_message_id, author, subject, total_parts FROM patchsets WHERE thread_id = ? ORDER BY id ASC",
+                libsql::params![thread_id],
+            )
+            .await?;
+
+        let mut matched_prior = false;
+        let mut max_version = 1u32;
+        while let Some(row) = rows.next().await? {
+            let ps_id: i64 = row.get(0)?;
+            let cover_msg_id: Option<String> = row.get(1).ok();
+            let existing_author: String = row.get(2).unwrap_or_default();
+            let existing_subject: String = row.get(3).unwrap_or_default();
+            let total_parts: u32 = row.get(4).unwrap_or(1);
+            let existing_version = crate::patch::parse_subject_version(&existing_subject);
+
+            if cover_msg_id.as_deref() == Some(message_id)
+                || self.patchset_holds_message(ps_id, message_id).await?
+            {
+                if let Some(v) = existing_version.filter(|&v| v > 1) {
+                    return Ok(Some(v));
+                }
+                continue;
+            }
+
+            if total_parts == 1
+                && crate::patch::authors_match(&existing_author, author)
+                && crate::patch::clean_subject(&existing_subject) == target_clean
+            {
+                matched_prior = true;
+                max_version = max_version.max(existing_version.unwrap_or(1));
+            }
+        }
+
+        if !matched_prior {
+            return Ok(None);
+        }
+
+        let mut patch_rows = self
+            .read_conn()
+            .query(
+                "SELECT p.git_patch_id, p.diff FROM patches p \
+                 JOIN patchsets ps ON p.patchset_id = ps.id \
+                 WHERE ps.thread_id = ? AND p.message_id != ?",
+                libsql::params![thread_id, message_id],
+            )
+            .await?;
+
+        let trimmed_diff = diff.trim();
+        while let Some(row) = patch_rows.next().await? {
+            let existing_patch_id: Option<String> = row.get(0).ok();
+            if let (Some(new_id), Some(old_id)) = (git_patch_id, existing_patch_id.as_deref())
+                && new_id == old_id
+            {
+                return Ok(None);
+            }
+            let existing_diff =
+                crate::compression::get_compressed_string(&row, 1).unwrap_or_default();
+            if existing_diff.trim() == trimmed_diff {
+                return Ok(None);
+            }
+        }
+
+        let next_version = crate::patch::parse_subject_version(subject)
+            .filter(|&v| v > max_version)
+            .or_else(|| max_version.checked_add(1));
+        Ok(next_version)
     }
 
     /// Determine whether an incoming message's version tag is compatible with an
@@ -6100,12 +8985,15 @@ impl Database {
         // Conversely, if unversioned patches arrived first (existing_version is None,
         // existing_subject_index > 0) and an explicit versioned cover letter or patch
         // arrives from the same git send-email batch (or direct reply to the cover letter),
-        // allow them to merge.
+        // allow them to merge. Awaiting Review counts alongside Pending: it is the
+        // same "complete but not yet reviewed" state with review.auto_review off.
         if existing_version.is_none() && new_version.is_some() {
             return existing_subject_index > 0
                 && (existing_status == "Incomplete"
                     || existing_status == "Fetching"
-                    || (new_part_index == 0 && existing_status == "Pending"))
+                    || (new_part_index == 0
+                        && (existing_status == "Pending"
+                            || existing_status == "Awaiting Review")))
                 && same_batch_or_reply;
         }
 
@@ -6124,7 +9012,7 @@ impl Database {
         }
 
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT subject FROM messages WHERE message_id = ?",
                 libsql::params![msg_id],
@@ -6140,7 +9028,7 @@ impl Database {
         }
 
         let mut ps_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT subject_index FROM patchsets WHERE id = ?",
                 libsql::params![patchset_id],
@@ -6173,7 +9061,7 @@ impl Database {
         is_own_part_id: bool,
     ) -> Result<()> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT cover_letter_message_id, total_parts, subject_index, subject, status, received_parts FROM patchsets WHERE id = ?",
                 libsql::params![patchset_id],
@@ -6196,7 +9084,7 @@ impl Database {
         // Never adopt an identity that is already claimed as the cover letter
         // of another patchset row.
         let mut owner_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND id != ? LIMIT 1",
                 libsql::params![identity, patchset_id],
@@ -6226,7 +9114,7 @@ impl Database {
                             if !is_placeholder && existing_total == 1 && existing_subject_index == 1
                             {
                                 let mut m_rows = self
-                                    .conn
+                                    .read_conn()
                                     .query(
                                         "SELECT subject FROM messages WHERE message_id = ? LIMIT 1",
                                         libsql::params![identity],
@@ -6322,7 +9210,7 @@ impl Database {
     /// Report whether any patch in `patchset_id` has `in_reply_to = message_id`.
     async fn patches_reply_to_message(&self, patchset_id: i64, message_id: &str) -> Result<bool> {
         let mut p_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND m.in_reply_to = ? LIMIT 1",
                 libsql::params![patchset_id, message_id],
@@ -6335,7 +9223,7 @@ impl Database {
     /// is not one of its patches.
     async fn patch_part_index(&self, patchset_id: i64, message_id: &str) -> Result<Option<u32>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT part_index FROM patches WHERE patchset_id = ? AND message_id = ?",
                 libsql::params![patchset_id, message_id],
@@ -6358,7 +9246,7 @@ impl Database {
     async fn patchset_holds_message(&self, patchset_id: i64, message_id: &str) -> Result<bool> {
         for candidate in Self::get_msgid_candidates(message_id) {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM patchsets
                       WHERE id = ? AND cover_letter_message_id = ?
@@ -6397,7 +9285,7 @@ impl Database {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn create_patchset(
+    pub async fn create_patchset_with_default_priority(
         &self,
         thread_id: i64,
         cover_letter_message_id: Option<&str>,
@@ -6415,6 +9303,7 @@ impl Database {
         strict_author: bool,
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
+        default_priority: i64,
     ) -> Result<Option<i64>> {
         let res = self
             .create_patchset_inner(
@@ -6434,6 +9323,7 @@ impl Database {
                 strict_author,
                 skip_filters,
                 only_filters,
+                default_priority,
             )
             .await?;
 
@@ -6445,6 +9335,48 @@ impl Database {
         }
 
         Ok(res)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_patchset(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+    ) -> Result<Option<i64>> {
+        self.create_patchset_with_default_priority(
+            thread_id,
+            cover_letter_message_id,
+            message_id,
+            subject,
+            author,
+            date,
+            total_parts,
+            parser_version,
+            to,
+            cc,
+            version,
+            part_index,
+            baseline_id,
+            strict_author,
+            skip_filters,
+            only_filters,
+            500,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6466,9 +9398,82 @@ impl Database {
         strict_author: bool,
         skip_filters: Option<&Vec<String>>,
         only_filters: Option<&Vec<String>>,
+        default_priority: i64,
+    ) -> Result<Option<i64>> {
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        let res = tx_db
+            .create_patchset_in_tx(
+                thread_id,
+                cover_letter_message_id,
+                message_id,
+                subject,
+                author,
+                date,
+                total_parts,
+                parser_version,
+                to,
+                cc,
+                version,
+                part_index,
+                baseline_id,
+                strict_author,
+                skip_filters,
+                only_filters,
+                default_priority,
+            )
+            .await;
+
+        match res {
+            Ok(val) => {
+                if let Some(tx) = tx_guard {
+                    tx.commit().await?;
+                }
+                Ok(val)
+            }
+            Err(err) => {
+                if let Some(tx) = tx_guard {
+                    let _ = tx.rollback().await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_patchset_in_tx(
+        &self,
+        thread_id: i64,
+        cover_letter_message_id: Option<&str>,
+        message_id: &str,
+        subject: &str,
+        author: &str,
+        date: i64,
+        total_parts: u32,
+        parser_version: i32,
+        to: &str,
+        cc: &str,
+        version: Option<u32>,
+        part_index: u32,
+        baseline_id: Option<i64>,
+        strict_author: bool,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+        default_priority: i64,
     ) -> Result<Option<i64>> {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
+        let explicit_ver = version
+            .or_else(|| crate::patch::parse_subject_version(subject))
+            .map(i64::from);
 
         // A series with no cover letter names itself after a part, and this
         // message is that part when the caller passed its own id. Such a name
@@ -6501,11 +9506,11 @@ impl Database {
                 "SELECT id, date, author, subject, subject_index, total_parts, status, thread_id, received_parts FROM patchsets WHERE cover_letter_message_id = ?"
             };
             let mut rows = if scope_to_thread {
-                self.conn
+                self.read_conn()
                     .query(query, libsql::params![clid.clone(), thread_id])
                     .await?
             } else {
-                self.conn
+                self.read_conn()
                     .query(query, libsql::params![clid.clone()])
                     .await?
             };
@@ -6525,6 +9530,7 @@ impl Database {
                 if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total)
                 {
                     if is_duplicate {
+                        drop(rows);
                         return Ok(Some(id));
                     }
                     if !(is_synthetic_series
@@ -6560,7 +9566,7 @@ impl Database {
                     false
                 } else {
                     let mut p_rows = self
-                        .conn
+                        .read_conn()
                         .query(
                             "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
                             libsql::params![id, part_index, message_id],
@@ -6605,6 +9611,8 @@ impl Database {
                     existing_author.as_str()
                 };
 
+                drop(rows);
+
                 // We proceed to update this record with the full metadata
                 if is_reply_msg {
                     self.execute(
@@ -6614,8 +9622,8 @@ impl Database {
                     .await?;
                 } else {
                     self.execute(
-                            "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                            libsql::params![thread_id, final_author, final_total, parser_version, to, cc, id],
+                            "UPDATE patchsets SET thread_id = ?, author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ?, version = COALESCE(?, version, 1) WHERE id = ?",
+                            libsql::params![thread_id, final_author, final_total, parser_version, to, cc, explicit_ver, id],
                         )
                         .await?;
                 }
@@ -6645,14 +9653,17 @@ impl Database {
                         "UPDATE patchsets
                          SET status = 'Incomplete', failed_reason = NULL
                          WHERE id = ?
-                           AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
+                           AND (status = 'Fetching'
+                                OR (status = 'Failed'
+                                    AND (COALESCE(received_parts, 0) = 0
+                                         OR COALESCE(received_parts, 0) < COALESCE(total_parts, 1))))",
                         libsql::params![id],
                     )
                     .await?;
 
                 self.execute(
-                    "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                    libsql::params![id],
+                    "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                    libsql::params![self.completion_status(), id],
                 ).await?;
 
                 return Ok(Some(id));
@@ -6664,7 +9675,7 @@ impl Database {
         let window_start = date - 86400;
         let window_end = date + 86400;
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id, date, author, subject, subject_index, total_parts, received_parts, cover_letter_message_id, thread_id, baseline_id, baseline_part_index, status FROM patchsets
                  WHERE thread_id = ? OR (author = ? AND date BETWEEN ? AND ?)
@@ -6689,9 +9700,9 @@ impl Database {
 
         while let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
-            let existing_date: i64 = row.get(1)?;
-            let existing_author: String = row.get(2)?;
-            let existing_subject: String = row.get(3)?;
+            let existing_date: i64 = row.get::<Option<i64>>(1)?.unwrap_or(0);
+            let existing_author: String = row.get::<Option<String>>(2)?.unwrap_or_default();
+            let existing_subject: String = row.get::<Option<String>>(3)?.unwrap_or_default();
             let existing_subject_index: u32 = row.get(4).unwrap_or(9999);
             let existing_total: u32 = row.get(5).unwrap_or(1);
             let existing_received: u32 = row.get(6).unwrap_or(0);
@@ -6721,7 +9732,7 @@ impl Database {
                     && existing_subject_index == 0
             } else {
                 let mut p_rows = self
-                    .conn
+                    .read_conn()
                     .query(
                         "SELECT 1 FROM patches WHERE patchset_id = ? AND part_index = ? AND message_id != ?",
                         libsql::params![id, part_index, message_id],
@@ -6736,7 +9747,7 @@ impl Database {
                     Some(cover_id.split('-').next().unwrap_or(cover_id).to_string());
             } else {
                 let mut p_rows = self
-                    .conn
+                    .read_conn()
                     .query(
                         "SELECT message_id FROM patches WHERE patchset_id = ? LIMIT 1",
                         libsql::params![id],
@@ -6769,25 +9780,50 @@ impl Database {
                 msgid_prefix_match || patches_reply_to_new_cover,
             );
 
+            let is_placeholder = existing_subject == "(placeholder)"
+                || existing_status == "Fetching"
+                || (existing_status == "Failed" && existing_received == 0);
+            let is_multipart_cover_and_singleton_patch = (existing_total > 1
+                && existing_subject_index == 0
+                && total_parts == 1
+                && part_index == 1)
+                || (total_parts > 1
+                    && part_index == 0
+                    && existing_total == 1
+                    && existing_subject_index == 1
+                    && !is_placeholder);
+            let totals_compatible = !is_multipart_cover_and_singleton_patch
+                && (total_parts == existing_total || existing_total == 1 || total_parts == 1);
+
             // Relaxed author check logic
             let author_match = crate::patch::authors_match(&existing_author, author);
-            let series_match = (total_parts > 1 && total_parts == existing_total)
-                || existing_total == 1
-                || total_parts == 1;
+            let series_match = totals_compatible;
 
+            // The new singleton and the message that defines this patchset are
+            // a 0/1 cover and a 1/1 patch, in either arrival order.
+            let is_cover_patch_pair = total_parts == 1
+                && existing_total == 1
+                && matches!((part_index, existing_subject_index), (0, 1) | (1, 0));
+            // A cover (0/1) and a patch (1/1) in one thread group even when
+            // their authors differ. The rule applies to every source: all
+            // messages of an API submission share one thread, and a 1/1 sent
+            // into a 0/1 cover's mailing-list thread is taken as its patch.
+            let is_cover_patch_pair_in_thread = same_thread && is_cover_patch_pair;
             let author_or_series_match = if strict_author {
-                author_match
+                author_match || is_cover_patch_pair_in_thread
             } else {
                 author_match || series_match
             };
 
             if Self::is_closed_to_new_parts(&existing_status, existing_received, existing_total) {
                 if is_duplicate {
+                    drop(rows);
                     return Ok(Some(id));
                 }
                 let is_late_own_cover = part_index == 0
                     && !Self::is_reply_subject(subject)
                     && existing_subject_index > 0
+                    && totals_compatible
                     && (existing_total > 1
                         || patches_reply_to_new_cover
                         || Self::has_explicit_zero_index(subject))
@@ -6796,14 +9832,54 @@ impl Database {
                     && author_or_series_match
                     && !index_collision;
                 if is_late_own_cover {
+                    drop(rows);
                     if let Some(clid) = cover_letter_message_id {
                         self.adopt_series_identity(id, clid, 0, false).await?;
                     }
-                    self.execute(
+                    let subject_updated = self
+                        .execute(
                             "UPDATE patchsets SET subject = ?, subject_index = 0 WHERE id = ? AND subject_index > 0",
                             libsql::params![subject, id],
                         )
                         .await?;
+                    // When a series failed to apply before its 0/N cover letter arrived,
+                    // re-queue it once if the late cover letter supplies baseline or
+                    // prerequisite metadata that patch 1 lacked.
+                    if subject_updated > 0
+                        && matches!(
+                            ReviewStatus::from_str(&existing_status),
+                            Ok(ReviewStatus::FailedToApply)
+                        )
+                        && let Some(clid) = cover_letter_message_id
+                    {
+                        let cover_body = self.get_message_body(clid).await?;
+                        if crate::baseline::cover_letter_adds_baseline_metadata(
+                            &existing_subject,
+                            subject,
+                            cover_body.as_deref(),
+                        ) {
+                            let requeued = self
+                                .execute(
+                                    "UPDATE patchsets
+                                        SET status = 'Pending',
+                                            baseline_id = NULL,
+                                            baseline_logs = NULL,
+                                            failed_reason = NULL
+                                      WHERE id = ?
+                                        AND status IN ('Failed To Apply', 'FailedToApply')
+                                        AND cover_letter_message_id = ?",
+                                    libsql::params![id, clid],
+                                )
+                                .await?;
+                            if requeued > 0 {
+                                self.reset_patchset_review_state(id).await?;
+                                info!(
+                                    "Patchset {} received late cover letter {} with baseline/prerequisite metadata; requeued from Failed To Apply to Pending",
+                                    id, clid
+                                );
+                            }
+                        }
+                    }
                     return Ok(Some(id));
                 }
                 continue;
@@ -6823,18 +9899,8 @@ impl Database {
             let is_singleton = total_parts == 1;
             // For singletons, we require the subject to be somewhat similar to avoid merging unrelated patches.
             let subject_match = if is_singleton {
-                if subject == existing_subject {
-                    true
-                } else {
-                    // Allow merging 0/1 (cover) and 1/1 (patch) even if subjects differ
-                    if (part_index == 0 && existing_subject_index == 1)
-                        || (part_index == 1 && existing_subject_index == 0)
-                    {
-                        true
-                    } else {
-                        clean_new == clean_old
-                    }
-                }
+                // A 0/1 cover and its 1/1 patch merge even when subjects differ.
+                subject == existing_subject || is_cover_patch_pair || clean_new == clean_old
             } else {
                 // For series:
                 // If we are replacing/matching the SAME index as the one that defined the patchset subject,
@@ -6859,22 +9925,25 @@ impl Database {
             // Thread Enforcement: To prevent cross-thread "stealing" of patches for resends of the same series,
             // we strictly require multi-part series patches to belong to the same thread,
             // unless they share a git send-email Message-ID prefix indicating they were sent together unthreaded.
-            let thread_compatible = same_thread || is_singleton || msgid_prefix_match;
+            // A cover/patch pair of singletons is the exception to the
+            // singleton leniency: it must be tied together by thread or by a
+            // common send-email batch, never by author and time alone.
+            let thread_compatible = same_thread
+                || msgid_prefix_match
+                || patches_reply_to_new_cover
+                || (is_singleton && existing_total == 1 && !is_cover_patch_pair);
             let is_same_series_redelivery =
                 is_duplicate && same_thread && total_parts == existing_total;
 
             if author_or_series_match
                 && (!strict_author || (date - existing_date).abs() < 86400)
                 && versions_compatible
-                && (total_parts == existing_total || existing_total == 1 || total_parts == 1)
+                && totals_compatible
                 && (subject_match || is_same_series_redelivery)
                 && prefix_match
                 && thread_compatible
                 && (!index_collision || is_same_series_redelivery)
             {
-                let is_placeholder = existing_subject == "(placeholder)"
-                    || existing_status == "Fetching"
-                    || (existing_status == "Failed" && existing_received == 0);
                 matches.push(CandidateMatch {
                     id,
                     subject: existing_subject,
@@ -6889,6 +9958,8 @@ impl Database {
             }
         }
 
+        drop(rows);
+
         if !matches.is_empty() {
             // Keep the row with the lowest ID (created first) as the primary target
             matches.sort_by_key(|k| k.id);
@@ -6898,12 +9969,13 @@ impl Database {
             let mut best_merged_subject: Option<(u32, String)> = None;
             let mut merged_cover_ids: Vec<String> = Vec::new();
 
-            // If we have multiple matches, merge others into target_id
+            // If we have multiple matches, merge others into target_id inside the
+            // enclosing immediate transaction.
             if matches.len() > 1 {
-                let tx = self.begin_transaction().await?;
+                let tx = self;
                 for merge_from in matches.iter().skip(1) {
                     let merge_from_id = merge_from.id;
-                    info!("Merging patchset {} into {}", merge_from_id, target_id);
+                    debug!("Merging patchset {} into {}", merge_from_id, target_id);
 
                     // Re-point any bugs referencing duplicate patches before deleting them
                     tx.execute(
@@ -6945,6 +10017,43 @@ impl Database {
                     .await?;
 
                     tx.execute(
+                        "UPDATE prior_feedback_resolutions
+                            SET patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = prior_feedback_resolutions.patch_id
+                                )
+                          WHERE patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Preserve Sent/Sending outbox status when merging duplicate patches
+                    // or patchsets so an already-delivered or in-flight email is never
+                    // replaced by a Pending duplicate.
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE status NOT IN ('Sent', 'Sending', 'Locked')
+                            AND patch_id IN (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                      JOIN email_outbox meo ON meo.patch_id = mp.id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.patchset_id = ?
+                                       AND meo.status IN ('Sent', 'Sending', 'Locked')
+                                )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
                         "UPDATE email_outbox
                             SET patch_id = (
                                     SELECT tp.id
@@ -6982,6 +10091,43 @@ impl Database {
                     )
                     .await?;
 
+                    // Preserve Sent/Sending patchset-level outbox rows across
+                    // duplicate patchset merges and avoid duplicate rows per kind.
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patch_id IS NULL
+                            AND patchset_id = ?
+                            AND status NOT IN ('Sent', 'Sending', 'Locked')
+                            AND kind IN (
+                                SELECT kind FROM email_outbox
+                                 WHERE patch_id IS NULL
+                                   AND patchset_id = ?
+                                   AND status IN ('Sent', 'Sending', 'Locked')
+                            )",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE email_outbox
+                            SET patchset_id = ?
+                          WHERE patch_id IS NULL
+                            AND patchset_id = ?
+                            AND NOT EXISTS (
+                                SELECT 1 FROM email_outbox teo
+                                 WHERE teo.patch_id IS NULL
+                                   AND teo.patchset_id = ?
+                                   AND teo.kind = email_outbox.kind
+                            )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM email_outbox
+                          WHERE patch_id IS NULL AND patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
                     tx.execute(
                         "INSERT OR IGNORE INTO patches_subsystems (patch_id, subsystem_id)
                          SELECT tp.id, ps.subsystem_id
@@ -7002,6 +10148,66 @@ impl Database {
                                        AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
                                 )",
                         libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Clear any intra-merge previous_patch_id links between target_id and
+                    // merge_from_id first so they neither block inheriting valid upstream
+                    // patch lineage nor get copied onto the surviving row.
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = NULL, previous_patch_status = NULL
+                          WHERE patchset_id IN (?, ?)
+                            AND previous_patch_id IN (SELECT id FROM patches WHERE patchset_id IN (?, ?))",
+                        libsql::params![target_id, merge_from_id, target_id, merge_from_id],
+                    )
+                    .await?;
+
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = (
+                                    SELECT tp.id
+                                      FROM patches tp
+                                      JOIN patches mp ON mp.message_id = tp.message_id
+                                     WHERE tp.patchset_id = ?
+                                       AND mp.id = patches.previous_patch_id
+                                )
+                          WHERE previous_patch_id IN (
+                                    SELECT mp.id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id IN (SELECT message_id FROM patches WHERE patchset_id = ?)
+                                )",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
+                    // Preserve per-patch version lineage from duplicate rows on merge_from_id
+                    // when the surviving row on target_id has not been linked yet.
+                    tx.execute(
+                        "UPDATE patches
+                            SET previous_patch_id = (
+                                    SELECT mp.previous_patch_id
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                ),
+                                previous_patch_status = (
+                                    SELECT mp.previous_patch_status
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                )
+                          WHERE patchset_id = ?
+                            AND previous_patch_id IS NULL
+                            AND EXISTS (
+                                    SELECT 1
+                                      FROM patches mp
+                                     WHERE mp.patchset_id = ?
+                                       AND mp.message_id = patches.message_id
+                                       AND mp.previous_patch_id IS NOT NULL
+                                )",
+                        libsql::params![merge_from_id, merge_from_id, target_id, merge_from_id],
                     )
                     .await?;
 
@@ -7030,6 +10236,16 @@ impl Database {
                     // Reassign reviews
                     tx.execute(
                         "UPDATE reviews SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE prior_feedback_resolutions SET patchset_id = ? WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "UPDATE review_pipeline_stats SET patchset_id = ? WHERE patchset_id = ?",
                         libsql::params![target_id, merge_from_id],
                     )
                     .await?;
@@ -7066,6 +10282,20 @@ impl Database {
                     .await?;
                     tx.execute(
                         "DELETE FROM patchset_maintainer_sections WHERE patchset_id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+
+                    // Merge upstream grant sections; the rows carry no
+                    // provenance, so a union is all there is to do.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO patchset_upstream_sections (patchset_id, subsystem)
+                         SELECT ?, subsystem FROM patchset_upstream_sections WHERE patchset_id = ?",
+                        libsql::params![target_id, merge_from_id],
+                    )
+                    .await?;
+                    tx.execute(
+                        "DELETE FROM patchset_upstream_sections WHERE patchset_id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
@@ -7113,6 +10343,92 @@ impl Database {
                         .await?;
                     }
 
+                    // Preserve lineage metadata across merged rows and re-point any
+                    // patchsets whose previous_patchset_id referenced merge_from_id.
+                    tx.execute(
+                        "UPDATE patchsets
+                            SET change_id = COALESCE(change_id, (SELECT change_id FROM patchsets WHERE id = ?)),
+                                version = COALESCE(version, (SELECT version FROM patchsets WHERE id = ?)),
+                                previous_patchset_id = COALESCE(
+                                    CASE WHEN previous_patchset_id = ? THEN NULL ELSE previous_patchset_id END,
+                                    (SELECT previous_patchset_id FROM patchsets WHERE id = ? AND previous_patchset_id != ?)
+                                ),
+                                version_link_signal = CASE
+                                    WHEN previous_patchset_id IS NOT NULL AND previous_patchset_id != ? THEN version_link_signal
+                                    ELSE (
+                                        SELECT version_link_signal
+                                          FROM patchsets
+                                         WHERE id = ?
+                                           AND previous_patchset_id IS NOT NULL
+                                           AND previous_patchset_id != ?
+                                    )
+                                END
+                          WHERE id = ?",
+                        libsql::params![
+                            merge_from_id,
+                            merge_from_id,
+                            merge_from_id,
+                            merge_from_id,
+                            target_id,
+                            merge_from_id,
+                            merge_from_id,
+                            target_id,
+                            target_id
+                        ],
+                    )
+                    .await?;
+                    let other_priority: Option<i64> = {
+                        let mut p_rows = tx
+                            .read_conn()
+                            .query(
+                                "SELECT priority FROM patchsets WHERE id = ?",
+                                libsql::params![merge_from_id],
+                            )
+                            .await?;
+                        let val = if let Some(p_row) = p_rows.next().await? {
+                            p_row.get(0).ok()
+                        } else {
+                            None
+                        };
+                        drop(p_rows);
+                        val
+                    };
+                    if let Some(other_prio) = other_priority {
+                        tx.execute(
+                            "UPDATE patchsets
+                                SET priority = CASE
+                                        WHEN priority IS NULL THEN ?
+                                        WHEN priority < ? AND ? < ? THEN MIN(priority, ?)
+                                        WHEN priority < ? AND ? >= ? THEN priority
+                                        WHEN priority >= ? AND ? < ? THEN ?
+                                        ELSE MAX(priority, ?)
+                                    END
+                              WHERE id = ?",
+                            libsql::params![
+                                other_prio,
+                                default_priority,
+                                other_prio,
+                                default_priority,
+                                other_prio,
+                                default_priority,
+                                other_prio,
+                                default_priority,
+                                default_priority,
+                                other_prio,
+                                default_priority,
+                                other_prio,
+                                other_prio,
+                                target_id
+                            ],
+                        )
+                        .await?;
+                    }
+                    tx.execute(
+                        "UPDATE patchsets SET previous_patchset_id = ? WHERE previous_patchset_id = ? AND id != ?",
+                        libsql::params![target_id, merge_from_id, target_id],
+                    )
+                    .await?;
+
                     // Delete the merged patchset
                     tx.execute(
                         "DELETE FROM patchsets WHERE id = ?",
@@ -7128,8 +10444,6 @@ impl Database {
                     )
                     .await?;
                 }
-
-                tx.commit().await?;
 
                 // Adopt the best series identity across all merged rows now that
                 // redundant rows have been deleted and all patches are attached to target_id.
@@ -7169,8 +10483,8 @@ impl Database {
                 .await?;
             } else {
                 self.execute(
-                        "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ? WHERE id = ?",
-                        libsql::params![author, final_total, parser_version, to, cc, target_id],
+                        "UPDATE patchsets SET author = ?, total_parts = ?, parser_version = ?, to_recipients = ?, cc_recipients = ?, version = COALESCE(?, version, 1) WHERE id = ?",
+                        libsql::params![author, final_total, parser_version, to, cc, explicit_ver, target_id],
                     )
                     .await?;
             }
@@ -7205,6 +10519,21 @@ impl Database {
                 .await?;
             }
 
+            // Reopen Fetching or partially-ingested Failed patchsets before
+            // recalculating received_parts so a merge that reaches total_parts
+            // transitions cleanly to Pending below.
+            self.execute(
+                "UPDATE patchsets
+                     SET status = 'Incomplete', failed_reason = NULL
+                     WHERE id = ?
+                       AND (status = 'Fetching'
+                            OR (status = 'Failed'
+                                AND (COALESCE(received_parts, 0) = 0
+                                     OR COALESCE(received_parts, 0) < COALESCE(total_parts, 1))))",
+                libsql::params![target_id],
+            )
+            .await?;
+
             // Recalculate received parts for target (in case we merged)
             self.execute(
                 "UPDATE patchsets SET received_parts = (SELECT COUNT(*) FROM patches WHERE patchset_id = ?) WHERE id = ?",
@@ -7213,17 +10542,8 @@ impl Database {
             .await?;
 
             self.execute(
-                    "UPDATE patchsets
-                     SET status = 'Incomplete', failed_reason = NULL
-                     WHERE id = ?
-                       AND (status = 'Fetching' OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
-                    libsql::params![target_id],
-                )
-                .await?;
-
-            self.execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-                libsql::params![target_id],
+                "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![self.completion_status(), target_id],
             ).await?;
 
             return Ok(Some(target_id));
@@ -7235,23 +10555,27 @@ impl Database {
         let mut final_cover_id = cover_letter_message_id.map(|s| s.to_string());
         if let Some(ref clid) = final_cover_id {
             let mut owner_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
                     libsql::params![clid.as_str()],
                 )
                 .await?;
-            if owner_rows.next().await?.is_some() {
+            let clid_owned = owner_rows.next().await?.is_some();
+            drop(owner_rows);
+            if clid_owned {
                 if clid != message_id {
                     let mut self_owner = self
-                        .conn
+                        .read_conn()
                         .query(
                             "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? LIMIT 1",
                             libsql::params![message_id],
                         )
                         .await?;
-                    if self_owner.next().await?.is_none() {
-                        info!(
+                    let self_unowned = self_owner.next().await?.is_none();
+                    drop(self_owner);
+                    if self_unowned {
+                        debug!(
                             "Message {} belongs to a series named {}, which another patchset holds; naming the new series after itself",
                             message_id, clid
                         );
@@ -7273,11 +10597,18 @@ impl Database {
             }
         }
 
+        let initial_version =
+            if subject == "(placeholder)" || (part_index == 0 && Self::is_reply_subject(subject)) {
+                explicit_ver
+            } else {
+                Some(explicit_ver.unwrap_or(1))
+            };
+
         let id = self
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters)
-                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone()],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, baseline_id, baseline_part_index, skip_filters, only_filters, version)
+                 VALUES (?, ?, ?, ?, ?, ?, 0, 'Incomplete', ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, final_cover_id.as_deref(), subject, author, date, total_parts, parser_version, to, cc, if part_index == 0 && Self::is_reply_subject(subject) { 9999 } else { part_index }, baseline_id, baseline_id.map(|_| part_index), skip_filters_json.clone(), only_filters_json.clone(), initial_version],
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to retrieve patchset ID after insert"))?;
@@ -7318,7 +10649,8 @@ impl Database {
         .context("patch compression task failed")?;
 
         for _ in 0..PATCH_WRITE_MAX_ATTEMPTS {
-            let old_patch = get_stored_patch_state(&self.conn, patchset_id, message_id).await?;
+            let old_patch =
+                get_stored_patch_state(self.read_conn(), patchset_id, message_id).await?;
             let selected_patch_id =
                 select_git_patch_id(old_patch.as_ref(), Arc::clone(&diff), git_patch_id).await?;
             // Clone the prepared value before taking the write lock. A large
@@ -7333,10 +10665,15 @@ impl Database {
                 part_index,
                 diff_to_write,
                 selected_patch_id,
+                self.completion_status(),
             )
             .await?
             {
-                PatchWriteOutcome::Written(patch_id) => return Ok(patch_id),
+                PatchWriteOutcome::Written(patch_id) => {
+                    self.reconcile_version_lineage_inner(patchset_id, part_index > 1)
+                        .await?;
+                    return Ok(patch_id);
+                }
                 PatchWriteOutcome::SnapshotChanged => continue,
             }
         }
@@ -7344,6 +10681,7 @@ impl Database {
         bail!("patch {message_id} changed during {PATCH_WRITE_MAX_ATTEMPTS} write attempts")
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn write_patch_transaction(
         tx: DatabaseTransaction,
         old_patch: Option<StoredPatchState>,
@@ -7352,6 +10690,7 @@ impl Database {
         part_index: u32,
         diff: libsql::Value,
         git_patch_id: Option<String>,
+        completion_status: &'static str,
     ) -> Result<PatchWriteOutcome> {
         if old_patch.is_none() {
             let collision_exists = {
@@ -7394,8 +10733,32 @@ impl Database {
         }
 
         tx.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
-            libsql::params![patchset_id],
+            "UPDATE patches SET status = 'Cancelled'
+              WHERE id = ?
+                AND (status IS NULL OR status = 'Pending')
+                AND EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = ? AND ps.status = 'Cancelled'
+                )",
+            libsql::params![patch_id, patchset_id],
+        )
+        .await?;
+
+        tx.execute(
+            "UPDATE patches SET status = 'Pending', apply_error = NULL
+              WHERE id = ?
+                AND status = 'Cancelled'
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = ? AND ps.status = 'Cancelled'
+                )",
+            libsql::params![patch_id, patchset_id],
+        )
+        .await?;
+
+        tx.execute(
+            "UPDATE patchsets SET status = ? WHERE id = ? AND received_parts >= total_parts AND status IN ('Incomplete', 'Fetching')",
+            libsql::params![completion_status, patchset_id],
         )
         .await?;
 
@@ -7511,74 +10874,128 @@ impl Database {
         Ok(())
     }
 
+    fn mr_urls_share_repo(mr_url_a: Option<&str>, mr_url_b: Option<&str>) -> bool {
+        let repo_a = mr_url_a.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        let repo_b = mr_url_b.and_then(crate::forge::extract_owner_repo_from_mr_url);
+        match (repo_a.as_deref(), repo_b.as_deref()) {
+            (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+            (None, None) => mr_url_a == mr_url_b,
+            _ => false,
+        }
+    }
+
     pub async fn get_mr_version_for_commit_range(
         &self,
         mr_number: i64,
         root_msg_id: &str,
     ) -> Result<u32> {
+        self.get_mr_version_for_commit_range_in_repo(mr_number, None, root_msg_id)
+            .await
+    }
+
+    pub async fn get_mr_version_for_commit_range_in_repo(
+        &self,
+        mr_number: i64,
+        mr_url: Option<&str>,
+        root_msg_id: &str,
+    ) -> Result<u32> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in &candidates {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
-                    "SELECT id, subject FROM patchsets WHERE cover_letter_message_id = ?",
+                    "SELECT id, subject, version, mr_url FROM patchsets WHERE cover_letter_message_id = ?",
                     libsql::params![clid.clone()],
                 )
                 .await?;
-            if let Ok(Some(row)) = rows.next().await {
+            while let Some(row) = rows.next().await? {
                 let existing_id: i64 = row.get(0)?;
-                let existing_subject: String = row.get(1).unwrap_or_default();
-                if let Some(v) = crate::patch::parse_subject_version(&existing_subject)
+                let existing_subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                let stored_ver: Option<u32> = row.get(2)?;
+                let row_mr_url: Option<String> = row.get(3)?;
+                if mr_url.is_some() && !Self::mr_urls_share_repo(mr_url, row_mr_url.as_deref()) {
+                    continue;
+                }
+                if let Some(v) = stored_ver
+                    .filter(|&v| v > 0)
+                    .or_else(|| {
+                        crate::forge::extract_mr_version_from_subject(
+                            Some(&existing_subject),
+                            mr_number,
+                        )
+                    })
+                    .or_else(|| crate::patch::parse_subject_version(&existing_subject))
                     && v > 0
                 {
                     return Ok(v);
                 }
+                let scope_url = mr_url.or(row_mr_url.as_deref());
                 let mut count_rows = self
-                    .conn
+                    .read_conn()
                     .query(
-                        "SELECT COUNT(*) FROM patchsets WHERE mr_number = ? AND id < ?",
+                        "SELECT mr_url FROM patchsets WHERE mr_number = ? AND id < ?",
                         libsql::params![mr_number, existing_id],
                     )
                     .await?;
-                let older_count: i64 = if let Ok(Some(crow)) = count_rows.next().await {
-                    crow.get(0).unwrap_or(0)
-                } else {
-                    0
-                };
-                return Ok((older_count + 1) as u32);
+                let mut older_count: u32 = 0;
+                while let Some(crow) = count_rows.next().await? {
+                    let older_mr_url: Option<String> = crow.get(0)?;
+                    if scope_url
+                        .is_none_or(|u| Self::mr_urls_share_repo(Some(u), older_mr_url.as_deref()))
+                    {
+                        older_count += 1;
+                    }
+                }
+                return Ok(older_count + 1);
             }
         }
 
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
-                "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
+                "SELECT COALESCE(version, 1), mr_url FROM patchsets WHERE mr_number = ?",
                 libsql::params![mr_number],
             )
             .await?;
-        let count: i64 = if let Ok(Some(row)) = rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
-        Ok((count + 1) as u32)
+        let mut max_ver: i64 = 0;
+        let mut count: i64 = 0;
+        while let Some(row) = rows.next().await? {
+            let ver: i64 = row.get(0)?;
+            let row_mr_url: Option<String> = row.get(1)?;
+            if mr_url.is_none_or(|u| Self::mr_urls_share_repo(Some(u), row_mr_url.as_deref())) {
+                max_ver = max_ver.max(ver);
+                count += 1;
+            }
+        }
+        Ok((max_ver.max(count) + 1) as u32)
     }
 
     async fn rotate_mr_slug(&self, slug: &str, exclude_id: Option<i64>) -> Result<()> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id, subject FROM patchsets WHERE slug = ?",
-                libsql::params![slug],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let old_id: i64 = row.get(0)?;
+        let existing = {
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT id, subject, version FROM patchsets WHERE slug = ?",
+                    libsql::params![slug],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let old_id: i64 = row.get(0)?;
+                let old_subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                let stored_ver: Option<u32> = row.get(2)?;
+                Some((old_id, old_subject, stored_ver))
+            } else {
+                None
+            }
+        };
+        if let Some((old_id, old_subject, stored_ver)) = existing {
             if Some(old_id) == exclude_id {
                 return Ok(());
             }
-            let old_subject: String = row.get(1).unwrap_or_default();
-            let old_ver = crate::patch::parse_subject_version(&old_subject).unwrap_or(1);
+            let old_ver = stored_ver
+                .filter(|&v| v > 0)
+                .or_else(|| crate::patch::parse_subject_version(&old_subject))
+                .unwrap_or(1);
             let candidate_slug = format!("{}-v{}", slug, old_ver);
             let res = self
                 .execute(
@@ -7588,12 +11005,11 @@ impl Database {
                 .await;
             if res.is_err() {
                 let fallback_slug = format!("{}-v{}-{}", slug, old_ver, old_id);
-                let _ = self
-                    .execute(
-                        "UPDATE patchsets SET slug = ? WHERE id = ?",
-                        libsql::params![fallback_slug, old_id],
-                    )
-                    .await;
+                self.execute(
+                    "UPDATE patchsets SET slug = ? WHERE id = ?",
+                    libsql::params![fallback_slug, old_id],
+                )
+                .await?;
             }
         }
         Ok(())
@@ -7607,32 +11023,50 @@ impl Database {
         mr_number: Option<i64>,
         slug: Option<&str>,
     ) -> Result<()> {
-        if let Some(s) = slug {
-            self.rotate_mr_slug(s, Some(id)).await?;
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let is_cancelled = tx_db.get_patchset_status(id).await?.as_deref()
+            == Some(ReviewStatus::Cancelled.as_str());
+        let effective_slug = if is_cancelled { None } else { slug };
+        if let Some(s) = effective_slug {
+            tx_db.rotate_mr_slug(s, Some(id)).await?;
         }
-        self.execute(
-            "UPDATE patchsets SET
+        tx_db
+            .execute(
+                "UPDATE patchsets SET
                     mr_url = COALESCE(mr_url, ?),
                     mr_title = COALESCE(mr_title, ?),
                     mr_number = COALESCE(mr_number, ?),
                     slug = COALESCE(?, slug)
                  WHERE id = ?",
-            libsql::params![mr_url, mr_title, mr_number, slug, id],
-        )
-        .await?;
-        self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+                libsql::params![mr_url, mr_title, mr_number, effective_slug, id],
+            )
             .await?;
+        tx_db
+            .reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
-        self.execute(
-            "UPDATE patchsets
+        let updated = self
+            .execute(
+                "UPDATE patchsets
                  SET embargo_until = NULL, embargo_release_started_at = NULL
                  WHERE id = ?",
-            libsql::params![id],
-        )
-        .await?;
+                libsql::params![id],
+            )
+            .await?;
+        if updated > 0
+            && !self.in_transaction
+            && let Err(e) = self.record_patchset_release_rollups(id).await
+        {
+            warn!(
+                "Failed to record post-embargo rollup telemetry for patchset {}: {}",
+                id, e
+            );
+        }
         Ok(())
     }
 
@@ -7665,9 +11099,11 @@ impl Database {
         // build_search returns "WHERE author ...".
 
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date,
+             COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+             p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
+             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug, p.priority
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -7699,7 +11135,7 @@ impl Database {
         args.push(libsql::Value::Integer(limit as i64));
         args.push(libsql::Value::Integer(offset as i64));
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn().query(&sql, args).await?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
@@ -7772,6 +11208,7 @@ impl Database {
                         mr_title: row.get(21).ok(),
                         mr_number: row.get(22).ok(),
                         slug: row.get(23).ok(),
+                        priority: row.get(24).ok(),
                     });
                 }
                 Ok(None) => break,
@@ -7804,7 +11241,7 @@ impl Database {
         args.push(libsql::Value::Integer(limit as i64));
         args.push(libsql::Value::Integer(offset as i64));
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn().query(&sql, args).await?;
         let mut messages = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
             messages.push(MessageRow {
@@ -7842,7 +11279,7 @@ impl Database {
             args.push(libsql::Value::Text(p));
         }
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn().query(&sql, args).await?;
         if let Ok(Some(row)) = rows.next().await {
             let count: i64 = row.get(0)?;
             Ok(count as usize)
@@ -7852,7 +11289,7 @@ impl Database {
     }
 
     pub async fn count_pending_patches(&self) -> Result<usize> {
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn().query(
             "SELECT COUNT(p.id) FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id 
              WHERE ps.status IN ('Pending', 'In Review') AND p.status IS NULL
              AND p.id NOT IN (SELECT patch_id FROM reviews WHERE status IN ('In Review', 'Applying') AND patch_id IS NOT NULL)",
@@ -7867,7 +11304,7 @@ impl Database {
     }
 
     pub async fn count_reviewing_patches(&self) -> Result<usize> {
-        let mut rows = self.conn.query(
+        let mut rows = self.read_conn().query(
             "SELECT COUNT(DISTINCT patch_id) FROM reviews WHERE status IN ('In Review', 'Applying') AND patch_id IS NOT NULL",
             ()
         ).await?;
@@ -7892,7 +11329,7 @@ impl Database {
             args.push(libsql::Value::Text(p));
         }
 
-        let mut rows = self.conn.query(&sql, args).await?;
+        let mut rows = self.read_conn().query(&sql, args).await?;
         if let Ok(Some(row)) = rows.next().await {
             let count: i64 = row.get(0)?;
             Ok(count as usize)
@@ -7909,7 +11346,7 @@ impl Database {
             return Ok(None);
         };
         let mut browse = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT repo_url, branch, last_known_commit FROM baselines WHERE id = ?",
                 libsql::params![bid],
@@ -7937,7 +11374,7 @@ impl Database {
         include_logs: bool,
     ) -> Result<Vec<serde_json::Value>> {
         let mut ps_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT model_name, prompts_git_hash, baseline_id, provider
                  FROM patchsets WHERE id = ?",
@@ -7958,7 +11395,7 @@ impl Database {
         let offset_val = limit_val.saturating_mul(page_val.saturating_sub(1));
         let mut patch_ids = Vec::new();
         let mut patch_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM patches
                  WHERE patchset_id = ?
@@ -8016,7 +11453,7 @@ impl Database {
             params.push(libsql::Value::Integer(pid_val));
         }
 
-        let mut rev_rows = self.conn.query(&query_str, params).await?;
+        let mut rev_rows = self.read_conn().query(&query_str, params).await?;
         while let Some(r) = rev_rows.next().await? {
             let mut item = serde_json::json!({
                 "summary": r.get::<Option<String>>(0)?,
@@ -8046,6 +11483,157 @@ impl Database {
         Ok(reviews)
     }
 
+    pub async fn get_patchset_version_chain(
+        &self,
+        patchset_id: i64,
+        now: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        const MAX_CHAIN_HOPS: usize = 32;
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(patchset_id);
+
+        struct ChainNode {
+            id: i64,
+            version: u32,
+            subject: Option<String>,
+            status: Option<String>,
+            date: Option<i64>,
+            message_id: Option<String>,
+            slug: Option<String>,
+        }
+
+        let mut nodes = Vec::new();
+        while let Some(curr_id) = queue.pop_front() {
+            if visited.len() >= MAX_CHAIN_HOPS || !visited.insert(curr_id) {
+                continue;
+            }
+            let mut rows = self
+                .read_conn()
+                .query(
+                    "SELECT id, subject, status, date,
+                            COALESCE(cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = patchsets.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                            slug, version, previous_patchset_id, mr_number, embargo_until
+                     FROM patchsets WHERE id = ?",
+                    libsql::params![curr_id],
+                )
+                .await?;
+            let Some(row) = rows.next().await? else {
+                continue;
+            };
+            let id: i64 = row.get(0)?;
+            let subject: Option<String> = row.get(1)?;
+            let mut status: Option<String> = row.get(2)?;
+            let date: Option<i64> = row.get(3)?;
+            let message_id: Option<String> = row.get(4)?;
+            let slug: Option<String> = row.get(5)?;
+            let stored_ver: Option<u32> = row.get(6)?;
+            let mut prev_id: Option<i64> = row.get(7)?;
+            let mr_number: Option<i64> = row.get(8)?;
+            let embargo_until: Option<i64> = row.get(9)?;
+            drop(rows);
+
+            if let Some(until) = embargo_until
+                && until > now
+                && status.as_deref() == Some("Reviewed")
+            {
+                status = Some("Embargoed".to_string());
+            }
+
+            let ver = stored_ver
+                .or_else(|| {
+                    mr_number.and_then(|num| {
+                        crate::forge::extract_mr_version_from_subject(subject.as_deref(), num)
+                    })
+                })
+                .or_else(|| {
+                    subject
+                        .as_deref()
+                        .and_then(crate::patch::parse_subject_version)
+                })
+                .unwrap_or(1);
+
+            if needs_lazy_lineage(prev_id, stored_ver.is_some(), mr_number) {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(id).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {id}: {e}");
+                } else {
+                    prev_id = self.get_previous_patchset_id(id).await.unwrap_or(None);
+                }
+            }
+
+            nodes.push(ChainNode {
+                id,
+                version: ver,
+                subject,
+                status,
+                date,
+                message_id,
+                slug,
+            });
+
+            if let Some(pid) = prev_id
+                && !visited.contains(&pid)
+            {
+                queue.push_back(pid);
+            }
+
+            let mut next_rows = self
+                .read_conn()
+                .query(
+                    "SELECT id FROM patchsets WHERE previous_patchset_id = ? ORDER BY id ASC LIMIT 16",
+                    libsql::params![id],
+                )
+                .await?;
+            while let Some(nrow) = next_rows.next().await? {
+                let nid: i64 = nrow.get(0)?;
+                if !visited.contains(&nid) {
+                    queue.push_back(nid);
+                }
+            }
+        }
+
+        // Every email link points to a strictly older patchset, so posting
+        // order is chain order; version tags are not (RFC v2 -> v1 -> v2
+        // must list RFC v2 first). The version only breaks ties between
+        // revisions sharing a timestamp, such as Forge PR revisions.
+        nodes.sort_by_key(|n| (n.date.unwrap_or(0), n.version, n.id));
+        Ok(nodes
+            .into_iter()
+            .map(|n| {
+                serde_json::json!({
+                    "id": n.id,
+                    "version": n.version,
+                    "subject": n.subject,
+                    "status": n.status,
+                    "date": n.date,
+                    "message_id": n.message_id,
+                    "slug": n.slug,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn set_patchset_change_id_if_unset(
+        &self,
+        patchset_id: i64,
+        change_id: &str,
+    ) -> Result<()> {
+        let trimmed = change_id.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let updated = self
+            .execute(
+                "UPDATE patchsets SET change_id = ? WHERE id = ? AND (change_id IS NULL OR change_id = '')",
+                libsql::params![trimmed, patchset_id],
+            )
+            .await?;
+        if updated > 0 {
+            self.reconcile_version_lineage(patchset_id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn get_patchset_details(
         &self,
         id: i64,
@@ -8053,15 +11641,18 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
-                    p.author, p.date, p.cover_letter_message_id, p.thread_id,
-                    p.total_parts, p.received_parts, p.failed_reason,
-                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
-                FROM patchsets p
-                WHERE p.id = ?",
+                        p.author, p.date,
+                        COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                        p.thread_id,
+                        p.total_parts, p.received_parts, p.failed_reason,
+                        p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
+                        p.embargo_until, p.mr_url, p.slug,
+                        p.version, p.previous_patchset_id, p.version_link_signal, p.mr_number
+                 FROM patchsets p
+                 WHERE p.id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -8088,7 +11679,37 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            // Columns 0..=19 are read above; columns 20..=23 are p.version,
+            // p.previous_patchset_id, p.version_link_signal, and p.mr_number (24 columns total).
+            let stored_version: Option<u32> = row.get(20)?;
+            let mut previous_patchset_id: Option<i64> = row.get(21)?;
+            let mut version_link_signal: Option<String> = row.get(22)?;
+            let mr_number: Option<i64> = row.get(23)?;
+            drop(rows);
             let baseline = self.get_baseline_json(baseline_id).await?;
+            let effective_version = stored_version
+                .or_else(|| {
+                    mr_number.and_then(|num| {
+                        crate::forge::extract_mr_version_from_subject(subject.as_deref(), num)
+                    })
+                })
+                .or_else(|| {
+                    subject
+                        .as_deref()
+                        .and_then(crate::patch::parse_subject_version)
+                })
+                .unwrap_or(1);
+
+            if needs_lazy_lineage(previous_patchset_id, stored_version.is_some(), mr_number) {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
+                } else if let Ok(Some(subj)) =
+                    Self::read_lineage_subject(self.read_conn(), pid).await
+                {
+                    previous_patchset_id = subj.previous_patchset_id;
+                    version_link_signal = subj.version_link_signal;
+                }
+            }
 
             // Calculate pagination
             let limit_val = limit.unwrap_or(50);
@@ -8098,7 +11719,7 @@ impl Database {
             // Fetch subsystems
             let mut subsystems = Vec::new();
             let mut sub_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT s.name FROM subsystems s
                  JOIN patchsets_subsystems ps ON s.id = ps.subsystem_id
@@ -8112,7 +11733,7 @@ impl Database {
 
             let mut total_patches = 0;
             let mut count_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
                     libsql::params![pid],
@@ -8132,17 +11753,26 @@ impl Database {
                 false
             };
 
-            // Fetch patches with subject and msg_db_id
+            // Fetch patches with subject, msg_db_id, and previous_patch lineage
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
             let mut patch_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
-                            eo.status as email_status, eo.to_addresses, eo.cc_addresses
+                            eo.status as email_status, eo.to_addresses, eo.cc_addresses,
+                            p.previous_patch_id, p.previous_patch_status,
+                            prev_p.part_index, prev_ps.id,
+                            COALESCE(prev_ps.cover_letter_message_id, prev_p.message_id),
+                            prev_ps.slug, prev_ps.version, prev_ps.subject,
+                            EXISTS (SELECT 1 FROM reviews r
+                                     WHERE r.patch_id = p.id AND r.status = 'Skipped'
+                                       AND r.inherited_from_review_id IS NOT NULL)
                  FROM patches p
                  LEFT JOIN messages m ON p.message_id = m.message_id
                  LEFT JOIN email_outbox eo ON eo.patch_id = p.id
+                 LEFT JOIN patches prev_p ON p.previous_patch_id = prev_p.id
+                 LEFT JOIN patchsets prev_ps ON prev_p.patchset_id = prev_ps.id
                  WHERE p.patchset_id = ? 
                  ORDER BY p.part_index ASC
                  LIMIT ? OFFSET ?",
@@ -8154,9 +11784,43 @@ impl Database {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
                 let mut p_status = p.get::<Option<String>>(5).ok().flatten();
-                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
+                // A patch that inherited a clean verdict is Skipped, and
+                // showing that during the embargo would say which patches
+                // of the series reviewed clean.
+                let inherited_clean =
+                    p_status.as_deref() == Some("Skipped") && p.get::<i64>(18).unwrap_or(0) != 0;
+                if is_embargoed && (p_status.as_deref() == Some("Reviewed") || inherited_clean) {
                     p_status = Some("Embargoed".to_string());
                 }
+                let prev_patch_id: Option<i64> = p.get(10)?;
+                let prev_patch_status: Option<String> = p.get(11)?;
+                let prev_part_index: Option<i64> = p.get(12)?;
+                let prev_ps_id: Option<i64> = p.get(13)?;
+                let prev_ps_mid: Option<String> = p.get(14)?;
+                let prev_ps_slug: Option<String> = p.get(15)?;
+                let prev_ps_ver: Option<u32> = p.get(16)?;
+                let prev_ps_subj: Option<String> = p.get(17)?;
+                let previous_patch = if let (Some(ppid), Some(ppsid)) = (prev_patch_id, prev_ps_id)
+                {
+                    let pver = prev_ps_ver
+                        .or_else(|| {
+                            prev_ps_subj
+                                .as_deref()
+                                .and_then(crate::patch::parse_subject_version)
+                        })
+                        .unwrap_or(1);
+                    serde_json::json!({
+                        "id": ppid,
+                        "patchset_id": ppsid,
+                        "patchset_message_id": prev_ps_mid,
+                        "patchset_slug": prev_ps_slug,
+                        "part_index": prev_part_index,
+                        "version": pver,
+                        "status": prev_patch_status.unwrap_or_else(|| "modified".to_string()),
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
@@ -8168,6 +11832,7 @@ impl Database {
                     "email_status": p.get::<Option<String>>(7).ok(),
                     "email_to": p.get::<Option<String>>(8).ok(),
                     "email_cc": p.get::<Option<String>>(9).ok(),
+                    "previous_patch": previous_patch,
                 }));
             }
 
@@ -8194,7 +11859,7 @@ impl Database {
             // Fetch thread messages
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn().query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -8215,6 +11880,7 @@ impl Database {
                 .into_iter()
                 .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
                 .collect::<Vec<_>>();
+            let versions = self.get_patchset_version_chain(pid, now).await?;
 
             Ok(Some(serde_json::json!({
                 "id": pid,
@@ -8244,7 +11910,11 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "version": effective_version,
+                "previous_patchset_id": previous_patchset_id,
+                "version_link_signal": version_link_signal,
+                "versions": versions
             })))
         } else {
             Ok(None)
@@ -8258,15 +11928,18 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.id, p.subject, p.status, p.to_recipients, p.cc_recipients,
-                    p.author, p.date, p.cover_letter_message_id, p.thread_id,
-                    p.total_parts, p.received_parts, p.failed_reason,
-                    p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
-                FROM patchsets p
-                WHERE p.id = ?",
+                        p.author, p.date,
+                        COALESCE(p.cover_letter_message_id, (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = p.id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)),
+                        p.thread_id,
+                        p.total_parts, p.received_parts, p.failed_reason,
+                        p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
+                        p.embargo_until, p.mr_url, p.slug,
+                        p.version, p.previous_patchset_id, p.version_link_signal, p.mr_number
+                 FROM patchsets p
+                 WHERE p.id = ?",
                 libsql::params![id],
             )
             .await?;
@@ -8293,7 +11966,37 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            // Columns 0..=19 are read above; columns 20..=23 are p.version,
+            // p.previous_patchset_id, p.version_link_signal, and p.mr_number (24 columns total).
+            let stored_version: Option<u32> = row.get(20)?;
+            let mut previous_patchset_id: Option<i64> = row.get(21)?;
+            let mut version_link_signal: Option<String> = row.get(22)?;
+            let mr_number: Option<i64> = row.get(23)?;
+            drop(rows);
             let baseline = self.get_baseline_json(baseline_id).await?;
+            let effective_version = stored_version
+                .or_else(|| {
+                    mr_number.and_then(|num| {
+                        crate::forge::extract_mr_version_from_subject(subject.as_deref(), num)
+                    })
+                })
+                .or_else(|| {
+                    subject
+                        .as_deref()
+                        .and_then(crate::patch::parse_subject_version)
+                })
+                .unwrap_or(1);
+
+            if needs_lazy_lineage(previous_patchset_id, stored_version.is_some(), mr_number) {
+                if let Err(e) = self.reconcile_ancestor_version_lineage(pid).await {
+                    warn!("Failed to lazily reconcile version lineage for patchset {pid}: {e}");
+                } else if let Ok(Some(subj)) =
+                    Self::read_lineage_subject(self.read_conn(), pid).await
+                {
+                    previous_patchset_id = subj.previous_patchset_id;
+                    version_link_signal = subj.version_link_signal;
+                }
+            }
 
             let limit_val = limit.unwrap_or(50);
             let page_val = page.unwrap_or(1);
@@ -8301,7 +12004,7 @@ impl Database {
 
             let mut subsystems = Vec::new();
             let mut sub_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT s.name FROM subsystems s
                  JOIN patchsets_subsystems ps ON s.id = ps.subsystem_id
@@ -8315,7 +12018,7 @@ impl Database {
 
             let mut total_patches = 0;
             let mut count_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT COUNT(*) FROM patches WHERE patchset_id = ?",
                     libsql::params![pid],
@@ -8338,13 +12041,22 @@ impl Database {
             let mut patches = Vec::new();
             let mut patch_ids = Vec::new();
             let mut patch_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT p.id, p.message_id, p.part_index, m.id, m.subject, p.status, p.apply_error, 
-                            eo.status as email_status, eo.to_addresses, eo.cc_addresses
+                            eo.status as email_status, eo.to_addresses, eo.cc_addresses,
+                            p.previous_patch_id, p.previous_patch_status,
+                            prev_p.part_index, prev_ps.id,
+                            COALESCE(prev_ps.cover_letter_message_id, prev_p.message_id),
+                            prev_ps.slug, prev_ps.version, prev_ps.subject,
+                            EXISTS (SELECT 1 FROM reviews r
+                                     WHERE r.patch_id = p.id AND r.status = 'Skipped'
+                                       AND r.inherited_from_review_id IS NOT NULL)
                  FROM patches p
                  LEFT JOIN messages m ON p.message_id = m.message_id
                  LEFT JOIN email_outbox eo ON eo.patch_id = p.id
+                 LEFT JOIN patches prev_p ON p.previous_patch_id = prev_p.id
+                 LEFT JOIN patchsets prev_ps ON prev_p.patchset_id = prev_ps.id
                  WHERE p.patchset_id = ? 
                  ORDER BY p.part_index ASC
                  LIMIT ? OFFSET ?",
@@ -8357,9 +12069,43 @@ impl Database {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
                 let mut p_status = p.get::<Option<String>>(5).ok().flatten();
-                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
+                // A patch that inherited a clean verdict is Skipped, and
+                // showing that during the embargo would say which patches
+                // of the series reviewed clean.
+                let inherited_clean =
+                    p_status.as_deref() == Some("Skipped") && p.get::<i64>(18).unwrap_or(0) != 0;
+                if is_embargoed && (p_status.as_deref() == Some("Reviewed") || inherited_clean) {
                     p_status = Some("Embargoed".to_string());
                 }
+                let prev_patch_id: Option<i64> = p.get(10)?;
+                let prev_patch_status: Option<String> = p.get(11)?;
+                let prev_part_index: Option<i64> = p.get(12)?;
+                let prev_ps_id: Option<i64> = p.get(13)?;
+                let prev_ps_mid: Option<String> = p.get(14)?;
+                let prev_ps_slug: Option<String> = p.get(15)?;
+                let prev_ps_ver: Option<u32> = p.get(16)?;
+                let prev_ps_subj: Option<String> = p.get(17)?;
+                let previous_patch = if let (Some(ppid), Some(ppsid)) = (prev_patch_id, prev_ps_id)
+                {
+                    let pver = prev_ps_ver
+                        .or_else(|| {
+                            prev_ps_subj
+                                .as_deref()
+                                .and_then(crate::patch::parse_subject_version)
+                        })
+                        .unwrap_or(1);
+                    serde_json::json!({
+                        "id": ppid,
+                        "patchset_id": ppsid,
+                        "patchset_message_id": prev_ps_mid,
+                        "patchset_slug": prev_ps_slug,
+                        "part_index": prev_part_index,
+                        "version": pver,
+                        "status": prev_patch_status.unwrap_or_else(|| "modified".to_string()),
+                    })
+                } else {
+                    serde_json::Value::Null
+                };
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
@@ -8371,6 +12117,7 @@ impl Database {
                     "email_status": p.get::<Option<String>>(7).ok(),
                     "email_to": p.get::<Option<String>>(8).ok(),
                     "email_cc": p.get::<Option<String>>(9).ok(),
+                    "previous_patch": previous_patch,
                 }));
             }
 
@@ -8396,7 +12143,7 @@ impl Database {
 
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
-                let mut msg_rows = self.conn.query(
+                let mut msg_rows = self.read_conn().query(
                     "SELECT id, message_id, author, date, subject, in_reply_to FROM messages WHERE thread_id = ? AND subject != '(placeholder)' ORDER BY date ASC",
                     libsql::params![tid]
                 ).await?;
@@ -8411,6 +12158,7 @@ impl Database {
                     }));
                 }
             }
+            let versions = self.get_patchset_version_chain(pid, now).await?;
 
             Ok(Some(serde_json::json!({
                 "id": pid,
@@ -8439,7 +12187,11 @@ impl Database {
                 "provider": provider,
                 "embargo_until": embargo_until,
                 "mr_url": mr_url,
-                "slug": slug
+                "slug": slug,
+                "version": effective_version,
+                "previous_patchset_id": previous_patchset_id,
+                "version_link_signal": version_link_signal,
+                "versions": versions
             })))
         } else {
             Ok(None)
@@ -8465,7 +12217,7 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM patchsets WHERE slug = ?",
                 libsql::params![slug],
@@ -8486,7 +12238,7 @@ impl Database {
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM patchsets WHERE slug = ?",
                 libsql::params![slug],
@@ -8504,7 +12256,7 @@ impl Database {
     /// its parent `patchset_id` and `embargo_until` timestamp for embargo checks.
     pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
@@ -8515,7 +12267,12 @@ impl Database {
                             (SELECT m.subject FROM patches p JOIN messages m ON p.message_id = m.message_id WHERE p.id = r.patch_id LIMIT 1),
                             (SELECT ps.subject FROM patchsets ps WHERE ps.id = r.patchset_id)
                         ),
-                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id)
+                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id),
+                        COALESCE(
+                            (SELECT ps.slug FROM patchsets ps WHERE ps.id = r.patchset_id),
+                            (SELECT ps.cover_letter_message_id FROM patchsets ps WHERE ps.id = r.patchset_id),
+                            (SELECT pt.message_id FROM patches pt WHERE pt.patchset_id = r.patchset_id ORDER BY pt.part_index ASC, pt.id ASC LIMIT 1)
+                        )
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -8556,6 +12313,7 @@ impl Database {
                 "patchset_id": r.get::<Option<i64>>(19).ok(),
                 "subject": r.get::<Option<String>>(20).ok(),
                 "embargo_until": r.get::<Option<i64>>(21).ok(),
+                "patchset_ref": r.get::<Option<String>>(22).ok(),
                 "bugs": bugs_json,
             })))
         } else {
@@ -8568,7 +12326,7 @@ impl Database {
         patchset_id: i64,
     ) -> Result<Option<serde_json::Value>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT id FROM reviews WHERE patchset_id = ? ORDER BY created_at DESC LIMIT 1",
                 libsql::params![patchset_id],
@@ -8601,7 +12359,7 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<i64>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.id FROM patchsets p
                  WHERE p.id > ?
@@ -8630,7 +12388,7 @@ impl Database {
     /// reads the diffs alone and propagates failures instead.
     pub async fn patch_diffs_only(&self, patchset_id: i64) -> Result<Vec<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT diff FROM patches WHERE patchset_id = ? ORDER BY part_index ASC",
                 libsql::params![patchset_id],
@@ -8648,7 +12406,7 @@ impl Database {
     /// Reads an instance-wide marker.
     pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query("SELECT value FROM meta WHERE key = ?", libsql::params![key])
             .await?;
         match rows.next().await? {
@@ -8673,7 +12431,7 @@ impl Database {
         patchset_id: i64,
     ) -> Result<Vec<(i64, i64, String, String, String, i64, String)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.id, p.part_index, p.diff, m.subject, m.author, m.date, m.message_id 
              FROM patches p 
@@ -8698,12 +12456,190 @@ impl Database {
         Ok(diffs)
     }
 
+    /// Returns the message that patchset-level replies (consolidated series
+    /// summaries and failure notifications) should thread under: the cover
+    /// letter message when stored in `messages` (ignoring synthetic
+    /// `(placeholder)` rows created for missing thread roots), otherwise the
+    /// first patch.
+    pub async fn get_patchset_reply_target_message(
+        &self,
+        patchset_id: i64,
+        cover_msg_id: Option<&str>,
+    ) -> Result<Option<MessageRow>> {
+        let is_placeholder = |msg: &MessageRow| {
+            msg.author.as_deref() == Some("unknown")
+                && msg.subject.as_deref() == Some("(placeholder)")
+        };
+
+        if let Some(mid) = cover_msg_id.map(str::trim).filter(|m| !m.is_empty())
+            && let Some(msg) = self.get_message_details_by_msgid(mid).await?
+            && !is_placeholder(&msg)
+        {
+            return Ok(Some(msg));
+        }
+
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT message_id FROM patches
+                  WHERE patchset_id = ?
+                  ORDER BY part_index ASC
+                  LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let first_mid: String = row.get(0)?;
+        self.get_message_details_by_msgid(&first_mid).await
+    }
+    /// Returns the Git patch ID stored for `patch_id`, if the ingest path
+    /// computed one.
+    pub async fn get_patch_git_patch_id(&self, patch_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT git_patch_id FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => get_optional_text(&row, 0),
+            None => Ok(None),
+        }
+    }
+
+    /// Lists completed reviews of other patches that share `git_patch_id`,
+    /// newest first, created at or after `since`.
+    ///
+    /// Reviews that themselves inherited a verdict are left out so the
+    /// caller always lands on the review a model actually produced. Reviews
+    /// with findings are kept and flagged: a clean verdict is only reusable
+    /// when nothing newer disagreed with it. The limit keeps a patch
+    /// carried across many series from pulling every copy's diff out of the
+    /// database; the newest few are the ones worth comparing.
+    pub async fn find_clean_review_candidates(
+        &self,
+        git_patch_id: &str,
+        exclude_patch_id: i64,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<CleanReviewCandidate>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT r.id, p.id, p.patchset_id, ps.subject, ps.version, p.part_index,
+                        p.diff, r.model, r.prompts_hash, r.baseline_commit,
+                        EXISTS (SELECT 1 FROM findings f WHERE f.review_id = r.id),
+                        r.cheap, r.stages, p.message_id
+                 FROM patches p
+                 JOIN reviews r ON r.patch_id = p.id
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.git_patch_id = ?
+                   AND p.id != ?
+                   AND r.status = 'Reviewed'
+                   AND r.created_at >= ?
+                   AND r.inherited_from_review_id IS NULL
+                 ORDER BY r.created_at DESC, r.id DESC
+                 LIMIT ?",
+                libsql::params![git_patch_id, exclude_patch_id, since, limit as i64],
+            )
+            .await?;
+
+        let mut candidates = Vec::new();
+        while let Some(row) = rows.next().await? {
+            candidates.push(CleanReviewCandidate {
+                review_id: row.get(0)?,
+                patch_id: row.get(1)?,
+                patchset_id: row.get(2)?,
+                patchset_subject: get_optional_text(&row, 3)?.unwrap_or_default(),
+                patchset_version: get_optional_integer(&row, 4)?
+                    .and_then(|v| u32::try_from(v).ok()),
+                part_index: get_optional_integer(&row, 5)?.unwrap_or(0),
+                diff: crate::compression::get_compressed_string(&row, 6)?,
+                model: get_optional_text(&row, 7)?,
+                prompts_hash: get_optional_text(&row, 8)?,
+                baseline_commit: get_optional_text(&row, 9)?,
+                has_findings: row.get::<i64>(10)? != 0,
+                coverage: ReviewCoverage {
+                    cheap: row.get::<i64>(11)? != 0,
+                    stages: get_optional_text(&row, 12)?,
+                },
+                patch_message_id: row.get(13)?,
+            });
+        }
+        Ok(candidates)
+    }
+
+    /// Records the commit a review's worktree was checked out at.
+    pub async fn set_review_baseline_commit(&self, review_id: i64, commit: &str) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET baseline_commit = ? WHERE id = ?",
+            libsql::params![commit, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Records how much of the pipeline a review is about to run. A full
+    /// review needs no call: the columns default to it, and claiming a row
+    /// for a model run puts them back there.
+    pub async fn set_review_coverage(
+        &self,
+        review_id: i64,
+        coverage: &ReviewCoverage,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET cheap = ?, stages = ? WHERE id = ?",
+            libsql::params![coverage.cheap as i64, coverage.stages.clone(), review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Marks `review_id` as carrying the verdict of `from_review_id`.
+    pub async fn set_review_inherited_from(
+        &self,
+        review_id: i64,
+        from_review_id: i64,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET inherited_from_review_id = ? WHERE id = ?",
+            libsql::params![from_review_id, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Lists the Message-IDs of the patches that inherited the verdict of
+    /// `review_id`. Each is a copy of the patch that review covered, and a
+    /// reply to any of them is a reply about the same diff.
+    pub async fn get_inheriting_patch_message_ids(&self, review_id: i64) -> Result<Vec<String>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT DISTINCT p.message_id
+                 FROM reviews r
+                 JOIN patches p ON r.patch_id = p.id
+                 WHERE r.inherited_from_review_id = ? AND r.status = 'Skipped'
+                 ORDER BY p.id ASC",
+                libsql::params![review_id],
+            )
+            .await?;
+        let mut message_ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            message_ids.push(row.get(0)?);
+        }
+        Ok(message_ids)
+    }
+
     pub async fn get_patch_by_git_patch_id(
         &self,
         git_patch_id: &str,
     ) -> Result<Option<(String, String, String, String, i64)>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.message_id, p.diff, m.subject, m.author, m.date
                  FROM patches p
@@ -8741,7 +12677,7 @@ impl Database {
         let mut head = None;
         for candidate in Self::get_msgid_candidates(message_id) {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT ps.id, ps.cover_letter_message_id,
                             ps.total_parts, ps.received_parts, m.body
@@ -8792,7 +12728,7 @@ impl Database {
         let total_parts = total_parts as u32;
 
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT p.git_patch_id, p.message_id, p.part_index, p.diff,
                         m.subject, m.author, m.date
@@ -8850,9 +12786,9 @@ impl Database {
     }
 
     pub async fn get_pending_patchsets(&self, limit: usize) -> Result<Vec<PatchsetRow>> {
-        let mut rows = self.conn.query(
-            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number
-             FROM patchsets WHERE status = 'Pending' ORDER BY date ASC LIMIT ?",
+        let mut rows = self.read_conn().query(
+            "SELECT id, subject, status, thread_id, author, date, cover_letter_message_id, total_parts, received_parts, baseline_id, failed_reason, target_review_count, skip_filters, only_filters, embargo_until, slug, mr_url, mr_title, mr_number, priority
+             FROM patchsets WHERE status = 'Pending' ORDER BY priority DESC, date ASC LIMIT ?",
             libsql::params![limit as i64],
         ).await?;
 
@@ -8888,6 +12824,7 @@ impl Database {
                 mr_url: row.get(16).ok(),
                 mr_title: row.get(17).ok(),
                 mr_number: row.get(18).ok(),
+                priority: row.get(19).ok(),
             });
         }
         Ok(patchsets)
@@ -8899,18 +12836,19 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<PatchsetRow>> {
         let sql = format!(
-            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
+            "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number, p.priority
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.status IN ('Reviewed', 'Failed', 'Failed To Apply')
+             AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
              AND (
                  p.embargo_until <= ?
-                 OR ({CLEAN_PATCHSET_PREDICATE})
+                 OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE}))
              )
              ORDER BY CASE WHEN p.embargo_until <= ? THEN 0 ELSE 1 END, p.date ASC LIMIT ?"
         );
         let mut rows = self
-            .conn
+            .read_conn()
             .query(&sql, libsql::params![now - 600, now, now, limit as i64])
             .await?;
 
@@ -8946,9 +12884,123 @@ impl Database {
                 mr_url: row.get(16).ok(),
                 mr_title: row.get(17).ok(),
                 mr_number: row.get(18).ok(),
+                priority: row.get(19).ok(),
             });
         }
         Ok(patchsets)
+    }
+
+    /// Sets or updates the dispatch priority for a patchset.
+    pub async fn set_patchset_priority(&self, id: i64, priority: i64) -> Result<()> {
+        self.execute(
+            "UPDATE patchsets SET priority = ? WHERE id = ?",
+            libsql::params![priority, id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Updates patchset priority on message ingestion.
+    ///
+    /// Updates a patchset's priority upon ingestion.
+    ///
+    /// If the patchset priority is uninitialized (`NULL`), it is set directly to `calculated_priority`.
+    ///
+    /// If an arriving message matches an elevated priority rule (> default_priority),
+    /// the series priority is elevated monotonically via MAX(priority, rule_priority).
+    /// If it matches an explicit deprioritization rule (< default_priority), the series
+    /// priority is demoted monotonically via MIN(priority, rule_priority).
+    /// Messages matching only default priority never downgrade an already elevated series
+    /// or overwrite a sliding-window batch tier demotion.
+    pub async fn update_patchset_priority_on_ingest(
+        &self,
+        id: i64,
+        calculated_priority: i64,
+        default_priority: i64,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE patchsets
+             SET priority = CASE
+                 WHEN priority IS NULL THEN ?
+                 WHEN ? > ? THEN MAX(priority, ?)
+                 WHEN ? < ? THEN MIN(priority, ?)
+                 ELSE priority
+             END
+             WHERE id = ?",
+            libsql::params![
+                calculated_priority,
+                calculated_priority,
+                default_priority,
+                calculated_priority,
+                calculated_priority,
+                default_priority,
+                calculated_priority,
+                id,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Demotes the priority of pending/in-flight patchsets from an author within a sliding window [window_start, window_end].
+    ///
+    /// Uses `COALESCE(MIN(priority, ?), ?)` so already lower-priority patchsets are never promoted,
+    /// while uninitialized (`NULL`) patchsets are properly assigned the demoted priority.
+    pub async fn deprioritize_author_batch(
+        &self,
+        author: &str,
+        window_start: i64,
+        window_end: i64,
+        max_priority: i64,
+    ) -> Result<usize> {
+        let count = self
+            .execute(
+                "UPDATE patchsets
+                 SET priority = COALESCE(MIN(priority, ?), ?)
+                 WHERE author = ? AND date >= ? AND date <= ? AND status NOT IN ('Reviewed', 'Failed', 'Cancelled', 'Skipped', 'Failed To Apply')",
+                libsql::params![max_priority, max_priority, author, window_start, window_end],
+            )
+            .await?;
+        Ok(count as usize)
+    }
+
+    /// Counts patchsets submitted by an author within a sliding window [window_start, window_end].
+    pub async fn count_recent_patchsets_by_author(
+        &self,
+        author: &str,
+        window_start: i64,
+        window_end: i64,
+    ) -> Result<usize> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT COUNT(*) FROM patchsets WHERE author = ? AND date >= ? AND date <= ? AND status NOT IN ('Failed', 'Cancelled', 'Skipped', 'Failed To Apply')",
+                libsql::params![author, window_start, window_end],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<Option<i64>>(0).ok().flatten().unwrap_or(0) as usize),
+            None => Ok(0),
+        }
+    }
+
+    /// Fetches the author and date for a patchset by id.
+    pub async fn get_patchset_author_and_date(&self, id: i64) -> Result<Option<(String, i64)>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT author, date FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => {
+                let author: String = row.get(0).unwrap_or_default();
+                let date: i64 = row.get(1).unwrap_or(0);
+                Ok(Some((author, date)))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn get_patchset_review_outcome(
@@ -8956,7 +13008,7 @@ impl Database {
         patchset_id: i64,
     ) -> Result<PatchsetReviewOutcome> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT status, COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
                 libsql::params![patchset_id],
@@ -8972,7 +13024,7 @@ impl Database {
         }
 
         let mut no_ai_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM reviews
                  WHERE patchset_id = ? AND status = 'Skipped'
@@ -8986,7 +13038,7 @@ impl Database {
         }
 
         let mut incomplete_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1
                  FROM patches p
@@ -9000,7 +13052,10 @@ impl Database {
                    )
                    AND (
                        SELECT COUNT(*) FROM reviews r
-                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                       WHERE r.patch_id = p.id
+                         AND (r.status = 'Reviewed'
+                              OR (r.status = 'Skipped'
+                                  AND r.inherited_from_review_id IS NOT NULL))
                    ) < ?
                  LIMIT 1",
                 libsql::params![patchset_id, target_review_count],
@@ -9011,18 +13066,24 @@ impl Database {
         }
 
         let mut reviewed_rows = self
-            .conn
+            .read_conn()
             .query(
-                "SELECT 1 FROM reviews WHERE patchset_id = ? AND status = 'Reviewed' LIMIT 1",
+                "SELECT 1 FROM reviews
+                 WHERE patchset_id = ?
+                   AND (status = 'Reviewed'
+                        OR (status = 'Skipped' AND inherited_from_review_id IS NOT NULL))
+                 LIMIT 1",
                 libsql::params![patchset_id],
             )
             .await?;
+        // A series whose every patch inherited a clean verdict has no
+        // Reviewed row of its own, and is clean all the same.
         if reviewed_rows.next().await?.is_none() {
             return Ok(PatchsetReviewOutcome::Incomplete);
         }
 
         let mut finding_rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM findings f
                  JOIN reviews r ON r.id = f.review_id
@@ -9032,6 +13093,22 @@ impl Database {
             )
             .await?;
         if finding_rows.next().await?.is_some() {
+            return Ok(PatchsetReviewOutcome::HasFindings);
+        }
+
+        // Mirrors CLEAN_PATCHSET_PREDICATE: an unmailed related pre-existing
+        // bug is held like a finding.
+        let mut related_rows = self
+            .read_conn()
+            .query(
+                "SELECT 1 FROM patches pd
+                 JOIN preexisting_disclosures d ON d.patch_message_id = pd.message_id
+                 WHERE pd.patchset_id = ? AND d.disclosed_at IS NULL
+                 LIMIT 1",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if related_rows.next().await?.is_some() {
             Ok(PatchsetReviewOutcome::HasFindings)
         } else {
             Ok(PatchsetReviewOutcome::Clean)
@@ -9041,9 +13118,11 @@ impl Database {
     pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
         let sql = format!(
             "UPDATE patchsets AS p SET embargo_release_started_at = ?
-             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.id = ?
+               AND p.status IN ('Reviewed', 'Failed', 'Failed To Apply')
+               AND p.embargo_until IS NOT NULL
                AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
-               AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
+               AND (p.embargo_until <= ? OR (p.status = 'Reviewed' AND ({CLEAN_PATCHSET_PREDICATE})))"
         );
         let updated = self
             .execute(&sql, libsql::params![now, id, now - 600, now])
@@ -9064,52 +13143,147 @@ impl Database {
         &self,
         patchset_id: i64,
     ) -> Result<Vec<ReleaseReview>> {
+        self.query_completed_reviews_for_release(patchset_id, None)
+            .await
+    }
+
+    /// Lists the patches of `patchset_id` whose only finished pass
+    /// inherited a clean verdict, as Message-ID and part index. A patch
+    /// that a rerun has since reviewed is left to
+    /// get_completed_reviews_for_release.
+    pub async fn get_inherited_clean_patches(
+        &self,
+        patchset_id: i64,
+    ) -> Result<Vec<(String, i64)>> {
+        // Read on the write connection, as the release query below does:
+        // the shared read connection can sit on an older WAL snapshot and
+        // miss a row committed a moment ago.
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         let mut rows = self
-            .conn
+            .tx_conn
             .query(
-                "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
-             FROM reviews r
-             JOIN patches p ON r.patch_id = p.id
-             JOIN messages m ON p.message_id = m.message_id
-             WHERE r.patchset_id = ? AND r.status = 'Reviewed'
-             ORDER BY p.part_index ASC, r.id ASC",
+                "SELECT DISTINCT p.message_id, p.part_index
+                 FROM reviews r
+                 JOIN patches p ON r.patch_id = p.id
+                 WHERE r.patchset_id = ?
+                   AND r.status = 'Skipped'
+                   AND r.inherited_from_review_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM reviews done
+                                    WHERE done.patchset_id = r.patchset_id
+                                      AND done.patch_id = r.patch_id
+                                      AND done.status = 'Reviewed')
+                 ORDER BY p.part_index ASC",
                 libsql::params![patchset_id],
             )
             .await?;
+        let mut patches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            patches.push((row.get(0)?, get_optional_integer(&row, 1)?.unwrap_or(0)));
+        }
+        Ok(patches)
+    }
 
-        let mut temp_reviews = Vec::new();
+    pub async fn get_latest_completed_review_for_patch(
+        &self,
+        patchset_id: i64,
+        patch_id: i64,
+    ) -> Result<Option<ReleaseReview>> {
+        Ok(self
+            .query_completed_reviews_for_release(patchset_id, Some(patch_id))
+            .await?
+            .pop())
+    }
+
+    async fn query_completed_reviews_for_release(
+        &self,
+        patchset_id: i64,
+        patch_id_filter: Option<i64>,
+    ) -> Result<Vec<ReleaseReview>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = match patch_id_filter {
+            Some(patch_id) => {
+                self.tx_conn
+                    .query(
+                        "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
+                     FROM reviews r
+                     JOIN patches p ON r.patch_id = p.id
+                     JOIN messages m ON p.message_id = m.message_id
+                     WHERE r.patchset_id = ? AND r.patch_id = ? AND r.status = 'Reviewed'
+                     ORDER BY r.id DESC
+                     LIMIT 1",
+                        libsql::params![patchset_id, patch_id],
+                    )
+                    .await?
+            }
+            None => {
+                self.tx_conn
+                    .query(
+                        "SELECT r.id, r.patch_id, r.inline_review, r.summary, m.message_id, p.part_index
+                     FROM reviews r
+                     JOIN patches p ON r.patch_id = p.id
+                     JOIN messages m ON p.message_id = m.message_id
+                     WHERE r.patchset_id = ? AND r.status = 'Reviewed'
+                     ORDER BY p.part_index ASC, r.id ASC",
+                        libsql::params![patchset_id],
+                    )
+                    .await?
+            }
+        };
+
+        let mut reviews = Vec::new();
         while let Some(row) = rows.next().await? {
             let review_id: i64 = row.get(0)?;
             let patch_id: i64 = row.get(1)?;
-            let inline_review: String = crate::compression::get_compressed_string_opt(&row, 2)
-                .unwrap_or(None)
-                .unwrap_or_default();
-            let summary: String = crate::compression::get_compressed_string_opt(&row, 3)
-                .unwrap_or(None)
-                .unwrap_or_default();
+            let inline_review_opt = crate::compression::get_compressed_string_opt(&row, 2)?;
+            let has_inline_review = inline_review_opt.is_some();
+            let inline_review: String = inline_review_opt.unwrap_or_default();
+            let summary: String =
+                crate::compression::get_compressed_string_opt(&row, 3)?.unwrap_or_default();
             let patch_message_id: String = row.get(4).unwrap_or_default();
             let index: i64 = row.get(5).unwrap_or_default();
-            temp_reviews.push((
-                review_id,
+            reviews.push(ReleaseReview {
+                id: review_id,
                 patch_id,
-                inline_review,
-                summary,
                 patch_message_id,
                 index,
-            ));
+                has_inline_review,
+                inline_review,
+                summary,
+                findings: Vec::new(),
+            });
+        }
+        drop(rows);
+
+        if reviews.is_empty() {
+            return Ok(reviews);
         }
 
-        let mut reviews = Vec::new();
-        for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
-            // Fetch findings for this review
-            let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations FROM findings WHERE review_id = ?",
-                libsql::params![review_id],
-            ).await?;
-
-            let mut findings = Vec::new();
+        const FINDINGS_CHUNK_SIZE: usize = 200;
+        let mut findings_by_review: std::collections::HashMap<i64, Vec<serde_json::Value>> =
+            std::collections::HashMap::new();
+        for chunk in reviews.chunks(FINDINGS_CHUNK_SIZE) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT review_id, severity, problem, severity_explanation, preexisting, locations
+                   FROM findings
+                  WHERE review_id IN ({})
+                  ORDER BY id ASC",
+                placeholders
+            );
+            let params: Vec<libsql::Value> =
+                chunk.iter().map(|r| libsql::Value::Integer(r.id)).collect();
+            let mut findings_rows = self.tx_conn.query(&sql, params).await?;
             while let Some(f_row) = findings_rows.next().await? {
-                let severity_int: i64 = f_row.get(0).unwrap_or(1);
+                let review_id: i64 = f_row.get(0)?;
+                let severity_int: i64 = f_row.get(1).unwrap_or(1);
                 let severity = match severity_int {
                     4 => "Critical",
                     3 => "High",
@@ -9117,85 +13291,377 @@ impl Database {
                     _ => "Low",
                 }
                 .to_string();
-                let problem: String = f_row.get(1).unwrap_or_default();
-                let severity_explanation: Option<String> = f_row.get(2).ok();
-                let int: Option<i64> = f_row.get(3).ok();
+                let problem: String = f_row.get(2).unwrap_or_default();
+                let severity_explanation: Option<String> = f_row.get(3).ok();
+                let int: Option<i64> = f_row.get(4).ok();
                 let preexisting = int.map(|val| val != 0);
-                let locations_str: Option<String> = f_row.get(4).ok();
+                let locations_str: Option<String> = f_row.get(5).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
-                findings.push(json!({
-                    "severity": severity,
-                    "problem": problem,
-                    "severity_explanation": severity_explanation,
-                    "preexisting": preexisting,
-                    "locations": locations,
-                }));
+                findings_by_review
+                    .entry(review_id)
+                    .or_default()
+                    .push(json!({
+                        "severity": severity,
+                        "problem": problem,
+                        "severity_explanation": severity_explanation,
+                        "preexisting": preexisting,
+                        "locations": locations,
+                    }));
             }
+        }
 
-            reviews.push(ReleaseReview {
-                id: review_id,
-                patch_id,
-                patch_message_id,
-                index,
-                inline_review,
-                summary,
-                findings,
-            });
+        for review in &mut reviews {
+            if let Some(findings) = findings_by_review.remove(&review.id) {
+                review.findings = findings;
+            }
         }
         Ok(reviews)
     }
 
-    pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
-        if status == ReviewStatus::Cancelled.as_str() {
-            self.execute(
-                "UPDATE patchsets SET status = ? WHERE id = ?",
-                libsql::params![status, id],
-            )
-            .await?;
-        } else {
-            self.execute(
-                "UPDATE patchsets SET status = ? WHERE id = ? AND status != 'Cancelled'",
-                libsql::params![status, id],
-            )
-            .await?;
+    pub async fn complete_patchset_review_status(&self, id: i64, status: &str) -> Result<bool> {
+        self.complete_patchset_review(id, status, None).await
+    }
+
+    /// Atomically marks an `'In Review'` patchset as `'Failed To Apply'`, or
+    /// re-queues it to `'Pending'` if a late 0/N cover letter carrying baseline
+    /// or prerequisite metadata arrived while this worker was trying baselines.
+    ///
+    /// Running inside an immediate write transaction serializes against
+    /// `create_patchset_in_tx`, eliminating the race where a late cover letter
+    /// lands during baseline resolution and would otherwise be stranded behind
+    /// `'Failed To Apply'`.
+    pub async fn complete_failed_to_apply_or_requeue(
+        &self,
+        id: i64,
+        started_cover_id: Option<&str>,
+        started_subject: &str,
+        started_had_body: bool,
+    ) -> Result<FailedToApplyOutcome> {
+        if let Some(claim) = self.patchset_claim
+            && claim.patchset_id != id
+        {
+            return Ok(FailedToApplyOutcome::Superseded);
         }
+
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+
+        let current_row = if let Some(claim) = tx_db.patchset_claim {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT cover_letter_message_id, subject, subject_index
+                       FROM patchsets
+                      WHERE id = ?
+                        AND status = 'In Review'
+                        AND EXISTS (
+                            SELECT 1 FROM meta m
+                             WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                               AND CAST(m.value AS INTEGER) = ?
+                        )",
+                    libsql::params![id, claim.generation],
+                )
+                .await?;
+            rows.next().await?
+        } else {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT cover_letter_message_id, subject, subject_index
+                       FROM patchsets
+                      WHERE id = ?
+                        AND status != 'Cancelled'",
+                    libsql::params![id],
+                )
+                .await?;
+            rows.next().await?
+        };
+
+        let Some(row) = current_row else {
+            tx.commit().await?;
+            return Ok(FailedToApplyOutcome::Superseded);
+        };
+
+        let current_cover_id: Option<String> = row.get(0).ok();
+        let current_subject: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+        let subject_index: u32 = row.get::<Option<u32>>(2)?.unwrap_or(9999);
+        drop(row);
+
+        let cover_arrived_after_start = subject_index == 0
+            && current_cover_id.is_some()
+            && (current_cover_id.as_deref() != started_cover_id || !started_had_body);
+
+        if cover_arrived_after_start && let Some(ref cover_id) = current_cover_id {
+            let cover_body = tx_db.get_message_body(cover_id).await?;
+            if crate::baseline::cover_letter_adds_baseline_metadata(
+                started_subject,
+                &current_subject,
+                cover_body.as_deref(),
+            ) {
+                tx_db
+                    .execute(
+                        "UPDATE patchsets
+                            SET status = 'Pending',
+                                baseline_id = NULL,
+                                baseline_logs = NULL,
+                                failed_reason = NULL
+                          WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await?;
+                tx_db.reset_patchset_review_state(id).await?;
+                tx.commit().await?;
+                return Ok(FailedToApplyOutcome::RequeuedForLateCover);
+            }
+        }
+
+        let updated = tx_db
+            .complete_patchset_review(id, ReviewStatus::FailedToApply.as_str(), None)
+            .await?;
+        tx.commit().await?;
+        Ok(if updated {
+            FailedToApplyOutcome::MarkedFailedToApply
+        } else {
+            FailedToApplyOutcome::Superseded
+        })
+    }
+
+    /// Moves a patchset to its final review status and records why it
+    /// failed, or clears a stale reason when `failed_reason` is `None`.
+    ///
+    /// Under a patchset claim the write only lands while the claim is still
+    /// the active generation, so a superseded worker cannot overwrite the
+    /// outcome of a newer run.
+    pub async fn complete_patchset_review(
+        &self,
+        id: i64,
+        status: &str,
+        failed_reason: Option<&str>,
+    ) -> Result<bool> {
+        if status == ReviewStatus::Cancelled.as_str() {
+            let updated = self
+                .execute(
+                    "UPDATE patchsets SET status = ?, failed_reason = ? WHERE id = ?",
+                    libsql::params![status, failed_reason, id],
+                )
+                .await?;
+            return Ok(updated > 0);
+        }
+        if let Some(claim) = self.patchset_claim {
+            if claim.patchset_id != id {
+                return Ok(false);
+            }
+            let updated = self
+                .execute(
+                    "UPDATE patchsets
+                        SET status = ?, failed_reason = ?
+                      WHERE id = ?
+                        AND status = 'In Review'
+                        AND EXISTS (
+                            SELECT 1 FROM meta m
+                             WHERE m.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                               AND CAST(m.value AS INTEGER) = ?
+                        )",
+                    libsql::params![status, failed_reason, id, claim.generation],
+                )
+                .await?;
+            Ok(updated > 0)
+        } else {
+            let updated = self
+                .execute(
+                    "UPDATE patchsets SET status = ?, failed_reason = ? WHERE id = ? AND status != 'Cancelled'",
+                    libsql::params![status, failed_reason, id],
+                )
+                .await?;
+            Ok(updated > 0)
+        }
+    }
+
+    pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
+        let _ = self.complete_patchset_review_status(id, status).await?;
         Ok(())
     }
 
-    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
-        let count = self
+    async fn allocate_patchset_review_gen_in_tx(&self, id: i64) -> Result<i64> {
+        let generation = self
+            .query_returning_i64(
+                "INSERT INTO meta (key, value) VALUES ('patchset_gen_seq', '1')
+                 ON CONFLICT(key) DO UPDATE SET
+                     value = CAST(CAST(meta.value AS INTEGER) + 1 AS TEXT)
+                 RETURNING CAST(value AS INTEGER)",
+                (),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Failed to allocate patchset review generation"))?;
+        self.execute(
+            "INSERT INTO meta (key, value)
+             VALUES ('patchset_active_gen:' || CAST(? AS TEXT), CAST(? AS TEXT))
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![id, generation],
+        )
+        .await?;
+        Ok(generation)
+    }
+
+    /// Atomically claims a `Pending` patchset for review (`status = 'In Review'`)
+    /// and allocates a monotonic claim generation token in `meta` so any stale
+    /// worker superseded by a later `rerun_patchset` or `cancel_patchset` is
+    /// fenced out of all database writes.
+    pub async fn claim_patchset_for_review_with_gen(&self, id: i64) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let count = tx_db
             .execute(
-                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND status = 'Pending'",
+                "UPDATE patchsets SET status = 'In Review', failed_reason = NULL WHERE id = ? AND status = 'Pending'",
                 libsql::params![id],
             )
             .await?;
-        Ok(count > 0)
+        if count == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let generation = tx_db.allocate_patchset_review_gen_in_tx(id).await?;
+        tx.commit().await?;
+        Ok(Some(generation))
+    }
+
+    /// Transitions a non-cancelled patchset into `'In Review'` and allocates a
+    /// claim generation token for direct callers of `review_patchset_task`.
+    pub async fn enter_patchset_review_with_gen(&self, id: i64) -> Result<Option<i64>> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let count = tx_db
+            .execute(
+                "UPDATE patchsets SET status = 'In Review' WHERE id = ? AND COALESCE(status, '') != 'Cancelled'",
+                libsql::params![id],
+            )
+            .await?;
+        if count == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        let generation = tx_db.allocate_patchset_review_gen_in_tx(id).await?;
+        tx.commit().await?;
+        Ok(Some(generation))
+    }
+
+    pub async fn claim_patchset_for_review(&self, id: i64) -> Result<bool> {
+        Ok(self.claim_patchset_for_review_with_gen(id).await?.is_some())
     }
 
     pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
-            "UPDATE patches SET status = ? WHERE id = ?",
-            libsql::params![status, patch_id],
+            "UPDATE patches
+                SET status = ?
+              WHERE id = ?
+                AND (
+                    (? = 'Cancelled'
+                        AND COALESCE(status, '') NOT IN ('Reviewed', 'Skipped', 'Failed')
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                        ))
+                    OR (? != 'Cancelled'
+                        AND (? = 'Pending' OR COALESCE(status, '') != 'Cancelled')
+                        AND NOT EXISTS (
+                            SELECT 1 FROM patchsets ps
+                             WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                        )
+                        AND (? IS NULL OR (
+                            patches.patchset_id = ?
+                            AND EXISTS (
+                                SELECT 1 FROM patchsets ps_claim
+                                JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                                WHERE ps_claim.id = patches.patchset_id
+                                  AND ps_claim.status = 'In Review'
+                                  AND CAST(m_claim.value AS INTEGER) = ?
+                            )
+                        )))
+                )",
+            libsql::params![
+                status,
+                patch_id,
+                status,
+                status,
+                status,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
+            ],
         )
         .await?;
         Ok(())
     }
 
-    pub async fn get_patchset_status(&self, id: i64) -> Result<Option<String>> {
+    pub async fn get_patch_statuses_for_patchset(
+        &self,
+        patchset_id: i64,
+    ) -> Result<std::collections::HashMap<i64, String>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
         let mut rows = self
-            .conn
+            .tx_conn
+            .query(
+                "SELECT p.id,
+                        CASE
+                            WHEN p.status IN ('Failed', 'Failed To Apply', 'FailedToApply', 'error', 'Cancelled') THEN p.status
+                            WHEN (
+                                SELECT r.status FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id
+                                ORDER BY r.id DESC LIMIT 1
+                            ) IN ('Failed', 'FailedToApply', 'Cancelled', 'In Review') THEN 'Failed'
+                            WHEN p.status = 'Skipped' OR EXISTS (
+                                SELECT 1 FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id AND r.status = 'Skipped'
+                            ) THEN 'Skipped'
+                            WHEN p.status = 'Reviewed' OR EXISTS (
+                                SELECT 1 FROM reviews r
+                                WHERE r.patchset_id = p.patchset_id AND r.patch_id = p.id AND r.status = 'Reviewed'
+                            ) THEN 'Reviewed'
+                            WHEN COALESCE(p.status, '') != '' THEN p.status
+                            ELSE ''
+                        END
+                 FROM patches p
+                 WHERE p.patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut statuses = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let patch_id: i64 = row.get(0)?;
+            let status: String = row.get(1)?;
+            statuses.insert(patch_id, status);
+        }
+        drop(rows);
+        Ok(statuses)
+    }
+
+    pub async fn get_patchset_status(&self, id: i64) -> Result<Option<String>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = self
+            .tx_conn
             .query(
                 "SELECT status FROM patchsets WHERE id = ?",
                 libsql::params![id],
             )
             .await?;
-        if let Some(row) = rows.next().await? {
-            Ok(Some(row.get(0)?))
+        let status = if let Some(row) = rows.next().await? {
+            Some(row.get(0)?)
         } else {
-            Ok(None)
-        }
+            None
+        };
+        drop(rows);
+        Ok(status)
     }
 
     pub async fn cancel_outbox_for_patchset(&self, id: i64, reason: &str) -> Result<()> {
@@ -9211,8 +13677,11 @@ impl Database {
             "UPDATE email_outbox
                  SET status = 'Cancelled', error_log = ?, locked_at = NULL
                  WHERE status IN ('Pending', 'Embargoed')
-                   AND patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)",
-            libsql::params![reason.to_string(), id],
+                   AND (
+                       patch_id IN (SELECT id FROM patches WHERE patchset_id = ?)
+                       OR patchset_id = ?
+                   )",
+            libsql::params![reason.to_string(), id, id],
         )
         .await?;
 
@@ -9225,20 +13694,60 @@ impl Database {
         )
         .await?;
 
+        self.execute(
+            "UPDATE fetch_queue
+                 SET status = 'Cancelled', error_log = ?, locked_at = NULL
+                 WHERE status IN ('Pending', 'Fetching')
+                   AND EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = ?
+                         AND ps.cover_letter_message_id IN (
+                             fetch_queue.article_id,
+                             '<' || fetch_queue.article_id || '>',
+                             fetch_queue.article_id || '@sashiko.local',
+                             '<' || fetch_queue.article_id || '@sashiko.local>'
+                         )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patchsets ps2
+                       WHERE ps2.id != ?
+                         AND COALESCE(ps2.status, '') != 'Cancelled'
+                         AND ps2.cover_letter_message_id IN (
+                             fetch_queue.article_id,
+                             '<' || fetch_queue.article_id || '>',
+                             fetch_queue.article_id || '@sashiko.local',
+                             '<' || fetch_queue.article_id || '@sashiko.local>'
+                         )
+                   )",
+            libsql::params![reason.to_string(), id, id],
+        )
+        .await?;
+
         Ok(())
     }
 
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
         let allowed_statuses = if force {
-            "('Fetching', 'Pending', 'Incomplete', 'In Review')"
+            "('Fetching', 'Pending', 'Awaiting Review', 'Incomplete', 'In Review')"
         } else {
-            "('Fetching', 'Pending', 'Incomplete')"
+            "('Fetching', 'Pending', 'Awaiting Review', 'Incomplete')"
         };
-        // Atomically transition patchsets.status to 'Cancelled' first so any
-        // concurrent worker calling update_patchset_status (which guards with
-        // status != 'Cancelled') is immediately blocked from marking the
-        // patchset as 'Reviewed'.
-        let count = self
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        // Atomically transition patchsets.status to 'Cancelled' inside an
+        // immediate transaction so concurrent workers calling
+        // update_patchset_status, create_tool_usage, create_finding, or
+        // link_review_to_bug cannot interleave between child artifact cleanup
+        // and marking review/patch rows Cancelled.
+        let count = tx_db
             .execute(
                 &format!(
                     "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN {}",
@@ -9248,21 +13757,73 @@ impl Database {
             )
             .await?;
         if count == 0 {
+            if let Some(tx) = tx_guard {
+                tx.commit().await?;
+            }
             return Ok(false);
         }
 
-        self.execute(
-                "UPDATE reviews SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
+        tx_db
+            .execute(
+                "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
                 libsql::params![id],
             )
             .await?;
-        self.execute(
-                "UPDATE patches SET status = 'Cancelled' WHERE patchset_id = ? AND status IN ('Pending', 'In Review', 'Reviewing')",
+
+        for table in [
+            "tool_usages",
+            "findings",
+            "prior_feedback_resolutions",
+            "bug_reviews",
+        ] {
+            tx_db
+                .execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE review_id IN (
+                            SELECT id FROM reviews
+                             WHERE patchset_id = ? AND status IN ('Pending', 'In Review')
+                        )"
+                    ),
+                    libsql::params![id],
+                )
+                .await?;
+        }
+        let cancelled_reviews = tx_db
+            .execute(
+                "UPDATE reviews
+                    SET status = 'Cancelled', interaction_id = NULL
+                  WHERE patchset_id = ? AND status IN ('Pending', 'In Review')",
                 libsql::params![id],
             )
             .await?;
-        self.cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            cancelled_reviews,
+        );
+        tx_db
+            .execute(
+                "UPDATE patches
+                    SET status = 'Cancelled'
+                  WHERE patchset_id = ?
+                    AND (
+                        status IS NULL
+                        OR status IN ('Pending', 'In Review', 'Reviewing')
+                        OR (status = 'applied' AND NOT EXISTS (
+                            SELECT 1 FROM reviews r
+                             WHERE r.patchset_id = patches.patchset_id
+                               AND r.patch_id = patches.id
+                               AND r.status = 'Reviewed'
+                        ))
+                    )",
+                libsql::params![id],
+            )
             .await?;
+        tx_db
+            .cancel_outbox_for_patchset(id, "Cancelled because patchset was cancelled")
+            .await?;
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
         Ok(true)
     }
 
@@ -9276,20 +13837,31 @@ impl Database {
             return Ok(0);
         };
 
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
         let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
-        let mut rows = self
-            .conn
+        let mut rows = tx_db
+            .read_conn()
             .query(
-                "SELECT id, subject, mr_url FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
+                "SELECT id, subject, mr_url, version FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
                 libsql::params![num],
             )
             .await?;
 
-        let mut matching: Vec<(i64, u32)> = Vec::new();
+        let mut matching: Vec<(i64, u32, Option<u32>)> = Vec::new();
         while let Some(row) = rows.next().await? {
             let row_id: i64 = row.get(0)?;
-            let row_subj: String = row.get(1).unwrap_or_default();
-            let row_mr_url: Option<String> = row.get(2).ok();
+            let row_subj: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+            let row_mr_url: Option<String> = row.get(2)?;
+            let stored_ver: Option<u32> = row.get(3)?;
 
             let same_repo = match (target_repo.as_deref(), row_mr_url.as_deref()) {
                 (Some(target), Some(r_url)) => {
@@ -9305,232 +13877,1771 @@ impl Database {
 
             let ver = crate::forge::extract_mr_version_from_subject(Some(&row_subj), num)
                 .or_else(|| crate::patch::parse_subject_version(&row_subj))
+                .or(stored_ver)
                 .unwrap_or(1);
-            matching.push((row_id, ver));
+            matching.push((row_id, ver, stored_ver));
         }
         drop(rows);
 
+        for &(row_id, ver, stored_ver) in &matching {
+            if stored_ver != Some(ver) {
+                tx_db
+                    .execute(
+                        "UPDATE patchsets SET version = ? WHERE id = ?",
+                        libsql::params![i64::from(ver), row_id],
+                    )
+                    .await?;
+            }
+        }
+
         if matching.len() <= 1 {
+            if let Some(tx) = tx_guard {
+                tx.commit().await?;
+            }
             return Ok(0);
         }
 
-        let latest_id = matching
-            .iter()
-            .max_by_key(|(id, ver)| (*ver, *id))
-            .map(|(id, _)| *id)
-            .unwrap();
+        matching.sort_by_key(|&(id, ver, _)| (ver, id));
+        for pair in matching.windows(2) {
+            let (prev_id, _, _) = pair[0];
+            let (curr_id, _, _) = pair[1];
+            if prev_id != curr_id {
+                tx_db
+                    .execute(
+                        "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'forge_mr' WHERE id = ?",
+                        libsql::params![prev_id, curr_id],
+                    )
+                    .await?;
+                tx_db.reconcile_patch_lineage(prev_id, curr_id).await?;
+            }
+        }
+
+        let latest_id = matching.last().map(|&(id, _, _)| id).unwrap();
 
         let mut cancelled_count = 0;
-        for (old_id, old_ver) in matching {
+        for (old_id, old_ver, _) in matching {
             if old_id == latest_id {
                 continue;
             }
-            if self.cancel_patchset(old_id, true).await? {
+            tx_db
+                .cancel_outbox_for_patchset(old_id, "Cancelled: superseded by newer PR version")
+                .await?;
+            if tx_db.cancel_patchset(old_id, true).await? {
                 cancelled_count += 1;
                 info!(
                     "Cancelled superseded PR #{} v{} patchset {} (superseded by patchset {})",
                     num, old_ver, old_id, latest_id
                 );
             }
-            self.cancel_outbox_for_patchset(old_id, "Cancelled: superseded by newer PR version")
-                .await?;
         }
 
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
         Ok(cancelled_count)
+    }
+
+    const AUTHOR_EMAIL_EXPR: &'static str = "LOWER(TRIM(
+            CASE
+                WHEN INSTR(author, '<') > 0 AND INSTR(author, '>') > INSTR(author, '<')
+                THEN SUBSTR(author, INSTR(author, '<') + 1, INSTR(author, '>') - INSTR(author, '<') - 1)
+                ELSE author
+            END
+        ))";
+
+    fn author_email_candidates(author: &str) -> [String; 4] {
+        let email = crate::patch::extract_email(author).to_lowercase();
+        if email.is_empty() {
+            return [String::new(), String::new(), String::new(), String::new()];
+        }
+        let mut out = vec![email.clone()];
+        if let Some(rest) = email.strip_prefix("devnull+")
+            && let Some(at_idx) = rest.rfind('@')
+        {
+            let encoded = &rest[..at_idx];
+            let domain = &rest[at_idx + 1..];
+            if domain == "kernel.org" || domain == "linux.dev" {
+                let dot_positions: Vec<usize> = encoded
+                    .char_indices()
+                    .filter_map(|(i, c)| (c == '.').then_some(i))
+                    .collect();
+                for &pos in dot_positions.iter().rev().skip(1).take(3) {
+                    let mut decoded = String::with_capacity(encoded.len());
+                    decoded.push_str(&encoded[..pos]);
+                    decoded.push('@');
+                    decoded.push_str(&encoded[pos + 1..]);
+                    if !out.contains(&decoded) {
+                        out.push(decoded);
+                    }
+                }
+            }
+        } else if email.contains('@') {
+            let encoded = email.replace('@', ".");
+            out.push(format!("devnull+{encoded}@kernel.org"));
+            out.push(format!("devnull+{encoded}@linux.dev"));
+        }
+        while out.len() < 4 {
+            out.push(email.clone());
+        }
+        out.truncate(4);
+        out.try_into()
+            .unwrap_or_else(|_| [email.clone(), email.clone(), email.clone(), email])
+    }
+
+    fn is_generic_short_subject(clean_subject: &str, prefixes: &[String]) -> bool {
+        if !prefixes.is_empty() {
+            return false;
+        }
+        let lower = clean_subject.trim().to_ascii_lowercase();
+        let word_count = lower.split_whitespace().count();
+        if word_count > 2 {
+            return false;
+        }
+        matches!(
+            lower.as_str(),
+            "fix typo"
+                | "fix typos"
+                | "fix warning"
+                | "fix warnings"
+                | "fix build"
+                | "cleanup"
+                | "clean up"
+                | "update"
+                | "bugfix"
+                | "fix bug"
+        )
+    }
+
+    pub async fn reconcile_patch_lineage(
+        &self,
+        prev_patchset_id: i64,
+        curr_patchset_id: i64,
+    ) -> Result<()> {
+        if prev_patchset_id == curr_patchset_id {
+            return Ok(());
+        }
+
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        let mut prev_patches = Vec::new();
+        let mut prev_rows = tx_db
+            .read_conn()
+            .query(
+                "SELECT p.id, COALESCE(p.part_index, 0), p.git_patch_id, COALESCE(m.subject, '')
+                 FROM patches p
+                 LEFT JOIN messages m ON m.message_id = p.message_id
+                 WHERE p.patchset_id = ? AND COALESCE(p.part_index, 0) >= 1
+                 ORDER BY p.part_index ASC, p.id ASC
+                 LIMIT 256",
+                libsql::params![prev_patchset_id],
+            )
+            .await?;
+        while let Some(row) = prev_rows.next().await? {
+            let subj: String = row.get(3)?;
+            prev_patches.push(patch_lineage::LineagePatch {
+                id: row.get(0)?,
+                part_index: row.get(1)?,
+                git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
+                clean_subject: crate::patch::clean_subject(&subj),
+                diff: String::new(),
+                existing_prev_id: None,
+                existing_prev_status: None,
+            });
+        }
+        drop(prev_rows);
+
+        let mut curr_patches = Vec::new();
+        let mut curr_rows = tx_db
+            .read_conn()
+            .query(
+                "SELECT p.id, COALESCE(p.part_index, 0), p.git_patch_id, COALESCE(m.subject, ''),
+                        p.previous_patch_id, p.previous_patch_status
+                 FROM patches p
+                 LEFT JOIN messages m ON m.message_id = p.message_id
+                 WHERE p.patchset_id = ? AND COALESCE(p.part_index, 0) >= 1
+                 ORDER BY p.part_index ASC, p.id ASC
+                 LIMIT 256",
+                libsql::params![curr_patchset_id],
+            )
+            .await?;
+        while let Some(row) = curr_rows.next().await? {
+            let subj: String = row.get(3)?;
+            curr_patches.push(patch_lineage::LineagePatch {
+                id: row.get(0)?,
+                part_index: row.get(1)?,
+                git_patch_id: row.get::<Option<String>>(2)?.filter(|s| !s.is_empty()),
+                clean_subject: crate::patch::clean_subject(&subj),
+                diff: String::new(),
+                existing_prev_id: row.get(4)?,
+                existing_prev_status: row.get(5)?,
+            });
+        }
+        drop(curr_rows);
+
+        if curr_patches.is_empty() {
+            if let Some(tx) = tx_guard {
+                tx.commit().await?;
+            }
+            return Ok(());
+        }
+
+        tx_db
+            .populate_candidate_lineage_diffs(&mut prev_patches, &mut curr_patches)
+            .await?;
+
+        let (mut assignments, mut matched_prev_ids) =
+            patch_lineage::match_patch_lineage(&prev_patches, &curr_patches);
+
+        // Tier 3: Singleton fallback when linked via high-confidence series signal
+        if assignments.is_empty() && prev_patches.len() == 1 && curr_patches.len() == 1 {
+            let mut meta_rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT (SELECT total_parts FROM patchsets WHERE id = ?),
+                            total_parts, version_link_signal
+                     FROM patchsets WHERE id = ?",
+                    libsql::params![prev_patchset_id, curr_patchset_id],
+                )
+                .await?;
+            if let Some(mrow) = meta_rows.next().await? {
+                let prev_total: u32 = mrow.get::<Option<u32>>(0)?.unwrap_or(1);
+                let curr_total: u32 = mrow.get::<Option<u32>>(1)?.unwrap_or(1);
+                let signal: Option<String> = mrow.get(2)?;
+                if prev_total == 1
+                    && curr_total == 1
+                    && matches!(
+                        signal.as_deref(),
+                        Some("forge_mr" | "change_id" | "message_ref")
+                    )
+                {
+                    assignments.insert(
+                        curr_patches[0].id,
+                        (Some(prev_patches[0].id), Some("modified")),
+                    );
+                }
+            }
+            drop(meta_rows);
+        }
+
+        for curr in &curr_patches {
+            let (prev_id, status) = if let Some(&(pid, st)) = assignments.get(&curr.id) {
+                (pid, st)
+            } else if let Some(existing_id) = curr.existing_prev_id
+                && !matched_prev_ids.contains(&existing_id)
+                && prev_patches.iter().any(|p| p.id == existing_id)
+            {
+                matched_prev_ids.insert(existing_id);
+                continue;
+            } else {
+                (None, None)
+            };
+            if prev_id != curr.existing_prev_id || status != curr.existing_prev_status.as_deref() {
+                tx_db
+                    .execute(
+                        "UPDATE patches SET previous_patch_id = ?, previous_patch_status = ? WHERE id = ?",
+                        libsql::params![prev_id, status, curr.id],
+                    )
+                    .await?;
+            }
+        }
+
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn populate_candidate_lineage_diffs(
+        &self,
+        prev_patches: &mut [patch_lineage::LineagePatch],
+        curr_patches: &mut [patch_lineage::LineagePatch],
+    ) -> Result<()> {
+        let prev_gpids: std::collections::HashSet<&str> = prev_patches
+            .iter()
+            .filter_map(|p| p.git_patch_id.as_deref())
+            .collect();
+        let shared_gpids: std::collections::HashSet<String> = curr_patches
+            .iter()
+            .filter_map(|p| p.git_patch_id.as_deref())
+            .filter(|g| prev_gpids.contains(g))
+            .map(str::to_string)
+            .collect();
+        if shared_gpids.is_empty() {
+            return Ok(());
+        }
+
+        let ids: Vec<i64> = prev_patches
+            .iter()
+            .chain(curr_patches.iter())
+            .filter(|p| {
+                p.git_patch_id
+                    .as_deref()
+                    .is_some_and(|g| shared_gpids.contains(g))
+            })
+            .map(|p| p.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let json = serde_json::to_string(&ids)?;
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT id, diff FROM patches WHERE id IN (SELECT value FROM json_each(?))",
+                libsql::params![json.as_str()],
+            )
+            .await?;
+        let mut diffs_by_id = std::collections::HashMap::with_capacity(ids.len());
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let diff = crate::compression::get_compressed_string(&row, 1)?;
+            diffs_by_id.insert(id, diff);
+        }
+        for p in prev_patches.iter_mut().chain(curr_patches.iter_mut()) {
+            if let Some(diff) = diffs_by_id.remove(&p.id) {
+                p.diff = diff;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn reconcile_version_lineage(&self, patchset_id: i64) -> Result<usize> {
+        self.reconcile_version_lineage_inner(patchset_id, false)
+            .await
+    }
+
+    async fn is_prereq_candidate(
+        &self,
+        cand_id: i64,
+        cand_cover_id: Option<&str>,
+        prereq_msgids: &std::collections::HashSet<String>,
+        prereq_patch_ids: &std::collections::HashSet<String>,
+        own_msgids: &std::collections::HashSet<String>,
+        own_git_patch_ids: &std::collections::HashSet<String>,
+    ) -> Result<bool> {
+        if let Some(c) = cand_cover_id
+            && !prereq_msgids.is_empty()
+            && Self::get_msgid_candidates(c)
+                .iter()
+                .any(|m| prereq_msgids.contains(m))
+        {
+            return Ok(true);
+        }
+
+        if !prereq_msgids.is_empty() || !prereq_patch_ids.is_empty() {
+            let mut p_rows = self
+                .read_conn()
+                .query(
+                    "SELECT message_id, git_patch_id FROM patches WHERE patchset_id = ? LIMIT 256",
+                    libsql::params![cand_id],
+                )
+                .await?;
+            let mut hit = false;
+            while let Some(prow) = p_rows.next().await? {
+                let pmid = prow.get::<String>(0)?;
+                if !prereq_msgids.is_empty()
+                    && Self::get_msgid_candidates(&pmid)
+                        .iter()
+                        .any(|m| prereq_msgids.contains(m))
+                {
+                    hit = true;
+                    break;
+                }
+                if let Some(gpid) = prow.get::<Option<String>>(1)?
+                    && prereq_patch_ids.contains(&gpid)
+                {
+                    hit = true;
+                    break;
+                }
+            }
+            drop(p_rows);
+            if hit {
+                return Ok(true);
+            }
+        }
+
+        if !own_msgids.is_empty() || !own_git_patch_ids.is_empty() {
+            let cand_cover_body = if let Some(clid) = cand_cover_id {
+                let mut m_rows = self
+                    .read_conn()
+                    .query(
+                        "SELECT body FROM messages WHERE message_id = ? LIMIT 1",
+                        libsql::params![clid],
+                    )
+                    .await?;
+                if let Some(mrow) = m_rows.next().await? {
+                    Some(mrow.get::<libsql::Value>(0)?)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let cand_p1 = {
+                let mut p1_rows = self
+                    .read_conn()
+                    .query(
+                        "SELECT m.body, p.diff
+                         FROM patches p
+                         LEFT JOIN messages m ON m.message_id = p.message_id
+                         WHERE p.patchset_id = ? AND p.part_index = 1
+                         LIMIT 1",
+                        libsql::params![cand_id],
+                    )
+                    .await?;
+                if let Some(p1row) = p1_rows.next().await? {
+                    Some((
+                        p1row.get::<libsql::Value>(0)?,
+                        p1row.get::<libsql::Value>(1)?,
+                    ))
+                } else {
+                    None
+                }
+            };
+
+            if cand_cover_body.is_some() || cand_p1.is_some() {
+                let (c_mids, c_pids) = tokio::task::spawn_blocking(move || -> Result<_> {
+                    let mut mids = Vec::new();
+                    let mut pids = Vec::new();
+                    if let Some(bval) = cand_cover_body {
+                        let b = crate::compression::decompress_string_value(&bval)?;
+                        if !b.is_empty() {
+                            let (m, p) =
+                                crate::patch::extract_prerequisite_message_and_patch_ids(&b);
+                            mids.extend(m);
+                            pids.extend(p);
+                        }
+                    }
+                    if let Some((bval, dval)) = cand_p1 {
+                        let b = crate::compression::decompress_string_value(&bval)?;
+                        let d = crate::compression::decompress_string_value(&dval)?;
+                        for t in [&b, &d] {
+                            if !t.is_empty() {
+                                let (m, p) =
+                                    crate::patch::extract_prerequisite_message_and_patch_ids(t);
+                                mids.extend(m);
+                                pids.extend(p);
+                            }
+                        }
+                    }
+                    Ok((mids, pids))
+                })
+                .await
+                .context("candidate prerequisite decompression task failed")??;
+
+                for pm in c_mids {
+                    if Self::get_msgid_candidates(&pm)
+                        .iter()
+                        .any(|c| own_msgids.contains(c))
+                    {
+                        return Ok(true);
+                    }
+                }
+                for pp in c_pids {
+                    if own_git_patch_ids.contains(&pp) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    async fn reconcile_version_lineage_inner(
+        &self,
+        patchset_id: i64,
+        skip_intermediate_parts: bool,
+    ) -> Result<usize> {
+        let cancelled = self
+            .reconcile_version_lineage_with_options(patchset_id, skip_intermediate_parts, true)
+            .await?;
+        if let Some(prev_id) = self.get_previous_patchset_id(patchset_id).await? {
+            self.reconcile_ancestor_version_lineage(prev_id).await?;
+        }
+        Ok(cancelled)
+    }
+
+    /// Lazily reconciles unlinked pre-migration-14 ancestor patchsets
+    /// (`version IS NULL`, see `needs_lazy_lineage`) along the backward
+    /// chain starting at `start_id`, without cancelling any historical
+    /// patchset.
+    pub(crate) async fn reconcile_ancestor_version_lineage(&self, start_id: i64) -> Result<()> {
+        const MAX_CHAIN_HOPS: usize = 32;
+        let mut curr_id = start_id;
+        let mut visited = std::collections::HashSet::new();
+        while visited.len() < MAX_CHAIN_HOPS && visited.insert(curr_id) {
+            let Some(subj) = Self::read_lineage_subject(self.read_conn(), curr_id).await? else {
+                break;
+            };
+            if let Some(prev_id) = subj.previous_patchset_id {
+                curr_id = prev_id;
+                continue;
+            }
+            if !needs_lazy_lineage(None, subj.stored_version.is_some(), subj.mr_number) {
+                break;
+            }
+            self.reconcile_version_lineage_with_options(curr_id, false, false)
+                .await?;
+            let Some(updated_prev_id) = self.get_previous_patchset_id(curr_id).await? else {
+                break;
+            };
+            curr_id = updated_prev_id;
+        }
+        Ok(())
+    }
+
+    async fn reconcile_version_lineage_with_options(
+        &self,
+        patchset_id: i64,
+        skip_intermediate_parts: bool,
+        allow_supersede: bool,
+    ) -> Result<usize> {
+        let Some(pre) = Self::read_lineage_subject(self.read_conn(), patchset_id).await? else {
+            return Ok(0);
+        };
+
+        // Avoid O(N^2) reconciliation across intermediate patch insertions in large series
+        // (including multi-commit Forge PRs): cover letter (part_index == 0), patch 1
+        // (part_index == 1), and explicit callers (`skip_intermediate_parts == false`) link
+        // the series immediately even when arriving out of order, and the final patch
+        // (`received_parts >= total_parts`) reconciles full per-patch lineage once complete.
+        if pre.skips_reconciliation(skip_intermediate_parts) {
+            return Ok(0);
+        }
+
+        if pre.mr_number.is_some() {
+            return self
+                .reconcile_superseded_pr_patchsets(
+                    patchset_id,
+                    pre.mr_url.as_deref(),
+                    pre.mr_number,
+                )
+                .await;
+        }
+
+        if is_placeholder_or_reply(&pre.subject, pre.subject_index) {
+            return Ok(0);
+        }
+
+        // Extract cover/patch-1 payloads before acquiring the exclusive SQLite
+        // write transaction so gzip decompression and regex scanning run on
+        // the blocking pool outside the write lock.
+        let refs = self
+            .load_lineage_references(
+                patchset_id,
+                pre.cover_id.as_deref(),
+                pre.change_id.is_none(),
+            )
+            .await?;
+
+        let tx_guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.begin_immediate_transaction().await?)
+        };
+        let tx_db = match tx_guard.as_ref() {
+            Some(tx) => self.with_connection((**tx).clone()),
+            None => self.with_connection(self.conn.clone()),
+        };
+
+        let cancelled = tx_db
+            .reconcile_version_lineage_locked(
+                patchset_id,
+                skip_intermediate_parts,
+                allow_supersede,
+                refs,
+            )
+            .await?;
+
+        if let Some(tx) = tx_guard {
+            tx.commit().await?;
+        }
+        Ok(cancelled)
+    }
+
+    /// Runs under the write lock: re-reads the patchset, picks its previous
+    /// version and writes only the patchset's own lineage columns.
+    async fn reconcile_version_lineage_locked(
+        &self,
+        patchset_id: i64,
+        skip_intermediate_parts: bool,
+        allow_supersede: bool,
+        refs: LineageReferences,
+    ) -> Result<usize> {
+        let Some(curr) = Self::read_lineage_subject(self.read_conn(), patchset_id).await? else {
+            return Ok(0);
+        };
+        if curr.skips_reconciliation(skip_intermediate_parts) {
+            return Ok(0);
+        }
+        if curr.mr_number.is_some() {
+            return self
+                .reconcile_superseded_pr_patchsets(
+                    patchset_id,
+                    curr.mr_url.as_deref(),
+                    curr.mr_number,
+                )
+                .await;
+        }
+        if is_placeholder_or_reply(&curr.subject, curr.subject_index) {
+            return Ok(0);
+        }
+
+        let new_change_id = if curr.change_id.is_none() {
+            refs.detected_change_id.clone()
+        } else {
+            None
+        };
+        let ctx = LineageContext {
+            patchset_id,
+            subject: &curr.subject,
+            subject_index: curr.subject_index,
+            total_parts: curr.total_parts,
+            author: &curr.author,
+            date: curr.date,
+            version: curr.version(),
+            revision: SubjectRevision::with_number(&curr.subject, curr.version()),
+            change_id: curr.change_id.as_deref().or(new_change_id.as_deref()),
+            refs: &refs,
+        };
+
+        let chosen = self.find_previous_version(&ctx).await?;
+
+        if curr.stored_version != Some(ctx.version) {
+            self.execute(
+                "UPDATE patchsets SET version = ? WHERE id = ?",
+                libsql::params![i64::from(ctx.version), patchset_id],
+            )
+            .await?;
+        }
+        if let Some(ref cid) = new_change_id {
+            self.execute(
+                "UPDATE patchsets SET change_id = ? WHERE id = ?",
+                libsql::params![cid.as_str(), patchset_id],
+            )
+            .await?;
+        }
+
+        self.apply_previous_version(
+            &ctx,
+            curr.previous_patchset_id,
+            curr.version_link_signal.as_deref(),
+            chosen,
+            allow_supersede,
+        )
+        .await
+    }
+
+    async fn read_lineage_subject(
+        conn: &libsql::Connection,
+        patchset_id: i64,
+    ) -> Result<Option<LineageSubject>> {
+        let mut rows = conn
+            .query(
+                "SELECT subject, subject_index, author, date, total_parts, received_parts,
+                        cover_letter_message_id, mr_url, mr_number, version,
+                        change_id, previous_patchset_id, version_link_signal
+                 FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        Ok(Some(LineageSubject {
+            subject: row.get::<Option<String>>(0)?.unwrap_or_default(),
+            subject_index: row.get::<Option<u32>>(1)?.unwrap_or(9999),
+            author: row.get::<Option<String>>(2)?.unwrap_or_default(),
+            date: row.get::<Option<i64>>(3)?.unwrap_or(0),
+            total_parts: row.get::<Option<u32>>(4)?.unwrap_or(1),
+            received_parts: row.get::<Option<u32>>(5)?.unwrap_or(0),
+            cover_id: row.get(6)?,
+            mr_url: row.get(7)?,
+            mr_number: row.get(8)?,
+            stored_version: row.get(9)?,
+            change_id: row.get(10)?,
+            previous_patchset_id: row.get(11)?,
+            version_link_signal: row.get(12)?,
+        }))
+    }
+
+    /// Reads the cover letter and patch 1 of a patchset and extracts its
+    /// explicit previous-version references, prerequisites and b4
+    /// change-id.
+    async fn load_lineage_references(
+        &self,
+        patchset_id: i64,
+        cover_id: Option<&str>,
+        need_change_id: bool,
+    ) -> Result<LineageReferences> {
+        let mut own_msgids = std::collections::HashSet::new();
+        let mut own_git_patch_ids = std::collections::HashSet::new();
+        if let Some(clid) = cover_id {
+            own_msgids.extend(Self::get_msgid_candidates(clid));
+        }
+        let mut own_p_rows = self
+            .read_conn()
+            .query(
+                "SELECT message_id, git_patch_id FROM patches WHERE patchset_id = ? LIMIT 256",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        while let Some(prow) = own_p_rows.next().await? {
+            own_msgids.extend(Self::get_msgid_candidates(&prow.get::<String>(0)?));
+            if let Some(gpid) = prow.get::<Option<String>>(1)? {
+                own_git_patch_ids.insert(gpid);
+            }
+        }
+        drop(own_p_rows);
+
+        let cover_body = if let Some(clid) = cover_id {
+            let mut m_rows = self
+                .read_conn()
+                .query(
+                    "SELECT body FROM messages WHERE message_id = ? LIMIT 1",
+                    libsql::params![clid],
+                )
+                .await?;
+            match m_rows.next().await? {
+                Some(mrow) => Some(mrow.get::<libsql::Value>(0)?),
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let p1_payload = {
+            let mut p1_rows = self
+                .read_conn()
+                .query(
+                    "SELECT m.body, p.diff
+                     FROM patches p
+                     LEFT JOIN messages m ON m.message_id = p.message_id
+                     WHERE p.patchset_id = ? AND p.part_index = 1
+                     LIMIT 1",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            match p1_rows.next().await? {
+                Some(p1row) => Some((
+                    p1row.get::<libsql::Value>(0)?,
+                    p1row.get::<libsql::Value>(1)?,
+                )),
+                None => None,
+            }
+        };
+
+        tokio::task::spawn_blocking(move || {
+            Self::extract_lineage_references(
+                cover_body,
+                p1_payload,
+                need_change_id,
+                own_msgids,
+                own_git_patch_ids,
+            )
+        })
+        .await
+        .context("lineage body decompression task failed")?
+    }
+
+    fn extract_lineage_references(
+        cover_body: Option<libsql::Value>,
+        p1_payload: Option<(libsql::Value, libsql::Value)>,
+        need_change_id: bool,
+        own_msgids: std::collections::HashSet<String>,
+        own_git_patch_ids: std::collections::HashSet<String>,
+    ) -> Result<LineageReferences> {
+        let mut refs = LineageReferences {
+            own_msgids,
+            own_git_patch_ids,
+            ..LineageReferences::default()
+        };
+        let mut texts: Vec<(String, bool)> = Vec::new();
+        if let Some(body_val) = cover_body {
+            texts.push((
+                crate::compression::decompress_string_value(&body_val)?,
+                true,
+            ));
+        }
+        if let Some((body_val, diff_val)) = p1_payload {
+            let body = crate::compression::decompress_string_value(&body_val)?;
+            let diff = crate::compression::decompress_string_value(&diff_val)?;
+            // Version links are read from the patch 1 message body, or from
+            // the diff text when the body is stored empty.
+            if body.is_empty() {
+                texts.push((diff, true));
+            } else {
+                texts.push((body, true));
+                texts.push((diff, false));
+            }
+        }
+
+        for (text, scan_version_links) in &texts {
+            if text.is_empty() {
+                continue;
+            }
+            if need_change_id && refs.detected_change_id.is_none() {
+                refs.detected_change_id = crate::patch::parse_b4_change_id(text);
+            }
+            let (p_mids, p_pids) = crate::patch::extract_prerequisite_message_and_patch_ids(text);
+            for pm in p_mids {
+                refs.prereq_msgids.extend(Self::get_msgid_candidates(&pm));
+            }
+            refs.prereq_patch_ids.extend(p_pids);
+            if *scan_version_links {
+                for rmid in crate::patch::extract_version_reference_msgids(text) {
+                    if !refs.own_msgids.contains(&rmid) && !refs.version_ref_msgids.contains(&rmid)
+                    {
+                        refs.version_ref_msgids.push(rmid);
+                    }
+                }
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Picks the single previous version of the patchset in `ctx`, or none.
+    /// The strongest signal with a qualifying candidate decides; an
+    /// ambiguous result at that rank links nothing.
+    async fn find_previous_version(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Option<(LineageCandidate, VersionLinkSignal)>> {
+        for signal in VersionLinkSignal::BY_RANK {
+            let raw = match signal {
+                VersionLinkSignal::ChangeId => self.change_id_candidates(ctx).await?,
+                VersionLinkSignal::MessageRef => self.message_ref_candidates(ctx).await?,
+                VersionLinkSignal::SubjectAuthor => self.subject_author_candidates(ctx).await?,
+            };
+            let qualifying = self.qualifying_predecessors(ctx, raw, signal).await?;
+            match Self::choose_predecessor(qualifying, signal) {
+                PredecessorChoice::NoCandidate => continue,
+                PredecessorChoice::Ambiguous(ids) => {
+                    debug!(
+                        "Not linking patchset {} to a previous version: {} candidates {:?} are equally ranked",
+                        ctx.patchset_id,
+                        signal.as_str(),
+                        ids
+                    );
+                    return Ok(None);
+                }
+                PredecessorChoice::Chosen(pred) => return Ok(Some((pred, signal))),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Picks the newest posting of the series among the qualifying
+    /// candidates. A candidate is dropped when a later candidate follows
+    /// it in the series (its tag advances, or keeps the label for a signal
+    /// that proves the same series), so chronology decides even when tags
+    /// restart (`RFC v2 -> v1 -> v2`). Of the remaining candidates the
+    /// highest tag wins, which keeps a stale resend of an old version from
+    /// beating a newer version; ties are broken by date for same-series
+    /// signals and are ambiguous otherwise.
+    fn choose_predecessor(
+        mut candidates: Vec<LineageCandidate>,
+        signal: VersionLinkSignal,
+    ) -> PredecessorChoice {
+        candidates.sort_by_key(|c| (c.date, c.id));
+        candidates.dedup_by_key(|c| c.id);
+        let newest: Vec<&LineageCandidate> = candidates
+            .iter()
+            .filter(|older| {
+                !candidates.iter().any(|newer| {
+                    newer.date > older.date
+                        && signal.later_candidate_replaces(older.revision.step_to(newer.revision))
+                })
+            })
+            .collect();
+        let tag_rank = |c: &LineageCandidate| {
+            (
+                c.revision.number,
+                c.revision.stage == crate::patch::SeriesStage::Patch,
+            )
+        };
+        let Some(top) = newest.iter().map(|c| tag_rank(c)).max() else {
+            return PredecessorChoice::NoCandidate;
+        };
+        let mut top_ranked: Vec<&LineageCandidate> =
+            newest.into_iter().filter(|c| tag_rank(c) == top).collect();
+        if top_ranked.len() > 1 && !signal.same_version_is_same_series() {
+            return PredecessorChoice::Ambiguous(top_ranked.iter().map(|c| c.id).collect());
+        }
+        match top_ranked.pop() {
+            Some(latest) => PredecessorChoice::Chosen(latest.clone()),
+            None => PredecessorChoice::NoCandidate,
+        }
+    }
+
+    /// Keeps the candidates that are strictly older, whose subject tag
+    /// may precede the current one through `signal`, by the same author
+    /// email, and not a prerequisite of (or dependent on) the current
+    /// patchset.
+    async fn qualifying_predecessors(
+        &self,
+        ctx: &LineageContext<'_>,
+        candidates: Vec<LineageCandidate>,
+        signal: VersionLinkSignal,
+    ) -> Result<Vec<LineageCandidate>> {
+        let ctx_tagged = crate::patch::has_patch_or_rfc_tag(ctx.subject);
+        let mut out = Vec::new();
+        for cand in candidates {
+            if cand.id == ctx.patchset_id
+                || is_placeholder_or_reply(&cand.subject, cand.subject_index)
+                || cand.date >= ctx.date
+                || !signal.admits(
+                    cand.revision.step_to(ctx.revision),
+                    ctx.date - cand.date,
+                    ctx_tagged && crate::patch::has_patch_or_rfc_tag(&cand.subject),
+                )
+                || !same_author_email(&cand.author, ctx.author)
+            {
+                continue;
+            }
+            if self
+                .is_prereq_candidate(
+                    cand.id,
+                    cand.cover_id.as_deref(),
+                    &ctx.refs.prereq_msgids,
+                    &ctx.refs.prereq_patch_ids,
+                    &ctx.refs.own_msgids,
+                    &ctx.refs.own_git_patch_ids,
+                )
+                .await?
+            {
+                continue;
+            }
+            out.push(cand);
+        }
+        Ok(out)
+    }
+
+    async fn change_id_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let Some(cid) = ctx.change_id else {
+            return Ok(Vec::new());
+        };
+        let mut rows = self
+            .read_conn()
+            .query(
+                &format!(
+                    "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+                     FROM patchsets
+                     WHERE change_id = ? AND id != ? AND mr_number IS NULL AND date < ?
+                     ORDER BY date DESC, id DESC LIMIT 50"
+                ),
+                libsql::params![cid, ctx.patchset_id, ctx.date],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(LineageCandidate::from_row(&row)?);
+        }
+        Ok(out)
+    }
+
+    async fn message_ref_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let mut ids = std::collections::BTreeSet::new();
+        for ref_mid in &ctx.refs.version_ref_msgids {
+            if ctx.refs.prereq_msgids.contains(ref_mid) {
+                continue;
+            }
+            for cand_mid in Self::get_msgid_candidates(ref_mid) {
+                let mut ps_rows = self
+                    .read_conn()
+                    .query(
+                        "SELECT id FROM patchsets WHERE cover_letter_message_id = ? AND id != ? LIMIT 5",
+                        libsql::params![cand_mid.as_str(), ctx.patchset_id],
+                    )
+                    .await?;
+                while let Some(r) = ps_rows.next().await? {
+                    ids.insert(r.get::<i64>(0)?);
+                }
+                drop(ps_rows);
+
+                let mut p_rows = self
+                    .read_conn()
+                    .query(
+                        "SELECT patchset_id FROM patches WHERE message_id = ? AND patchset_id != ? LIMIT 5",
+                        libsql::params![cand_mid.as_str(), ctx.patchset_id],
+                    )
+                    .await?;
+                while let Some(r) = p_rows.next().await? {
+                    ids.insert(r.get::<i64>(0)?);
+                }
+            }
+        }
+
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(cand) = self.load_lineage_candidate(id).await? {
+                out.push(cand);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn load_lineage_candidate(&self, id: i64) -> Result<Option<LineageCandidate>> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                &format!(
+                    "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+                     FROM patchsets WHERE id = ? AND mr_number IS NULL"
+                ),
+                libsql::params![id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(LineageCandidate::from_row(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether an existing link of the current patchset still points to a
+    /// strict predecessor (older, lower version, same author email, not a
+    /// prerequisite). Such a link is kept when no signal finds a
+    /// predecessor on a later run, for example after two partial rows of
+    /// the series were merged.
+    async fn existing_link_still_qualifies(
+        &self,
+        ctx: &LineageContext<'_>,
+        existing_prev_id: i64,
+        existing_signal: Option<&str>,
+    ) -> Result<bool> {
+        let Some(cand) = self.load_lineage_candidate(existing_prev_id).await? else {
+            return Ok(false);
+        };
+        // A link whose signal is unknown is held to the strictest rules:
+        // body links only accept a tag that moves forward.
+        let signal = existing_signal
+            .and_then(VersionLinkSignal::from_str)
+            .unwrap_or(VersionLinkSignal::MessageRef);
+        // An unchanged tag is only evidence together with the exact
+        // subject and shape; a later cover letter or row merge can change
+        // either, and the link must then go.
+        if signal == VersionLinkSignal::SubjectAuthor
+            && cand.revision.step_to(ctx.revision) == RevisionStep::SameLabel
+            && !Self::has_same_subject_and_shape(ctx, &cand)
+        {
+            return Ok(false);
+        }
+        Ok(!self
+            .qualifying_predecessors(ctx, vec![cand], signal)
+            .await?
+            .is_empty())
+    }
+
+    /// Exact cleaned subject and subsystem prefixes by the same author in
+    /// the 120 days before the current patchset, comparing a cover letter
+    /// only with a cover letter and a single patch only with a single
+    /// patch.
+    async fn subject_author_candidates(
+        &self,
+        ctx: &LineageContext<'_>,
+    ) -> Result<Vec<LineageCandidate>> {
+        let shape = SubjectShape::of(ctx.subject_index, ctx.total_parts);
+        let clean_curr = crate::patch::clean_subject(ctx.subject);
+        let curr_prefixes = crate::patch::get_subject_prefixes(ctx.subject);
+        if shape == SubjectShape::Other
+            || clean_curr.is_empty()
+            || Self::is_generic_short_subject(&clean_curr, &curr_prefixes)
+        {
+            return Ok(Vec::new());
+        }
+
+        let [e0, e1, e2, e3] = Self::author_email_candidates(ctx.author);
+        let window_start = ctx.date.saturating_sub(SUBJECT_LINK_WINDOW_SECS);
+        // Indexed normalized author-email + date range lookup via
+        // idx_patchsets_author_email_date (including b4 web relay aliases
+        // without unindexed LIKE scans).
+        let query = format!(
+            "SELECT {LINEAGE_CANDIDATE_COLUMNS}
+             FROM patchsets
+             WHERE {} IN (?, ?, ?, ?) AND date >= ? AND date < ? AND id != ? AND mr_number IS NULL
+             ORDER BY date DESC LIMIT 100",
+            Self::AUTHOR_EMAIL_EXPR
+        );
+        let mut rows = self
+            .read_conn()
+            .query(
+                &query,
+                libsql::params![e0, e1, e2, e3, window_start, ctx.date, ctx.patchset_id],
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let cand = LineageCandidate::from_row(&row)?;
+            if Self::has_same_subject_and_shape(ctx, &cand) {
+                out.push(cand);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `cand` has the exact cleaned subject, subsystem prefixes and
+    /// like-for-like shape (cover letter or single patch) of the current
+    /// patchset, as the subject signal requires.
+    fn has_same_subject_and_shape(ctx: &LineageContext<'_>, cand: &LineageCandidate) -> bool {
+        let shape = SubjectShape::of(ctx.subject_index, ctx.total_parts);
+        shape != SubjectShape::Other
+            && SubjectShape::of(cand.subject_index, cand.total_parts) == shape
+            && crate::patch::clean_subject(&cand.subject)
+                == crate::patch::clean_subject(ctx.subject)
+            && crate::patch::get_subject_prefixes(&cand.subject)
+                == crate::patch::get_subject_prefixes(ctx.subject)
+    }
+
+    /// Writes the chosen previous version on the current patchset only (or,
+    /// without a choice, keeps an existing link that still qualifies and
+    /// clears any other), maps its patches, and cancels the predecessor
+    /// when the new link supersedes it.
+    async fn apply_previous_version(
+        &self,
+        ctx: &LineageContext<'_>,
+        existing_prev_id: Option<i64>,
+        existing_signal: Option<&str>,
+        chosen: Option<(LineageCandidate, VersionLinkSignal)>,
+        allow_supersede: bool,
+    ) -> Result<usize> {
+        let Some((pred, signal)) = chosen else {
+            if let Some(prev_id) = existing_prev_id
+                && self
+                    .existing_link_still_qualifies(ctx, prev_id, existing_signal)
+                    .await?
+            {
+                self.reconcile_patch_lineage(prev_id, ctx.patchset_id)
+                    .await?;
+                return Ok(0);
+            }
+            if existing_prev_id.is_some() || existing_signal.is_some() {
+                self.execute(
+                    "UPDATE patchsets SET previous_patchset_id = NULL, version_link_signal = NULL WHERE id = ?",
+                    libsql::params![ctx.patchset_id],
+                )
+                .await?;
+                self.execute(
+                    "UPDATE patches SET previous_patch_id = NULL, previous_patch_status = NULL WHERE patchset_id = ?",
+                    libsql::params![ctx.patchset_id],
+                )
+                .await?;
+            }
+            return Ok(0);
+        };
+
+        let is_new_link = existing_prev_id != Some(pred.id);
+        if is_new_link || existing_signal != Some(signal.as_str()) {
+            self.execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = ? WHERE id = ?",
+                libsql::params![pred.id, signal.as_str(), ctx.patchset_id],
+            )
+            .await?;
+            info!(
+                "Linked patchset {} (v{}) to previous version {} (v{}) via {}",
+                ctx.patchset_id,
+                ctx.version,
+                pred.id,
+                pred.version,
+                signal.as_str()
+            );
+        }
+        self.reconcile_patch_lineage(pred.id, ctx.patchset_id)
+            .await?;
+
+        if !allow_supersede {
+            return Ok(0);
+        }
+
+        // A link supersedes when it is newly established or when its signal
+        // upgrades from one that did not supersede at age_secs (for example,
+        // subject_author beyond 30 days) to one that does (change_id or
+        // message_ref). Repeated runs with a signal that already superseded
+        // leave the predecessor alone so an explicit rerun is respected.
+        // Nothing beyond the direct predecessor is ever cancelled.
+        let age_secs = ctx.date.saturating_sub(pred.date);
+        let step = pred.revision.step_to(ctx.revision);
+        let previously_superseded = !is_new_link
+            && existing_signal
+                .and_then(VersionLinkSignal::from_str)
+                .is_some_and(|prev_sig| prev_sig.supersedes(age_secs, step));
+        if previously_superseded || !signal.supersedes(age_secs, step) {
+            return Ok(0);
+        }
+        // cancel_patchset only cancels a patchset (and its pending outbox)
+        // while it is still in flight.
+        if self.cancel_patchset(pred.id, true).await? {
+            info!(
+                "Cancelled superseded patchset {} (v{}) after linking patchset {} (v{}) via {}",
+                pred.id,
+                pred.version,
+                ctx.patchset_id,
+                ctx.version,
+                signal.as_str()
+            );
+            return Ok(1);
+        }
+        Ok(0)
     }
 
     pub async fn reconcile_superseded_series_patchsets(
         &self,
         current_id: i64,
-        author: &str,
-        subject: &str,
+        _author: &str,
+        _subject: &str,
         part_index: u32,
-        version: Option<u32>,
-        date: i64,
+        _version: Option<u32>,
+        _date: i64,
     ) -> Result<usize> {
-        let trimmed = subject.trim_start();
-        if part_index == 0
-            && trimmed
-                .get(..3)
-                .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
-        {
-            return Ok(0);
-        }
-
-        let clean_curr = crate::patch::clean_subject(subject);
-        if clean_curr.is_empty() {
-            return Ok(0);
-        }
-
-        let curr_ver = version
-            .or_else(|| crate::patch::parse_subject_version(subject))
-            .unwrap_or(1);
-        let curr_prefixes = crate::patch::get_subject_prefixes(subject);
-
-        let window_start = date.saturating_sub(86400 * 30);
-        let window_end = date.saturating_add(86400 * 30);
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id, author, subject, subject_index, total_parts
-                 FROM patchsets
-                 WHERE id != ?
-                   AND status IN ('Fetching', 'Incomplete', 'Pending', 'In Review')
-                   AND date BETWEEN ? AND ?
-                 ORDER BY date DESC, id DESC
-                 LIMIT 100",
-                libsql::params![current_id, window_start, window_end],
-            )
-            .await?;
-
-        let mut candidates: Vec<(i64, String, String, u32, u32)> = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let cand_id: i64 = row.get(0)?;
-            let cand_author: String = row.get(1).unwrap_or_default();
-            let cand_subject: String = row.get(2).unwrap_or_default();
-            let cand_subject_index: u32 = row.get(3).unwrap_or(9999);
-            let cand_total_parts: u32 = row.get(4).unwrap_or(1);
-            candidates.push((
-                cand_id,
-                cand_author,
-                cand_subject,
-                cand_subject_index,
-                cand_total_parts,
-            ));
-        }
-        drop(rows);
-
-        let mut cancelled_count = 0;
-        for (cand_id, cand_author, cand_subject, cand_subject_index, cand_total_parts) in candidates
-        {
-            let cand_ver = crate::patch::parse_subject_version(&cand_subject).unwrap_or(1);
-            if cand_ver == curr_ver {
-                continue;
-            }
-
-            if !crate::patch::authors_match(&cand_author, author) {
-                continue;
-            }
-
-            if crate::patch::get_subject_prefixes(&cand_subject) != curr_prefixes {
-                continue;
-            }
-
-            let mut series_matches = (cand_subject_index == part_index || cand_total_parts == 1)
-                && crate::patch::clean_subject(&cand_subject) == clean_curr;
-
-            if !series_matches {
-                let mut p_rows = self
-                    .conn
-                    .query(
-                        "SELECT m.subject FROM patches p JOIN messages m ON m.message_id = p.message_id WHERE p.patchset_id = ? AND p.part_index = ? LIMIT 1",
-                        libsql::params![cand_id, part_index],
-                    )
-                    .await?;
-                if let Some(p_row) = p_rows.next().await? {
-                    let p_subj: String = p_row.get(0).unwrap_or_default();
-                    if crate::patch::clean_subject(&p_subj) == clean_curr {
-                        series_matches = true;
-                    }
-                }
-                drop(p_rows);
-            }
-
-            if !series_matches {
-                continue;
-            }
-
-            if cand_ver < curr_ver {
-                if self.cancel_patchset(cand_id, true).await? {
-                    cancelled_count += 1;
-                    info!(
-                        "Cancelled superseded patchset {} (v{}) after ingesting patchset {} (v{})",
-                        cand_id, cand_ver, current_id, curr_ver
-                    );
-                }
-                self.cancel_outbox_for_patchset(
-                    cand_id,
-                    "Cancelled: superseded by newer patchset version",
-                )
-                .await?;
-            } else if cand_ver > curr_ver {
-                if self.cancel_patchset(current_id, true).await? {
-                    cancelled_count += 1;
-                    info!(
-                        "Cancelled older patchset {} (v{}) because newer patchset {} (v{}) already exists",
-                        current_id, curr_ver, cand_id, cand_ver
-                    );
-                }
-                self.cancel_outbox_for_patchset(
-                    current_id,
-                    "Cancelled: superseded by newer patchset version",
-                )
-                .await?;
-            }
-        }
-
-        Ok(cancelled_count)
+        self.reconcile_version_lineage_inner(current_id, part_index > 1)
+            .await
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
-        // 1. Get current status of the patchset
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT status FROM patchsets WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
 
-        let current_status = if let Some(row) = rows.next().await? {
-            row.get::<Option<String>>(0)?
-        } else {
-            None
+        // 1. Get current status of the patchset under the write lock
+        let current_status = {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT status FROM patchsets WHERE id = ?",
+                    libsql::params![id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                row.get::<Option<String>>(0)?
+            } else {
+                None
+            }
         };
 
         let should_increment = current_status.as_deref() == Some("Reviewed");
 
-        // 2. Reset patchset status to Pending
-        self.execute(
-            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
-            libsql::params![id],
-        )
-        .await?;
+        // 2. Reset patchset status to Pending; the new attempt records its
+        // own failure reason, if any.
+        tx_db
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', failed_reason = NULL WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
 
         // 3. Increment target_review_count only if it was previously Reviewed
         if should_increment {
-            self.execute(
+            tx_db
+                .execute(
                     "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
                     libsql::params![id],
                 )
                 .await?;
         }
 
-        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        // 4. Reset active claim generation, non-terminal/failed patch statuses,
+        // and associated failed/cancelled/interrupted review and outbox rows.
+        tx_db.reset_patchset_review_state(id).await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn reset_patchset_review_state(&self, id: i64) -> Result<()> {
         self.execute(
+            "DELETE FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+            libsql::params![id],
+        )
+        .await?;
+        self.execute(
+            "UPDATE patches
+                SET status = 'Pending', apply_error = NULL
+              WHERE patchset_id = ?
+                AND (status IN ('Failed', 'Cancelled', 'In Review', 'error')
+                     OR (status = 'applied' AND NOT EXISTS (
+                         SELECT 1 FROM reviews r
+                          WHERE r.patchset_id = ? AND r.patch_id = patches.id AND r.status = 'Reviewed'
+                     )))",
+            libsql::params![id, id],
+        )
+        .await?;
+
+        // Delete associated tool usages, findings, bug links, and unsent
+        // outbox entries for infra-failed attempts (interaction_id IS NULL,
+        // which are the only Failed rows matched by has_failed_review()) and
+        // interrupted/cancelled ('In Review', 'Cancelled') attempts before
+        // deleting those review rows. Standalone ai_interactions rows have no
+        // foreign key to reviews and remain in the ledger for cumulative token
+        // accounting.
+        let review_filter = "((status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL) OR status IN ('In Review', 'Cancelled'))";
+
+        self.execute(
+            &format!(
                 "DELETE FROM tool_usages WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
-            )
-            .await?;
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
 
         self.execute(
+            &format!(
                 "DELETE FROM findings WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
-            )
-            .await?;
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
 
-        // 5. Delete failed reviews that block retrying (infra failures)
         self.execute(
-                "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                libsql::params![id],
+            &format!(
+                "DELETE FROM prior_feedback_resolutions WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
+
+        self.execute(
+            &format!(
+                "DELETE FROM bug_reviews WHERE review_id IN (
+                    SELECT id FROM reviews WHERE patchset_id = ? AND {review_filter}
+                )"
+            ),
+            libsql::params![id],
+        )
+        .await?;
+
+        self.execute(
+            &format!(
+                "DELETE FROM email_outbox
+                  WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                    AND patch_id IN (
+                        SELECT id FROM patches WHERE patchset_id = ?
+                    )
+                    AND (
+                        patch_id IN (
+                            SELECT patch_id FROM reviews
+                             WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
+                        )
+                        OR status = 'Cancelled'
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM reviews r_ok
+                         WHERE r_ok.patchset_id = ? AND r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
+                    )"
+            ),
+            libsql::params![id, id, id],
+        )
+        .await?;
+
+        self.execute(
+            "DELETE FROM email_outbox
+              WHERE patch_id IS NULL
+                AND patchset_id = ?
+                AND status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')",
+            libsql::params![id],
+        )
+        .await?;
+
+        self.execute(
+            &format!(
+                "DELETE FROM patchwork_outbox
+                  WHERE status IN ('Pending', 'Cancelled')
+                    AND patch_msg_id IN (
+                        SELECT p.message_id FROM patches p
+                        WHERE p.patchset_id = ?
+                          AND (
+                              p.id IN (
+                                  SELECT patch_id FROM reviews
+                                   WHERE patchset_id = ? AND patch_id IS NOT NULL AND {review_filter}
+                              )
+                              OR patchwork_outbox.status = 'Cancelled'
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1 FROM reviews r_ok
+                               WHERE r_ok.patch_id = p.id
+                                 AND (r_ok.status = 'Reviewed'
+                                      OR (r_ok.status = 'Skipped'
+                                          AND r_ok.inherited_from_review_id IS NOT NULL))
+                          )
+                    )"
+            ),
+            libsql::params![id, id],
+        )
+        .await?;
+
+        self.execute(
+            "DELETE FROM forge_outbox
+              WHERE patchset_id = ?
+                AND status IN ('Pending', 'Embargoed', 'Failed', 'Cancelled', 'Disabled', 'Dry-Run')",
+            libsql::params![id],
+        )
+        .await?;
+
+        // Record the high-water review ID before deleting failed, cancelled,
+        // or interrupted ('In Review') review rows so SQLite never recycles the
+        // deleted rowid on the next INSERT INTO reviews.
+        self.execute(
+            "INSERT INTO meta (key, value)
+             VALUES (
+                 'reviews_max_id',
+                 CAST((SELECT COALESCE(MAX(id), 0) FROM reviews) AS TEXT)
+             )
+             ON CONFLICT(key) DO UPDATE SET
+                 value = CAST(
+                     MAX(CAST(meta.value AS INTEGER), CAST(excluded.value AS INTEGER))
+                     AS TEXT
+                 )",
+            (),
+        )
+        .await?;
+        self.execute(
+            &format!("DELETE FROM reviews WHERE patchset_id = ? AND {review_filter}"),
+            libsql::params![id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Clears any partial tool usages, findings, bug links, unsent outbox rows,
+    /// and interaction reference attached to a review row inside an immediate
+    /// transaction before an in-process retry or claimed Pending row reuses it.
+    pub async fn clear_aborted_review_artifacts(&self, review_id: i64) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        tx_db
+            .clear_aborted_review_artifacts_in_tx(review_id)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically clears partial artifacts for `review_id` and transitions it
+    /// to `'Cancelled'` while the parent patchset remains `'Cancelled'` (or
+    /// no-ops if a concurrent rerun already reset the patchset or deleted the
+    /// row).
+    pub async fn cancel_aborted_review(&self, review_id: i64, reason: &str) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let id_opt = tx_db
+            .query_returning_i64(
+                "SELECT id FROM reviews
+                  WHERE id = ?
+                    AND status IN ('Pending', 'In Review', 'Cancelled')
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )",
+                libsql::params![review_id],
             )
             .await?;
+        let mut transitioned = 0u64;
+        if id_opt.is_some() {
+            tx_db
+                .delete_aborted_review_children_in_tx(review_id)
+                .await?;
+            transitioned = tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Cancelled',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?
+                        AND status IN ('Pending', 'In Review')",
+                    libsql::params![reason, review_id],
+                )
+                .await?;
+            if transitioned == 0 {
+                // Row was already marked Cancelled (e.g. by cancel_patchset());
+                // still record the abort reason without double-counting the metric.
+                tx_db
+                    .execute(
+                        "UPDATE reviews
+                            SET result_description = ?,
+                                interaction_id = NULL
+                          WHERE id = ?
+                            AND status = 'Cancelled'",
+                        libsql::params![reason, review_id],
+                    )
+                    .await?;
+            }
+        }
+        tx.commit().await?;
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            transitioned,
+        );
+        Ok(())
+    }
+
+    /// Atomically cancels any `'Pending'` or orphaned `'In Review'` review row
+    /// for `(patchset_id, patch_id)` and clears its partial artifacts inside a
+    /// single immediate transaction while the parent patchset remains
+    /// `'Cancelled'`.
+    pub async fn cancel_pending_review_for_patch(
+        &self,
+        patchset_id: i64,
+        patch_id: Option<i64>,
+        reason: &str,
+    ) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        let id_opt = tx_db
+            .query_returning_i64(
+                "SELECT id FROM reviews
+                  WHERE patchset_id = ?
+                    AND patch_id IS ?
+                    AND status IN ('Pending', 'In Review')
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                  ORDER BY id ASC LIMIT 1",
+                libsql::params![patchset_id, patch_id],
+            )
+            .await?;
+        let mut transitioned = 0u64;
+        if let Some(review_id) = id_opt {
+            tx_db
+                .delete_aborted_review_children_in_tx(review_id)
+                .await?;
+            transitioned = tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Cancelled',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?",
+                    libsql::params![reason, review_id],
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        crate::metrics::add_reviews_completed(
+            crate::metrics::ReviewOutcomeMetric::Cancelled,
+            transitioned,
+        );
+        Ok(())
+    }
+
+    async fn delete_aborted_review_children_in_tx(&self, review_id: i64) -> Result<()> {
+        self.execute(
+            "DELETE FROM tool_usages WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM findings WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM prior_feedback_resolutions WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM bug_reviews WHERE review_id = ?",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM email_outbox
+              WHERE status IN ('Pending', 'Embargoed', 'Skipped', 'Muted', 'Disabled', 'Dry-Run', 'Cancelled')
+                AND patch_id IN (SELECT patch_id FROM reviews WHERE id = ? AND patch_id IS NOT NULL)
+                AND NOT EXISTS (
+                    SELECT 1 FROM reviews r_ok
+                     WHERE r_ok.patch_id = email_outbox.patch_id AND r_ok.status = 'Reviewed'
+                )",
+            libsql::params![review_id],
+        )
+        .await?;
+        self.execute(
+            "DELETE FROM patchwork_outbox
+              WHERE status IN ('Pending', 'Cancelled')
+                AND patch_msg_id IN (
+                    SELECT p.message_id FROM patches p
+                    JOIN reviews r ON r.patch_id = p.id
+                    WHERE r.id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM reviews r_ok
+                           WHERE r_ok.patch_id = p.id
+                             AND (r_ok.status = 'Reviewed'
+                                  OR (r_ok.status = 'Skipped'
+                                      AND r_ok.inherited_from_review_id IS NOT NULL))
+                      )
+                )",
+            libsql::params![review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn clear_aborted_review_artifacts_in_tx(&self, review_id: i64) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
+        let active = self
+            .query_returning_i64(
+                "UPDATE reviews
+                    SET status = 'In Review', interaction_id = NULL,
+                        inherited_from_review_id = NULL, baseline_commit = NULL,
+                        cheap = 0, stages = NULL
+                  WHERE id = ?
+                    AND COALESCE(status, '') != 'Cancelled'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM patchsets ps
+                         WHERE ps.id = reviews.patchset_id AND ps.status = 'Cancelled'
+                    )
+                    AND (? IS NULL OR (
+                        reviews.patchset_id = ?
+                        AND EXISTS (
+                            SELECT 1 FROM patchsets ps_claim
+                            JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                            WHERE ps_claim.id = reviews.patchset_id
+                              AND ps_claim.status = 'In Review'
+                              AND CAST(m_claim.value AS INTEGER) = ?
+                        )
+                    ))
+                  RETURNING id",
+                libsql::params![review_id, claim_ps_id, claim_ps_id, claim_gen],
+            )
+            .await?;
+        if active.is_none() {
+            bail!("review {} no longer exists or was superseded", review_id);
+        }
+        self.delete_aborted_review_children_in_tx(review_id).await?;
 
         Ok(())
+    }
+
+    /// Transitions any still-`'In Review'` review rows for `patchset_id` to
+    /// `'Failed'` and clears their partial artifacts inside an immediate
+    /// transaction when the owning review task terminates abnormally or errors
+    /// out while its claim generation is still active.
+    pub async fn fail_orphaned_in_review_rows(&self, patchset_id: i64, reason: &str) -> Result<()> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let mut review_ids = Vec::new();
+        {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT id FROM reviews WHERE patchset_id = ? AND status = 'In Review'",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            while let Some(row) = rows.next().await? {
+                review_ids.push(row.get::<i64>(0)?);
+            }
+        }
+        for rev_id in review_ids {
+            tx_db.delete_aborted_review_children_in_tx(rev_id).await?;
+            tx_db
+                .execute(
+                    "UPDATE reviews
+                        SET status = 'Failed',
+                            result_description = ?,
+                            interaction_id = NULL
+                      WHERE id = ?
+                        AND status = 'In Review'",
+                    libsql::params![reason, rev_id],
+                )
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Settles a patch whose review task panicked, under the active claim.
+    ///
+    /// A panic can strike before the review row is completed or after it,
+    /// for example while queueing pre-existing bugs or notifications. An
+    /// in-flight row is failed with `reason` and the patch marked Failed; a
+    /// completed review is kept and the patch marked Reviewed so its result
+    /// is still shown and posted. Nothing changes once the claim has been
+    /// superseded.
+    pub async fn settle_panicked_patch_review(
+        &self,
+        patchset_id: i64,
+        patch_id: i64,
+        reason: &str,
+    ) -> Result<PanickedPatchOutcome> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active(patchset_id).await? {
+            tx.commit().await?;
+            return Ok(PanickedPatchOutcome::Superseded);
+        }
+        let latest = {
+            let mut rows = tx_db
+                .read_conn()
+                .query(
+                    "SELECT id, status FROM reviews
+                      WHERE patchset_id = ? AND patch_id = ?
+                      ORDER BY id DESC
+                      LIMIT 1",
+                    libsql::params![patchset_id, patch_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Some((row.get::<i64>(0)?, row.get::<Option<String>>(1)?)),
+                None => None,
+            }
+        };
+        let outcome = match latest {
+            Some((_, Some(status))) if status == ReviewStatus::Reviewed.as_str() => {
+                PanickedPatchOutcome::KeptCompletedReview
+            }
+            Some((review_id, Some(status))) if status == ReviewStatus::InReview.as_str() => {
+                tx_db
+                    .delete_aborted_review_children_in_tx(review_id)
+                    .await?;
+                tx_db
+                    .execute(
+                        "UPDATE reviews
+                            SET status = 'Failed',
+                                result_description = ?,
+                                interaction_id = NULL
+                          WHERE id = ?
+                            AND status = 'In Review'",
+                        libsql::params![reason, review_id],
+                    )
+                    .await?;
+                PanickedPatchOutcome::FailedInFlightReview
+            }
+            _ => PanickedPatchOutcome::NoUsableReview,
+        };
+        let patch_status = match outcome {
+            PanickedPatchOutcome::KeptCompletedReview => ReviewStatus::Reviewed,
+            _ => ReviewStatus::Failed,
+        };
+        tx_db
+            .update_patch_status(patch_id, patch_status.as_str())
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<()> {
@@ -9544,7 +15655,7 @@ impl Database {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
             let mut rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
@@ -9555,7 +15666,7 @@ impl Database {
             }
 
             let mut p_rows = self
-                .conn
+                .read_conn()
                 .query(
                     "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
                     libsql::params![clid.clone()],
@@ -9589,11 +15700,164 @@ impl Database {
         let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
         let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
 
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+
+        // If a prior revision with the same commit range was superseded by a
+        // newer PR push in the same repository (e.g. force-push A -> B -> A),
+        // archive its cover_letter_message_id on its existing thread and remove
+        // the unprefixed placeholder message row before allocating the thread
+        // for this re-push, so the new [vN] patchset gets a distinct thread_id
+        // and clean message row without losing the superseded revision's body.
+        if let Some(num) = mr_number {
+            for clid in &clid_candidates {
+                let mut candidates_in_repo = Vec::new();
+                {
+                    let mut rows = tx_db
+                        .read_conn()
+                        .query(
+                            "SELECT ps.id, ps.thread_id, ps.mr_url
+                             FROM patchsets ps
+                             WHERE ps.cover_letter_message_id = ?",
+                            libsql::params![clid.clone()],
+                        )
+                        .await?;
+                    while let Some(row) = rows.next().await? {
+                        let old_id: i64 = row.get(0)?;
+                        let old_thread_id: Option<i64> = row.get(1)?;
+                        let ps_mr_url: Option<String> = row.get(2)?;
+                        if (mr_url.is_some() || ps_mr_url.is_some())
+                            && !Self::mr_urls_share_repo(mr_url, ps_mr_url.as_deref())
+                        {
+                            continue;
+                        }
+                        candidates_in_repo.push((old_id, old_thread_id, ps_mr_url));
+                    }
+                }
+                for (old_id, old_thread_id, ps_mr_url) in candidates_in_repo {
+                    let scope_url = mr_url.or(ps_mr_url.as_deref());
+                    let mut newer_rows = tx_db
+                        .read_conn()
+                        .query(
+                            "SELECT mr_url FROM patchsets WHERE mr_number = ? AND id > ?",
+                            libsql::params![num, old_id],
+                        )
+                        .await?;
+                    let mut superseded_in_same_repo = false;
+                    while let Some(nrow) = newer_rows.next().await? {
+                        let newer_mr_url: Option<String> = nrow.get(0)?;
+                        if scope_url.is_none_or(|u| {
+                            Self::mr_urls_share_repo(Some(u), newer_mr_url.as_deref())
+                        }) {
+                            superseded_in_same_repo = true;
+                            break;
+                        }
+                    }
+                    drop(newer_rows);
+                    if superseded_in_same_repo {
+                        let archived_clid = format!("superseded-{old_id}-{clid}");
+                        let copied = tx_db
+                            .execute(
+                                "INSERT INTO messages (message_id, thread_id, in_reply_to, author, subject, date, body, to_recipients, cc_recipients)
+                                 SELECT ?1, COALESCE(?2, thread_id), in_reply_to, author, subject, date, body, to_recipients, cc_recipients
+                                 FROM messages WHERE message_id = ?3
+                                 ON CONFLICT(message_id) DO UPDATE SET
+                                     thread_id = excluded.thread_id,
+                                     in_reply_to = excluded.in_reply_to,
+                                     author = excluded.author,
+                                     subject = excluded.subject,
+                                     date = excluded.date,
+                                     body = excluded.body,
+                                     to_recipients = excluded.to_recipients,
+                                     cc_recipients = excluded.cc_recipients",
+                                libsql::params![archived_clid.clone(), old_thread_id, clid.clone()],
+                            )
+                            .await?;
+                        if copied == 0 {
+                            tx_db
+                                .ensure_thread_for_message_in_tx(&archived_clid, now)
+                                .await?;
+                        }
+                        tx_db
+                            .execute(
+                                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = ?",
+                                libsql::params![archived_clid.clone(), old_id],
+                            )
+                            .await?;
+                        if let Some(tid) = old_thread_id {
+                            tx_db
+                                .execute(
+                                    "UPDATE threads SET root_message_id = ? WHERE id = ? AND root_message_id = ?",
+                                    libsql::params![archived_clid.clone(), tid, clid.clone()],
+                                )
+                                .await?;
+                            tx_db
+                                .execute(
+                                    "UPDATE messages SET in_reply_to = ? WHERE thread_id = ? AND in_reply_to = ?",
+                                    libsql::params![archived_clid.clone(), tid, clid.clone()],
+                                )
+                                .await?;
+                        }
+                        tx_db
+                            .execute(
+                                "INSERT OR IGNORE INTO messages_subsystems (message_id, subsystem_id)
+                                 SELECT m_new.id, ms.subsystem_id
+                                 FROM messages_subsystems ms
+                                 JOIN messages m_old ON m_old.id = ms.message_id
+                                 JOIN messages m_new ON m_new.message_id = ?1
+                                 WHERE m_old.message_id = ?2",
+                                libsql::params![archived_clid, clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM messages_subsystems
+                                 WHERE message_id IN (
+                                     SELECT id FROM messages
+                                     WHERE message_id = ?1
+                                       AND NOT EXISTS (SELECT 1 FROM patchsets WHERE cover_letter_message_id = ?1)
+                                       AND NOT EXISTS (SELECT 1 FROM patches WHERE message_id = ?1)
+                                 )",
+                                libsql::params![clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM messages
+                                 WHERE message_id = ?
+                                   AND NOT EXISTS (SELECT 1 FROM patchsets WHERE cover_letter_message_id = ?)
+                                   AND NOT EXISTS (SELECT 1 FROM patches WHERE message_id = ?)",
+                                libsql::params![clid.clone(), clid.clone(), clid.clone()],
+                            )
+                            .await?;
+                        tx_db
+                            .execute(
+                                "DELETE FROM fetch_queue
+                                 WHERE status IN ('Done', 'Failed', 'Cancelled')
+                                   AND article_id IN (
+                                       TRIM(?, '<>'),
+                                       REPLACE(TRIM(?, '<>'), '@sashiko.local', '')
+                                   )",
+                                libsql::params![clid.clone(), clid.clone()],
+                            )
+                            .await?;
+                    }
+                }
+            }
+        }
+
+        // Ensure a placeholder thread and message exist under the immediate
+        // write lock to satisfy Foreign Key constraints without racing against
+        // concurrent thread deduplication.
+        let thread_id = tx_db
+            .ensure_thread_for_message_in_tx(root_msg_id, now)
+            .await?;
+
         let mr_ver = if let Some(num) = mr_number {
             Some(
-                self.get_mr_version_for_commit_range(num, root_msg_id)
-                    .await
-                    .unwrap_or(1),
+                tx_db
+                    .get_mr_version_for_commit_range_in_repo(num, mr_url, root_msg_id)
+                    .await?,
             )
         } else {
             None
@@ -9605,22 +15869,37 @@ impl Database {
             } else {
                 subject.to_string()
             };
+        let effective_ver = crate::patch::parse_subject_version(&effective_subject)
+            .or(mr_ver)
+            .map(i64::from);
 
-        // 1. Check if it already exists
+        // 1. Check if it already exists under the write lock
         for clid in clid_candidates {
-            let mut rows = self
-                .conn
-                .query(
-                    "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?",
-                    libsql::params![clid.clone()],
-                )
-                .await?;
+            let existing = {
+                let mut rows = tx_db
+                    .read_conn()
+                    .query(
+                        "SELECT id, status, mr_url FROM patchsets WHERE cover_letter_message_id = ?",
+                        libsql::params![clid.clone()],
+                    )
+                    .await?;
+                let mut matched = None;
+                while let Some(row) = rows.next().await? {
+                    let id: i64 = row.get(0)?;
+                    let status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                    let row_mr_url: Option<String> = row.get(2)?;
+                    if (mr_url.is_some() || row_mr_url.is_some())
+                        && !Self::mr_urls_share_repo(mr_url, row_mr_url.as_deref())
+                    {
+                        continue;
+                    }
+                    matched = Some((id, status));
+                    break;
+                }
+                matched
+            };
 
-            if let Some(row) = rows.next().await? {
-                let id: i64 = row.get(0)?;
-                let status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
-                drop(rows);
-
+            if let Some((id, status)) = existing {
                 // Only reset to Fetching if it failed or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
                 if status == "Failed"
@@ -9630,35 +15909,46 @@ impl Database {
                     || status == "FailedToApply"
                 {
                     if let Some(s) = slug {
-                        self.rotate_mr_slug(s, Some(id)).await?;
+                        tx_db.rotate_mr_slug(s, Some(id)).await?;
                     }
-                    self.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
+                    tx_db.execute(
+                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ?, version = COALESCE(?, version) WHERE id = ?",
+                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, effective_ver, id]
                     ).await?;
+                    tx_db.reset_patchset_review_state(id).await?;
+                    tx_db
+                        .execute(
+                            "DELETE FROM fetch_queue
+                             WHERE status IN ('Done', 'Failed', 'Cancelled')
+                               AND article_id IN (
+                                   TRIM(?, '<>'),
+                                   REPLACE(TRIM(?, '<>'), '@sashiko.local', '')
+                               )",
+                            libsql::params![clid.clone(), clid.clone()],
+                        )
+                        .await?;
                 }
+                tx.commit().await?;
                 self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
                     .await?;
                 return Ok(id);
             }
         }
 
-        // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
-        let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
-
         if let Some(s) = slug {
-            self.rotate_mr_slug(s, None).await?;
+            tx_db.rotate_mr_slug(s, None).await?;
         }
 
-        // 3. Create the fetching patchset
-        let id = self
+        // 2. Create the fetching patchset atomically inside the transaction
+        let id = tx_db
             .query_returning_i64(
-                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
-                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug, version)
+                     VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug, effective_ver],
             )
             .await?
             .ok_or_else(|| anyhow::anyhow!("Failed to get patchset ID"))?;
+        tx.commit().await?;
         self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
         Ok(id)
@@ -9666,8 +15956,23 @@ impl Database {
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self.execute(
-                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
+            let res = self
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                     WHERE cover_letter_message_id = ?
+                       AND status IN ('Fetching', 'Incomplete', 'Failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM fetch_queue fq
+                           WHERE fq.status IN ('Pending', 'Fetching')
+                             AND fq.article_id IN (
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 REPLACE(
+                                     TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                     '@sashiko.local',
+                                     ''
+                                 )
+                             )
+                       )",
                     libsql::params![error, clid],
                 )
                 .await?;
@@ -9681,10 +15986,13 @@ impl Database {
     pub async fn fail_fetching_patchset(&self, root_msg_id: &str, error: &str) -> Result<()> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
         for clid in candidates {
-            let res = self.execute(
+            let res = self
+                .execute(
                     "UPDATE patchsets SET status = 'Failed', failed_reason = ?
                      WHERE cover_letter_message_id = ?
-                       AND (status = 'Fetching' OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0))",
+                       AND (status = 'Fetching'
+                            OR (status = 'Incomplete' AND COALESCE(received_parts, 0) = 0)
+                            OR (status = 'Failed' AND COALESCE(received_parts, 0) = 0))",
                     libsql::params![error, clid],
                 )
                 .await?;
@@ -9696,11 +16004,48 @@ impl Database {
     }
 
     pub async fn fail_interrupted_fetching_patchsets(&self) -> Result<u64> {
+        let tx = self.begin_immediate_transaction().await?;
+
+        // Reset any remote git fetches interrupted mid-flight (or marked Done
+        // just before shutdown while their patchset remained Fetching or
+        // Incomplete in the in-memory channel) so FetchAgent resumes them.
+        // Drive the Done lookup from active Fetching/Incomplete patchsets via
+        // the UNIQUE(article_id) index so startup never scans historical Done rows.
+        tx.execute(
+            "UPDATE fetch_queue
+             SET status = 'Pending', locked_at = NULL
+             WHERE status = 'Fetching'",
+            (),
+        )
+        .await?;
+        tx.execute(
+            "UPDATE fetch_queue
+             SET status = 'Pending', locked_at = NULL
+             WHERE status = 'Done'
+               AND article_id IN (
+                   SELECT TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>')
+                   FROM patchsets ps
+                   WHERE ps.status IN ('Fetching', 'Incomplete')
+                     AND ps.cover_letter_message_id IS NOT NULL
+                   UNION ALL
+                   SELECT REPLACE(
+                       TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                       '@sashiko.local',
+                       ''
+                   )
+                   FROM patchsets ps
+                   WHERE ps.status IN ('Fetching', 'Incomplete')
+                     AND ps.cover_letter_message_id IS NOT NULL
+               )",
+            (),
+        )
+        .await?;
+
         // Restore normal mailing-list cover letters (0 received parts, positive
         // total_parts, non-placeholder subject, non-local message ID, and no MR
         // URL) that an earlier startup sweep wrongly transitioned from
         // 'Incomplete' to 'Failed'.
-        self.execute(
+        tx.execute(
             "UPDATE patchsets SET status = 'Incomplete', failed_reason = NULL
              WHERE status = 'Failed'
                AND failed_reason = 'Interrupted before fetch completed'
@@ -9713,13 +16058,27 @@ impl Database {
         )
         .await?;
 
-        let count = self
+        let count = tx
             .execute(
-                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
-                 WHERE status = 'Fetching'",
+                "UPDATE patchsets
+                 SET status = 'Failed', failed_reason = 'Interrupted before fetch completed'
+                 WHERE status = 'Fetching'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM fetch_queue fq
+                       WHERE fq.status IN ('Pending', 'Fetching')
+                         AND fq.article_id IN (
+                             TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                             REPLACE(
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 '@sashiko.local',
+                                 ''
+                             )
+                         )
+                   )",
                 (),
             )
             .await?;
+        tx.commit().await?;
         Ok(count)
     }
 
@@ -9732,16 +16091,32 @@ impl Database {
         logs: Option<&str>,
         provider: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         let compressed_logs = crate::compression::compress_opt_string_async(logs).await;
         self.execute(
-            "UPDATE patchsets SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ? WHERE id = ?",
+            "UPDATE patchsets
+                SET baseline_id = ?, model_name = ?, prompts_git_hash = ?, baseline_logs = ?, provider = ?
+              WHERE id = ?
+                AND COALESCE(status, '') != 'Cancelled'
+                AND (? IS NULL OR (
+                    patchsets.id = ?
+                    AND patchsets.status = 'In Review'
+                    AND EXISTS (
+                        SELECT 1 FROM meta m_claim
+                         WHERE m_claim.key = 'patchset_active_gen:' || CAST(patchsets.id AS TEXT)
+                           AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                ))",
             libsql::params![
                 baseline_id,
                 model_name,
                 prompts_hash,
                 compressed_logs,
                 provider,
-                id
+                id,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
             ],
         )
         .await?;
@@ -9755,17 +16130,47 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
+        let (claim_ps_id, claim_gen) = self.claim_params();
         self.execute(
-            "UPDATE patches SET status = ?, apply_error = ? WHERE patchset_id = ? AND part_index = ?",
-            libsql::params![status, error, patchset_id, part_index],
-        ).await?;
+            "UPDATE patches
+                SET status = ?, apply_error = ?
+              WHERE patchset_id = ?
+                AND part_index = ?
+                AND (status IS NULL OR status IN ('Pending', 'In Review', 'Reviewing', 'applied', 'error'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM patchsets ps
+                     WHERE ps.id = patches.patchset_id AND ps.status = 'Cancelled'
+                )
+                AND (? IS NULL OR (
+                    patches.patchset_id = ?
+                    AND EXISTS (
+                        SELECT 1 FROM patchsets ps_claim
+                        JOIN meta m_claim ON m_claim.key = 'patchset_active_gen:' || CAST(ps_claim.id AS TEXT)
+                        WHERE ps_claim.id = patches.patchset_id
+                          AND ps_claim.status = 'In Review'
+                          AND CAST(m_claim.value AS INTEGER) = ?
+                    )
+                ))",
+            libsql::params![
+                status,
+                error,
+                patchset_id,
+                part_index,
+                claim_ps_id,
+                claim_ps_id,
+                claim_gen
+            ],
+        )
+        .await?;
         Ok(())
     }
 
     pub async fn reset_reviewing_status(&self) -> Result<u64> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
         let status_pending = ReviewStatus::Pending.as_str();
-        // Reset Patchsets
-        let count_ps = self
+        // Reset Patchsets and invalidate any prior active claim generations
+        let count_ps = tx_db
             .execute(
                 format!(
                     "UPDATE patchsets SET status = '{}' WHERE status IN ('In Review', 'Reviewing')",
@@ -9775,9 +16180,15 @@ impl Database {
                 (),
             )
             .await?;
+        tx_db
+            .execute(
+                "DELETE FROM meta WHERE key LIKE 'patchset_active_gen:%'",
+                (),
+            )
+            .await?;
 
         // Reset Reviews
-        let count_rev = self
+        let count_rev = tx_db
             .execute(
                 format!(
                     "UPDATE reviews SET status = '{}' WHERE status = 'In Review'",
@@ -9788,6 +16199,7 @@ impl Database {
             )
             .await?;
 
+        tx.commit().await?;
         Ok(count_ps + count_rev)
     }
 
@@ -9795,7 +16207,7 @@ impl Database {
         &self,
     ) -> Result<std::collections::HashMap<String, usize>> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query("SELECT status, COUNT(*) FROM patchsets GROUP BY status", ())
             .await?;
 
@@ -9811,8 +16223,33 @@ impl Database {
 }
 
 #[cfg(feature = "server")]
+const FETCH_QUEUE_TARGET_CANCELLED_SQL: &str = "EXISTS (
+    SELECT 1 FROM patchsets ps
+    WHERE ps.status = 'Cancelled'
+      AND ps.cover_letter_message_id IN (
+          fetch_queue.article_id,
+          '<' || fetch_queue.article_id || '>',
+          fetch_queue.article_id || '@sashiko.local',
+          '<' || fetch_queue.article_id || '@sashiko.local>'
+      )
+)
+AND NOT EXISTS (
+    SELECT 1 FROM patchsets ps2
+    WHERE COALESCE(ps2.status, '') != 'Cancelled'
+      AND ps2.cover_letter_message_id IN (
+          fetch_queue.article_id,
+          '<' || fetch_queue.article_id || '>',
+          fetch_queue.article_id || '@sashiko.local',
+          '<' || fetch_queue.article_id || '@sashiko.local>'
+      )
+)";
+
+#[cfg(feature = "server")]
 impl Database {
     #[allow(clippy::too_many_arguments)]
+    /// Returns whether a row was written (inserted or refreshed); `false`
+    /// when the claim is gone, the patchset is cancelled, or the patch
+    /// already has an email that can no longer be replaced.
     pub async fn insert_email_outbox(
         &self,
         patch_id: i64,
@@ -9823,28 +16260,129 @@ impl Database {
         in_reply_to: &str,
         references_hdr: &str,
         body: &str,
-    ) -> Result<()> {
-        // Prevent duplicate emails for the same patch
-        let mut rows = self
-            .conn
+    ) -> Result<bool> {
+        self.insert_review_email_outbox(
+            patch_id,
+            status,
+            to_addresses,
+            cc_addresses,
+            subject,
+            in_reply_to,
+            references_hdr,
+            body,
+            None,
+            0,
+        )
+        .await
+    }
+
+    /// Like [`Self::insert_email_outbox`], and when the row is written with
+    /// status `Pending` it also stamps the live related pre-existing bug
+    /// reservations of `disclose_for` (a patch Message-ID) as mailed, in the
+    /// same transaction. Stamping separately would let the email worker send
+    /// the email before the stamp, and a retry would then see an unreplaceable
+    /// email and could not tell whether it carried the bugs.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_review_email_outbox(
+        &self,
+        patch_id: i64,
+        status: &str,
+        to_addresses: &str,
+        cc_addresses: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+        disclose_for: Option<&str>,
+        related_preexisting_count: usize,
+    ) -> Result<bool> {
+        // Prevent duplicate emails for the same patch; if an unsent row from an
+        // aborted attempt exists, refresh its payload with the latest review.
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active_for_outbox(None).await? {
+            return Ok(false);
+        }
+        let mut ps_rows = tx
             .query(
-                "SELECT 1 FROM email_outbox WHERE patch_id = ?",
+                "SELECT ps.status FROM patches p JOIN patchsets ps ON ps.id = p.patchset_id WHERE p.id = ?",
                 libsql::params![patch_id],
             )
             .await?;
+        if let Some(ps_row) = ps_rows.next().await?
+            && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
+        {
+            return Ok(false);
+        }
+        drop(ps_rows);
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM email_outbox WHERE patch_id = ? ORDER BY id DESC LIMIT 1",
+                    libsql::params![patch_id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
 
-        if rows.next().await?.is_some() {
-            tracing::info!(
-                "Email outbox entry already exists for patch_id {}, skipping to prevent duplicates.",
-                patch_id
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(
+                existing_status.as_str(),
+                "Pending"
+                    | "Embargoed"
+                    | "Skipped"
+                    | "Muted"
+                    | "Disabled"
+                    | "Dry-Run"
+                    | "Cancelled"
+            ) {
+                tx.execute(
+                    "UPDATE email_outbox
+                        SET status = ?, to_addresses = ?, cc_addresses = ?,
+                            subject = ?, in_reply_to = ?, references_hdr = ?, body = ?,
+                            related_preexisting_count = ?, error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![
+                        status,
+                        to_addresses,
+                        cc_addresses,
+                        subject,
+                        in_reply_to,
+                        references_hdr,
+                        body,
+                        related_preexisting_count as i64,
+                        existing_id,
+                    ],
+                )
+                .await?;
+                Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
+                tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Email,
+                        status,
+                    );
+                }
+                return Ok(true);
+            }
+            tracing::debug!(
+                "Email outbox entry already exists for patch_id {} (status {}), skipping to prevent duplicates.",
+                patch_id,
+                existing_status
             );
-            return Ok(());
+            return Ok(false);
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
-            "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        tx.execute(
+            "INSERT INTO email_outbox (patch_id, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, related_preexisting_count, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
                 patch_id,
                 status,
@@ -9854,9 +16392,232 @@ impl Database {
                 in_reply_to,
                 references_hdr,
                 body,
+                related_preexisting_count as i64,
                 created_at,
             ],
-        ).await?;
+        )
+        .await?;
+        Self::stamp_disclosures_in(&tx, status, disclose_for).await?;
+        tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Email, status);
+        Ok(true)
+    }
+
+    /// Returns true if `patch_id` already has a non-Cancelled `email_outbox`
+    /// row (reads on the write connection so a recently committed outbox row is
+    /// never missed behind an older WAL snapshot).
+    pub async fn has_active_email_outbox_for_patch(&self, patch_id: i64) -> Result<bool> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = self
+            .tx_conn
+            .query(
+                "SELECT 1 FROM email_outbox
+                  WHERE patch_id = ?
+                    AND status != 'Cancelled'
+                  LIMIT 1",
+                libsql::params![patch_id],
+            )
+            .await?;
+        Ok(rows.next().await?.is_some())
+    }
+
+    /// Returns the recorded `related_preexisting_count` from the latest
+    /// non-Cancelled `email_outbox` row for each patch in `patchset_id`.
+    pub async fn get_patch_related_preexisting_counts(
+        &self,
+        patchset_id: i64,
+    ) -> Result<std::collections::HashMap<i64, usize>> {
+        let _guard = if self.in_transaction {
+            None
+        } else {
+            Some(self.tx_lock.lock().await)
+        };
+        let mut rows = self
+            .tx_conn
+            .query(
+                "SELECT e.patch_id, e.related_preexisting_count
+                   FROM email_outbox e
+                   JOIN patches p ON p.id = e.patch_id
+                  WHERE p.patchset_id = ?
+                    AND e.status != 'Cancelled'
+                  ORDER BY e.id ASC",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut counts = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let patch_id: i64 = row.get(0)?;
+            let count = row.get::<Option<i64>>(1)?.unwrap_or(0).max(0) as usize;
+            counts.insert(patch_id, count);
+        }
+        Ok(counts)
+    }
+
+    /// Inserts or refreshes a patchset-level email (`PatchsetSummary` or
+    /// `PatchsetFailure`), deduplicating on `(patchset_id, kind)` with
+    /// `patch_id IS NULL`. Returns `false` if the claim is no longer active,
+    /// the patchset is `Cancelled`, or an already-sent/in-flight row exists.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_patchset_email_outbox(
+        &self,
+        patchset_id: i64,
+        kind: EmailKind,
+        status: &str,
+        to_addresses: &str,
+        cc_addresses: &str,
+        subject: &str,
+        in_reply_to: &str,
+        references_hdr: &str,
+        body: &str,
+    ) -> Result<bool> {
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db
+            .is_patchset_claim_active_for_outbox(Some(patchset_id))
+            .await?
+        {
+            return Ok(false);
+        }
+        let mut ps_rows = tx
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        if let Some(ps_row) = ps_rows.next().await?
+            && ps_row.get::<Option<String>>(0)?.as_deref() == Some("Cancelled")
+        {
+            return Ok(false);
+        }
+        drop(ps_rows);
+
+        let kind_str = kind.as_str();
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM email_outbox
+                      WHERE patchset_id = ? AND patch_id IS NULL AND kind = ?
+                      ORDER BY id DESC LIMIT 1",
+                    libsql::params![patchset_id, kind_str],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(
+                existing_status.as_str(),
+                "Pending"
+                    | "Embargoed"
+                    | "Skipped"
+                    | "Muted"
+                    | "Disabled"
+                    | "Dry-Run"
+                    | "Cancelled"
+            ) {
+                tx.execute(
+                    "UPDATE email_outbox
+                        SET status = ?, to_addresses = ?, cc_addresses = ?,
+                            subject = ?, in_reply_to = ?, references_hdr = ?, body = ?,
+                            error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![
+                        status,
+                        to_addresses,
+                        cc_addresses,
+                        subject,
+                        in_reply_to,
+                        references_hdr,
+                        body,
+                        existing_id,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Email,
+                        status,
+                    );
+                }
+                return Ok(true);
+            }
+            tracing::debug!(
+                "Patchset email outbox entry already exists for patchset_id {} kind {} (status {}), skipping.",
+                patchset_id,
+                kind_str,
+                existing_status
+            );
+            return Ok(false);
+        }
+
+        let created_at = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT INTO email_outbox (patch_id, patchset_id, kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+             VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patchset_id,
+                kind_str,
+                status,
+                to_addresses,
+                cc_addresses,
+                subject,
+                in_reply_to,
+                references_hdr,
+                body,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Email, status);
+        Ok(true)
+    }
+
+    fn record_initial_outbox_outcome(channel: crate::metrics::OutboxChannel, status: &str) {
+        let outcome = match status {
+            "Muted" => Some(crate::metrics::OutboxOutcome::Muted),
+            "Skipped" | "Disabled" => Some(crate::metrics::OutboxOutcome::Skipped),
+            "Dry-Run" => Some(crate::metrics::OutboxOutcome::DryRun),
+            "Embargoed" => Some(crate::metrics::OutboxOutcome::Embargoed),
+            _ => None,
+        };
+        if let Some(out) = outcome {
+            crate::metrics::inc_outbox_event(channel, out);
+        }
+    }
+
+    /// Stamps the live reservations of `disclose_for` as mailed inside the
+    /// outbox transaction `tx`, for a `Pending` email only.
+    async fn stamp_disclosures_in(
+        tx: &libsql::Transaction,
+        status: &str,
+        disclose_for: Option<&str>,
+    ) -> Result<()> {
+        let Some(patch_message_id) = disclose_for.filter(|_| status == "Pending") else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "UPDATE preexisting_disclosures SET disclosed_at = ?1
+              WHERE patch_message_id = ?2 AND disclosed_at IS NULL AND reserved_at > ?3",
+            libsql::params![
+                now,
+                patch_message_id,
+                now - preexisting_disclosures::RESERVATION_TTL_SECS
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -9868,10 +16629,16 @@ impl Database {
                  error_log = 'Cancelled because patchset was cancelled',
                  locked_at = NULL
              WHERE status IN ('Pending', 'Embargoed')
-               AND EXISTS (
-                   SELECT 1 FROM patches p
-                   JOIN patchsets ps ON ps.id = p.patchset_id
-                   WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+               AND (
+                   EXISTS (
+                       SELECT 1 FROM patches p
+                       JOIN patchsets ps ON ps.id = p.patchset_id
+                       WHERE p.id = email_outbox.patch_id AND ps.status = 'Cancelled'
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM patchsets ps
+                       WHERE ps.id = email_outbox.patchset_id AND ps.status = 'Cancelled'
+                   )
                )",
             (),
         )
@@ -9972,33 +16739,78 @@ impl Database {
         target_url: &str,
         context: &str,
     ) -> Result<()> {
-        let mut rows = self
-            .conn
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db.is_patchset_claim_active_for_outbox(None).await? {
+            return Ok(());
+        }
+        let mut ps_rows = tx
             .query(
-                "SELECT 1 FROM patchwork_outbox
-                 WHERE patch_msg_id = ? AND api_url = ? AND context = ?",
-                libsql::params![patch_msg_id, api_url, context],
+                "SELECT 1 FROM patches p
+                 JOIN patchsets ps ON ps.id = p.patchset_id
+                 WHERE p.message_id = ? AND ps.status = 'Cancelled'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM patches p2
+                       JOIN patchsets ps2 ON ps2.id = p2.patchset_id
+                       WHERE p2.message_id = ? AND COALESCE(ps2.status, '') != 'Cancelled'
+                   )
+                 LIMIT 1",
+                libsql::params![patch_msg_id, patch_msg_id],
             )
             .await?;
-        if rows.next().await?.is_some() {
+        if ps_rows.next().await?.is_some() {
+            return Ok(());
+        }
+        drop(ps_rows);
+        let existing = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status FROM patchwork_outbox
+                     WHERE patch_msg_id = ? AND api_url = ? AND context = ?
+                     ORDER BY id DESC LIMIT 1",
+                    libsql::params![patch_msg_id, api_url, context],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                let id: i64 = row.get(0)?;
+                let existing_status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
+                Some((id, existing_status))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status)) = existing {
+            if matches!(existing_status.as_str(), "Pending" | "Cancelled") {
+                tx.execute(
+                    "UPDATE patchwork_outbox
+                        SET status = 'Pending', check_state = ?, description = ?, target_url = ?,
+                            retry_count = 0, next_retry_at = NULL, locked_at = NULL, error_log = NULL
+                      WHERE id = ?",
+                    libsql::params![check_state, description, target_url, existing_id],
+                )
+                .await?;
+                tx.commit().await?;
+            }
             return Ok(());
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
-                "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    patch_msg_id,
-                    api_url,
-                    check_state,
-                    description,
-                    target_url,
-                    context,
-                    created_at,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO patchwork_outbox (patch_msg_id, api_url, check_state, description, target_url, context, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patch_msg_id,
+                api_url,
+                check_state,
+                description,
+                target_url,
+                context,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -10128,18 +16940,29 @@ impl Database {
         target_url: &str,
         status: &str,
     ) -> Result<()> {
-        if self.get_patchset_status(patchset_id).await?.as_deref()
+        let tx = self.begin_immediate_transaction().await?;
+        let tx_db = self.with_connection((*tx).clone());
+        if !tx_db
+            .is_patchset_claim_active_for_outbox(Some(patchset_id))
+            .await?
+        {
+            debug!(
+                "Skipping forge outbox insertion for superseded worker on patchset {}",
+                patchset_id
+            );
+            return Ok(());
+        }
+        if tx_db.get_patchset_status(patchset_id).await?.as_deref()
             == Some(ReviewStatus::Cancelled.as_str())
         {
-            info!(
+            debug!(
                 "Skipping forge outbox insertion for cancelled patchset {}",
                 patchset_id
             );
             return Ok(());
         }
 
-        let mut newer_rows = self
-            .conn
+        let mut newer_rows = tx
             .query(
                 "SELECT 1 FROM patchsets
                  WHERE mr_number = ?
@@ -10155,22 +16978,89 @@ impl Database {
             )
             .await?;
         if newer_rows.next().await?.is_some() {
-            info!(
+            debug!(
                 "Skipping forge outbox insertion for patchset {} (PR #{} has a newer revision)",
                 patchset_id, pr_number
             );
             return Ok(());
         }
+        drop(newer_rows);
 
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM forge_outbox WHERE patchset_id = ?",
-                libsql::params![patchset_id],
-            )
-            .await?;
-        if rows.next().await?.is_some() {
-            info!(
+        let existing: Option<(i64, String, String)> = {
+            let mut rows = tx
+                .query(
+                    "SELECT id, status, body FROM forge_outbox WHERE patchset_id = ?",
+                    libsql::params![patchset_id],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some((row.get(0)?, row.get(1)?, row.get(2)?))
+            } else {
+                None
+            }
+        };
+
+        if let Some((existing_id, existing_status, existing_body)) = existing {
+            let existing_is_incomplete =
+                crate::forge::is_incomplete_pr_review_comment(&existing_body);
+            let new_is_incomplete = crate::forge::is_incomplete_pr_review_comment(body);
+            let is_cancelled = existing_status == "Cancelled";
+            let is_unsent = !matches!(existing_status.as_str(), "Sent" | "Sending" | "Cancelled");
+            let should_upgrade = is_cancelled
+                || (existing_is_incomplete
+                    && (!new_is_incomplete || (is_unsent && existing_body != body)));
+
+            if should_upgrade {
+                let next_id: i64 = {
+                    let mut id_rows = tx
+                        .query("SELECT COALESCE(MAX(id), 0) + 1 FROM forge_outbox", ())
+                        .await?;
+                    id_rows
+                        .next()
+                        .await?
+                        .map(|r| r.get::<i64>(0))
+                        .transpose()?
+                        .unwrap_or(existing_id + 1)
+                        .max(existing_id + 1)
+                };
+                let created_at = chrono::Utc::now().timestamp();
+                info!(
+                    "Replacing incomplete forge outbox entry {} with {} for patchset_id {} (prior status: {}).",
+                    existing_id, next_id, patchset_id, existing_status
+                );
+                tx.execute(
+                    "DELETE FROM forge_outbox WHERE id = ?",
+                    libsql::params![existing_id],
+                )
+                .await?;
+                tx.execute(
+                    "INSERT INTO forge_outbox (id, patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        next_id,
+                        patchset_id,
+                        provider,
+                        repo,
+                        pr_number,
+                        head_sha,
+                        body,
+                        target_url,
+                        status,
+                        created_at,
+                    ],
+                )
+                .await?;
+                tx.commit().await?;
+                if existing_status != status {
+                    Self::record_initial_outbox_outcome(
+                        crate::metrics::OutboxChannel::Forge,
+                        status,
+                    );
+                }
+                return Ok(());
+            }
+            tx.commit().await?;
+            debug!(
                 "Forge outbox entry already exists for patchset_id {}, skipping duplicate.",
                 patchset_id
             );
@@ -10178,22 +17068,24 @@ impl Database {
         }
 
         let created_at = chrono::Utc::now().timestamp();
-        self.execute(
-                "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    patchset_id,
-                    provider,
-                    repo,
-                    pr_number,
-                    head_sha,
-                    body,
-                    target_url,
-                    status,
-                    created_at,
-                ],
-            )
-            .await?;
+        tx.execute(
+            "INSERT INTO forge_outbox (patchset_id, provider, repo, pr_number, head_sha, body, target_url, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            libsql::params![
+                patchset_id,
+                provider,
+                repo,
+                pr_number,
+                head_sha,
+                body,
+                target_url,
+                status,
+                created_at,
+            ],
+        )
+        .await?;
+        tx.commit().await?;
+        Self::record_initial_outbox_outcome(crate::metrics::OutboxChannel::Forge, status);
         Ok(())
     }
 
@@ -10321,6 +17213,454 @@ impl Database {
         Ok(count)
     }
 
+    pub async fn enqueue_fetch_request(
+        &self,
+        repo_url: Option<&str>,
+        commit_range: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> Result<()> {
+        if crate::fetcher::url_has_embedded_credentials(repo_url) {
+            anyhow::bail!(
+                "Refusing to persist repository URL with embedded credentials in fetch_queue"
+            );
+        }
+        let repo_key = repo_url.unwrap_or("");
+        let article_id = crate::fetcher::fetch_article_id(commit_range, mr_number);
+        let now = chrono::Utc::now().timestamp();
+        self.execute(
+            "INSERT INTO fetch_queue (repo_url, commit_range, article_id, mr_url, mr_title, mr_number, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?)
+             ON CONFLICT(repo_url, article_id) DO UPDATE SET
+                 commit_range = excluded.commit_range,
+                 mr_url = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_url, fetch_queue.mr_url)
+                     ELSE excluded.mr_url
+                 END,
+                 mr_title = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_title, fetch_queue.mr_title)
+                     ELSE excluded.mr_title
+                 END,
+                 mr_number = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching')
+                         THEN COALESCE(excluded.mr_number, fetch_queue.mr_number)
+                     ELSE excluded.mr_number
+                 END,
+                 status = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN 'Fetching'
+                     ELSE 'Pending'
+                 END,
+                 retry_count = CASE
+                     WHEN fetch_queue.status IN ('Pending', 'Fetching') THEN fetch_queue.retry_count
+                     ELSE 0
+                 END,
+                 next_retry_at = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN fetch_queue.next_retry_at
+                     ELSE NULL
+                 END,
+                 error_log = CASE
+                     WHEN fetch_queue.status = 'Fetching' THEN fetch_queue.error_log
+                     ELSE NULL
+                 END",
+            libsql::params![
+                repo_key,
+                commit_range,
+                article_id,
+                mr_url,
+                mr_title,
+                mr_number,
+                now,
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn lock_pending_fetch_queue(&self) -> Result<Option<FetchQueueRow>> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE status IN ('Pending', 'Fetching')
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            (),
+        )
+        .await?;
+
+        let claimed = {
+            let mut rows = tx
+                .query(
+                    "UPDATE fetch_queue
+                     SET status = 'Fetching', locked_at = ?
+                     WHERE id = (
+                         SELECT id FROM fetch_queue
+                         WHERE status = 'Pending'
+                           AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                         ORDER BY created_at ASC, id ASC
+                         LIMIT 1
+                     )
+                     RETURNING id, repo_url, commit_range, article_id, mr_url, mr_title, mr_number, status, locked_at, retry_count, next_retry_at, error_log, created_at",
+                    libsql::params![now, now],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some(FetchQueueRow {
+                    id: row.get(0)?,
+                    repo_url: row.get(1)?,
+                    commit_range: row.get(2)?,
+                    article_id: row.get(3)?,
+                    mr_url: row.get(4)?,
+                    mr_title: row.get(5)?,
+                    mr_number: row.get(6)?,
+                    status: row.get(7)?,
+                    locked_at: row.get(8)?,
+                    retry_count: row.get(9)?,
+                    next_retry_at: row.get(10)?,
+                    error_log: row.get(11)?,
+                    created_at: row.get(12)?,
+                })
+            } else {
+                None
+            }
+        };
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn cancel_fetch_queue_if_target_cancelled(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+    ) -> Result<()> {
+        self.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE id = ?
+                   AND status = 'Fetching'
+                   AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            libsql::params![id, locked_at],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn has_fetch_queue_lease(&self, id: i64, locked_at: Option<i64>) -> Result<bool> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                &format!(
+                    "SELECT 1 FROM fetch_queue
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})
+                     LIMIT 1"
+                ),
+                libsql::params![id, locked_at],
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Ok(true);
+        }
+        drop(rows);
+        self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+            .await?;
+        Ok(false)
+    }
+
+    pub async fn mark_fetch_queue_done(&self, id: i64, locked_at: Option<i64>) -> Result<bool> {
+        let count = self
+            .execute(
+                &format!(
+                    "UPDATE fetch_queue
+                     SET status = 'Done', locked_at = NULL, next_retry_at = NULL, error_log = NULL
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})"
+                ),
+                libsql::params![id, locked_at],
+            )
+            .await?;
+        if count == 0 {
+            self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+                .await?;
+        }
+        Ok(count > 0)
+    }
+
+    pub async fn mark_fetch_queue_failed(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+        error_log: &str,
+    ) -> Result<bool> {
+        let redacted = crate::utils::redact_secret(error_log);
+        let tx = self.begin_immediate_transaction().await?;
+        tx.execute(
+            &format!(
+                "UPDATE fetch_queue
+                 SET status = 'Cancelled',
+                     error_log = 'Cancelled: target patchset was cancelled',
+                     locked_at = NULL
+                 WHERE id = ?
+                   AND status = 'Fetching'
+                   AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                   AND {FETCH_QUEUE_TARGET_CANCELLED_SQL}"
+            ),
+            libsql::params![id, locked_at],
+        )
+        .await?;
+        let article_id: Option<String> = {
+            let mut rows = tx
+                .query(
+                    &format!(
+                        "UPDATE fetch_queue
+                         SET status = 'Failed', error_log = ?, locked_at = NULL
+                         WHERE id = ?
+                           AND status = 'Fetching'
+                           AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                           AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})
+                         RETURNING article_id"
+                    ),
+                    libsql::params![redacted.clone(), id, locked_at],
+                )
+                .await?;
+            if let Some(row) = rows.next().await? {
+                Some(row.get(0)?)
+            } else {
+                None
+            }
+        };
+        if let Some(ref aid) = article_id {
+            let root_local = format!("{aid}@sashiko.local");
+            for clid in Self::get_msgid_candidates(&root_local)
+                .into_iter()
+                .chain(Self::get_msgid_candidates(aid))
+            {
+                tx.execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                     WHERE cover_letter_message_id = ?
+                       AND status IN ('Fetching', 'Incomplete', 'Failed')
+                       AND NOT EXISTS (
+                           SELECT 1 FROM fetch_queue fq
+                           WHERE fq.status IN ('Pending', 'Fetching')
+                             AND fq.article_id IN (
+                                 TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                 REPLACE(
+                                     TRIM(COALESCE(patchsets.cover_letter_message_id, ''), '<>'),
+                                     '@sashiko.local',
+                                     ''
+                                 )
+                             )
+                       )",
+                    libsql::params![redacted.clone(), clid],
+                )
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(article_id.is_some())
+    }
+
+    pub async fn set_fetch_queue_retry_at(
+        &self,
+        id: i64,
+        locked_at: Option<i64>,
+        next_retry_at: i64,
+        error_log: &str,
+    ) -> Result<bool> {
+        let redacted = crate::utils::redact_secret(error_log);
+        let count = self
+            .execute(
+                &format!(
+                    "UPDATE fetch_queue
+                     SET status = 'Pending',
+                         retry_count = retry_count + 1,
+                         next_retry_at = ?,
+                         error_log = ?,
+                         locked_at = NULL
+                     WHERE id = ?
+                       AND status = 'Fetching'
+                       AND COALESCE(locked_at, 0) = COALESCE(?, 0)
+                       AND NOT ({FETCH_QUEUE_TARGET_CANCELLED_SQL})"
+                ),
+                libsql::params![next_retry_at, redacted, id, locked_at],
+            )
+            .await?;
+        if count == 0 {
+            self.cancel_fetch_queue_if_target_cancelled(id, locked_at)
+                .await?;
+        }
+        Ok(count > 0)
+    }
+
+    pub async fn sweep_stale_fetch_queue(&self) -> Result<u64> {
+        let ten_mins_ago = chrono::Utc::now().timestamp() - 600;
+        let count = self
+            .execute(
+                "UPDATE fetch_queue
+                 SET status = 'Pending', locked_at = NULL
+                 WHERE status = 'Fetching' AND (locked_at IS NULL OR locked_at < ?)",
+                libsql::params![ten_mins_ago],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    pub async fn bootstrap_or_get_forge_poll_watermark(&self, repo: &str, now: i64) -> Result<i64> {
+        let key = format!("forge_github_poll_watermark:{repo}");
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT value FROM meta WHERE key = ?",
+                libsql::params![key.clone()],
+            )
+            .await?;
+        if let Some(row) = rows.next().await? {
+            let val: String = row.get(0)?;
+            if let Ok(parsed) = val.trim().parse::<i64>() {
+                return Ok(parsed);
+            }
+        }
+        drop(rows);
+
+        let mut ps_rows = self
+            .read_conn()
+            .query("SELECT 1 FROM patchsets LIMIT 1", ())
+            .await?;
+        let has_existing_patchsets = ps_rows.next().await?.is_some();
+        drop(ps_rows);
+
+        let initial = if has_existing_patchsets {
+            now.saturating_sub(86_400)
+        } else {
+            now.saturating_sub(300)
+        };
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, initial.to_string()],
+        )
+        .await?;
+        Ok(initial)
+    }
+
+    pub async fn set_forge_poll_watermark(&self, repo: &str, ts: i64) -> Result<()> {
+        let key = format!("forge_github_poll_watermark:{repo}");
+        self.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            libsql::params![key, ts.to_string()],
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Return true if `(repo, mr_number, head_sha)` has already been ingested
+    /// (in any terminal or in-progress review state, or `Fetching` backed by a
+    /// `Pending`, `Fetching`, or `Done` `fetch_queue` row). Returns false when
+    /// the revision has never been seen, only exists as an unbacked/interrupted
+    /// fetch placeholder, or was superseded by a newer PR push (`A -> B -> A`).
+    pub async fn has_forge_pr_head_ingested(
+        &self,
+        repo: &str,
+        mr_number: i64,
+        head_sha: &str,
+    ) -> Result<bool> {
+        let mut rows = self
+            .read_conn()
+            .query(
+                "SELECT ps.status,
+                        ps.failed_reason,
+                        ps.mr_url,
+                        ps.cover_letter_message_id,
+                        EXISTS (
+                            SELECT 1 FROM fetch_queue fq
+                            WHERE fq.status IN ('Pending', 'Fetching', 'Done')
+                              AND fq.article_id IN (
+                                  TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                                  REPLACE(
+                                      TRIM(COALESCE(ps.cover_letter_message_id, ''), '<>'),
+                                      '@sashiko.local',
+                                      ''
+                                  )
+                              )
+                        ) AS has_active_fetch
+                 FROM patchsets ps
+                 WHERE ps.mr_number = ?
+                 ORDER BY ps.id DESC
+                 LIMIT 200",
+                libsql::params![mr_number],
+            )
+            .await?;
+
+        while let Some(row) = rows.next().await? {
+            let status: String = row.get::<Option<String>>(0)?.unwrap_or_default();
+            let failed_reason: Option<String> = row.get(1)?;
+            let mr_url: Option<String> = row.get(2)?;
+            let clid: String = row.get::<Option<String>>(3)?.unwrap_or_default();
+            let has_active_fetch: i64 = row.get(4)?;
+
+            let Some(ref row_mr_url) = mr_url else {
+                continue;
+            };
+            let Some(row_repo) = crate::forge::extract_owner_repo_from_mr_url(row_mr_url) else {
+                continue;
+            };
+            if !row_repo.eq_ignore_ascii_case(repo) {
+                continue;
+            }
+
+            let trimmed = clid.trim_matches(|c| c == '<' || c == '>');
+            let clean_clid = trimmed.strip_suffix("@sashiko.local").unwrap_or(trimmed);
+            let row_head_sha = clean_clid
+                .rsplit_once("..")
+                .map(|(_, h)| h.trim_start_matches('.'));
+            if !row_head_sha.is_some_and(|h| h.eq_ignore_ascii_case(head_sha)) {
+                // A newer revision with a different head SHA was ingested more
+                // recently than any remaining rows, so `head_sha` is either
+                // unseen or a re-push (`A -> B -> A`) that supersedes it.
+                return Ok(false);
+            }
+
+            if status == "Fetching" {
+                return Ok(has_active_fetch != 0);
+            }
+            // "Failed to store PR description body" is no longer written, but
+            // rows failed with it by earlier releases stay recoverable.
+            if status == "Failed"
+                && matches!(
+                    failed_reason.as_deref(),
+                    Some(
+                        "Interrupted before fetch completed"
+                            | "Failed to store PR description body"
+                            | "Failed to verify placeholder patchset status"
+                            | "Failed to enqueue fetch request"
+                    )
+                )
+            {
+                return Ok(false);
+            }
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     /// Insert a patchwork notification email into the email outbox.
     ///
     /// Uses patch_id = NULL to avoid colliding with the per-patch dedup
@@ -10336,7 +17676,7 @@ impl Database {
         body: &str,
     ) -> Result<()> {
         let mut rows = self
-            .conn
+            .read_conn()
             .query(
                 "SELECT 1 FROM email_outbox
                  WHERE patch_id IS NULL AND to_addresses = ? AND subject = ? AND in_reply_to = ?",
@@ -10430,6 +17770,26 @@ fn transactional_email_params(email: &TransactionalEmail<'_>) -> Result<libsql::
     ]))
 }
 
+#[cfg(test)]
+mod severity_floor_tests {
+    use super::*;
+
+    #[test]
+    fn test_severity_floor_admits_and_parses() {
+        assert!(SeverityFloor::High.admits(Severity::High));
+        assert!(SeverityFloor::High.admits(Severity::Critical));
+        assert!(!SeverityFloor::High.admits(Severity::Medium));
+        assert!(SeverityFloor::Low.admits(Severity::Low));
+        assert!(!SeverityFloor::Low.admits(Severity::Unknown));
+        assert_eq!(" High ".parse::<SeverityFloor>(), Ok(SeverityFloor::High));
+        assert_eq!(
+            SeverityFloor::Medium.to_string().parse(),
+            Ok(SeverityFloor::Medium)
+        );
+        assert!("unknown".parse::<SeverityFloor>().is_err());
+    }
+}
+
 #[cfg(all(test, feature = "server"))]
 mod tests {
     /// The message id lookup behind /api/patchset must seek an index.
@@ -10467,6 +17827,383 @@ mod tests {
             "message id lookups must seek an index, got: {plan}"
         );
 
+        Ok(())
+    }
+
+    /// Migration 22 adds the review reuse columns and survives being asked
+    /// to run again on a database that already has them.
+    #[tokio::test]
+    async fn test_review_reuse_columns_migrate_idempotently() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        // A rewound version with the columns present must not fail on the
+        // duplicate ALTER TABLE ADD COLUMN.
+        db.conn.execute("PRAGMA user_version = 18", ()).await?;
+        db.migrate().await?;
+
+        let version: i64 = db
+            .conn
+            .query("PRAGMA user_version", ())
+            .await?
+            .next()
+            .await?
+            .expect("user_version row")
+            .get(0)?;
+        assert_eq!(version, 24);
+
+        let mut columns = db.conn.query("PRAGMA table_info(reviews)", ()).await?;
+        let mut names = std::collections::BTreeSet::new();
+        while let Some(row) = columns.next().await? {
+            names.insert(row.get::<String>(1)?);
+        }
+        assert!(names.contains("inherited_from_review_id"));
+        assert!(names.contains("baseline_commit"));
+        assert!(names.contains("cheap"));
+        assert!(names.contains("stages"));
+
+        let mut index = db
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_reviews_inherited_from_review_id'",
+                (),
+            )
+            .await?;
+        assert!(
+            index.next().await?.is_some(),
+            "the foreign key column is indexed"
+        );
+        Ok(())
+    }
+
+    /// Creates a single-patch series whose patch carries `git_patch_id`, and
+    /// returns the patchset and patch ids.
+    async fn create_series_with_patch_id(
+        db: &Database,
+        tag: &str,
+        version: Option<u32>,
+        diff: &str,
+        git_patch_id: &str,
+    ) -> Result<(i64, i64)> {
+        let msg_id = format!("<{tag}@example.org>");
+        let thread_id = db.create_thread(&msg_id, tag, 1_700_000_000).await?;
+        db.create_message(
+            &msg_id,
+            thread_id,
+            None,
+            "Author <a@example.org>",
+            tag,
+            1_700_000_000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                &msg_id,
+                tag,
+                "Author <a@example.org>",
+                1_700_000_000,
+                1,
+                1,
+                "",
+                "",
+                version,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("patchset created");
+        let patch_id = db
+            .create_patch_with_git_patch_id(ps_id, &msg_id, 1, diff, Some(git_patch_id))
+            .await?;
+        Ok((ps_id, patch_id))
+    }
+
+    async fn complete_clean_review(
+        db: &Database,
+        ps_id: i64,
+        patch_id: i64,
+        model: &str,
+    ) -> Result<i64> {
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", model, None, Some("p1"))
+            .await?;
+        db.complete_review(review_id, "Reviewed", "done", None, None, None, None)
+            .await?;
+        Ok(review_id)
+    }
+
+    /// A full review covers every narrower one; a cheap pass or a stage
+    /// subset covers only a review narrowed the same way.
+    #[test]
+    fn test_review_coverage_covers() {
+        let stages =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+        let full = ReviewCoverage::default();
+        let cheap = ReviewCoverage::new(true, None);
+        let subset = ReviewCoverage::new(false, Some(&stages(&["locking", "security"])));
+        let reordered = ReviewCoverage::new(false, Some(&stages(&["security", "locking"])));
+        let other = ReviewCoverage::new(false, Some(&stages(&["security"])));
+
+        for wanted in [&full, &cheap, &subset, &other] {
+            assert!(full.covers(wanted));
+        }
+        assert!(cheap.covers(&cheap));
+        assert!(!cheap.covers(&full));
+        assert!(!cheap.covers(&subset));
+        assert!(subset.covers(&reordered));
+        assert!(!subset.covers(&full));
+        assert!(!subset.covers(&other));
+        assert!(!other.covers(&subset));
+    }
+
+    /// The clean-review lookup returns finished reviews of other patches
+    /// that share a Git patch ID, newest first, flags the ones with
+    /// findings, and never returns a review that itself inherited its
+    /// verdict.
+    #[tokio::test]
+    async fn test_find_clean_review_candidates_filters_by_outcome() -> Result<()> {
+        let db = Database::new(&DatabaseSettings {
+            url: ":memory:".into(),
+            token: String::new(),
+        })
+        .await?;
+        db.migrate().await?;
+
+        let diff = "diff --git a/f.c b/f.c\n--- a/f.c\n+++ b/f.c\n@@ -1 +1 @@\n-a\n+b\n";
+        let pid = "0123456789abcdef0123456789abcdef01234567";
+
+        // v1: clean, the review to inherit from.
+        let (v1_ps, v1_patch) = create_series_with_patch_id(&db, "v1", Some(1), diff, pid).await?;
+        let v1_review = complete_clean_review(&db, v1_ps, v1_patch, "pro").await?;
+        db.set_review_baseline_commit(v1_review, "abc123").await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 1000 WHERE id = ?",
+                libsql::params![v1_review],
+            )
+            .await?;
+
+        // v2: reviewed, but with a finding.
+        let (v2_ps, v2_patch) = create_series_with_patch_id(&db, "v2", Some(2), diff, pid).await?;
+        let v2_review = complete_clean_review(&db, v2_ps, v2_patch, "pro").await?;
+        db.create_finding(Finding {
+            review_id: v2_review,
+            severity: Severity::Low,
+            severity_explanation: None,
+            problem: "nit".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 1500 WHERE id = ?",
+                libsql::params![v2_review],
+            )
+            .await?;
+
+        // v3: still running.
+        let (v3_ps, v3_patch) = create_series_with_patch_id(&db, "v3", Some(3), diff, pid).await?;
+        db.create_review(v3_ps, Some(v3_patch), "gemini", "pro", None, None)
+            .await?;
+
+        // v4: skipped as an inherited copy of v1; must not be offered itself.
+        let (v4_ps, v4_patch) = create_series_with_patch_id(&db, "v4", Some(4), diff, pid).await?;
+        let v4_review = db
+            .create_review(v4_ps, Some(v4_patch), "gemini", "pro", None, Some("p1"))
+            .await?;
+        db.complete_review(v4_review, "Skipped", "inherited", None, None, None, None)
+            .await?;
+        db.set_review_inherited_from(v4_review, v1_review).await?;
+        assert_eq!(
+            db.get_inheriting_patch_message_ids(v1_review).await?,
+            vec!["<v4@example.org>".to_string()]
+        );
+
+        // v5: a newer clean review on another model.
+        let (v5_ps, v5_patch) = create_series_with_patch_id(&db, "v5", Some(5), diff, pid).await?;
+        let v5_review = complete_clean_review(&db, v5_ps, v5_patch, "flash").await?;
+        db.conn
+            .execute(
+                "UPDATE reviews SET created_at = 2000 WHERE id = ?",
+                libsql::params![v5_review],
+            )
+            .await?;
+
+        // Another series altogether with a different patch id.
+        let (o_ps, o_patch) = create_series_with_patch_id(
+            &db,
+            "other",
+            None,
+            "diff --git a/g.c b/g.c\n+x\n",
+            "fedcba9876543210fedcba9876543210fedcba98",
+        )
+        .await?;
+        complete_clean_review(&db, o_ps, o_patch, "pro").await?;
+
+        // v6 is the patch under review.
+        let (_, v6_patch) = create_series_with_patch_id(&db, "v6", Some(6), diff, pid).await?;
+
+        let found = db
+            .find_clean_review_candidates(pid, v6_patch, 0, 10)
+            .await?;
+        let ids: Vec<(i64, bool)> = found
+            .iter()
+            .map(|c| (c.review_id, c.has_findings))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![(v5_review, false), (v2_review, true), (v1_review, false)]
+        );
+
+        let v1 = found.iter().find(|c| c.review_id == v1_review).unwrap();
+        assert_eq!(v1.patch_id, v1_patch);
+        assert_eq!(v1.patchset_id, v1_ps);
+        assert_eq!(v1.patchset_subject, "v1");
+        assert_eq!(v1.patchset_version, Some(1));
+        assert_eq!(v1.part_index, 1);
+        assert_eq!(v1.diff, diff);
+        assert_eq!(v1.model.as_deref(), Some("pro"));
+        assert_eq!(v1.prompts_hash.as_deref(), Some("p1"));
+        assert_eq!(v1.baseline_commit.as_deref(), Some("abc123"));
+        assert_eq!(v1.patch_message_id, "<v1@example.org>");
+
+        // A reply from Sashiko itself is not discussion; a reply from
+        // anyone else is, however the In-Reply-To header spells the parent.
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+        let v1_thread = db
+            .create_thread("<v1-replies@example.org>", "v1", 1)
+            .await?;
+        db.create_message(
+            "<bot-reply@example.org>",
+            v1_thread,
+            Some("<v1@example.org>"),
+            "Sashiko <sashiko-bot@kernel.org>",
+            "Re: v1",
+            2,
+            "no issues",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        // Neither is a patch threaded under this one, as the rest of a
+        // series sent without a cover letter is.
+        db.create_message(
+            "<threaded@example.org>",
+            v1_thread,
+            Some("<v1@example.org>"),
+            "Author <author@example.org>",
+            "[PATCH 2/2] next",
+            2,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(v2_ps, "<threaded@example.org>", 2, "diff")
+            .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        // An answer to Sashiko's review is discussion of the patch.
+        db.create_message(
+            "<answer-to-bot@example.org>",
+            v1_thread,
+            Some("<bot-reply@example.org>"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v1",
+            3,
+            "you missed the leak",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(db.patch_has_human_replies(&v1.patch_message_id).await?);
+        db.conn
+            .execute(
+                "DELETE FROM messages WHERE message_id = '<answer-to-bot@example.org>'",
+                (),
+            )
+            .await?;
+        assert!(!db.patch_has_human_replies(&v1.patch_message_id).await?);
+
+        db.create_message(
+            "<human-reply@example.org>",
+            v1_thread,
+            Some("v1@example.org"),
+            "Reviewer <reviewer@example.org>",
+            "Re: v1",
+            3,
+            "this leaks",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        assert!(db.patch_has_human_replies(&v1.patch_message_id).await?);
+        assert!(!db.patch_has_human_replies("").await?);
+
+        // A review that never recorded its coverage reads as a full one,
+        // and a recorded coverage comes back as written.
+        assert_eq!(v1.coverage, ReviewCoverage::default());
+        let narrowed = ReviewCoverage::new(true, Some(&["security".into(), "locking".into()]));
+        db.set_review_coverage(v5_review, &narrowed).await?;
+        let reread = db
+            .find_clean_review_candidates(pid, v6_patch, 0, 10)
+            .await?;
+        assert_eq!(reread[0].review_id, v5_review);
+        assert_eq!(reread[0].coverage, narrowed);
+        assert_eq!(
+            reread[0].coverage.stages.as_deref(),
+            Some("locking,security")
+        );
+        db.set_review_coverage(v5_review, &ReviewCoverage::default())
+            .await?;
+
+        // The age bound and the limit both apply.
+        let recent = db
+            .find_clean_review_candidates(pid, v6_patch, 1500, 10)
+            .await?;
+        assert!(recent.iter().all(|c| c.review_id != v1_review));
+        let one = db.find_clean_review_candidates(pid, v6_patch, 0, 1).await?;
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].review_id, v5_review);
+
+        // The patch under review never matches itself.
+        assert!(
+            db.find_clean_review_candidates(pid, v1_patch, 0, 10)
+                .await?
+                .iter()
+                .all(|c| c.patch_id != v1_patch)
+        );
+
+        assert_eq!(
+            db.get_patch_git_patch_id(v6_patch).await?.as_deref(),
+            Some(pid)
+        );
         Ok(())
     }
 
@@ -10865,6 +18602,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_upstream_grant_source_cannot_be_deserialized() {
+        let parsed: AttributedSubsystem =
+            serde_json::from_value(json!({"name": "SOC", "source": "upstream_grant"})).unwrap();
+        assert_eq!(parsed.source, SubsystemSource::CallerSupplied);
+        assert!(!parsed.source.confers_authority());
+        // Serializing still says what it was, for logs and the bug input.
+        assert_eq!(
+            serde_json::to_value(AttributedSubsystem::from_upstream_grant("SOC")).unwrap(),
+            json!({"name": "SOC", "source": "upstream_grant"})
+        );
+        let unknown: SubsystemSource = serde_json::from_value(json!("bogus")).unwrap();
+        assert_eq!(unknown, SubsystemSource::CallerSupplied);
+    }
+
     #[tokio::test]
     async fn test_bug_visibility_scopes_listings_to_maintained_sections() -> Result<()> {
         let db = setup_db().await;
@@ -10941,6 +18693,113 @@ mod tests {
             .get_subsystems_bug_counts(Some(BugLifecycleStatus::New), BugVisibility::Unrestricted)
             .await?;
         assert_eq!(counts.len(), 4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_upstream_grant_rows_confer_access_but_are_not_displayed() -> Result<()> {
+        let db = setup_db().await;
+        let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
+        let mut bug: NewBug = serde_json::from_value(json!({"bugid": "b1", "title": "t"}))?;
+        bug.subsystems = vec![
+            AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+            AttributedSubsystem::from_upstream_grant(soc),
+        ];
+        let id = db.create_bug(&bug).await?;
+
+        assert_eq!(
+            db.authorizing_sections_for_bug(id).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        // Display and facets keep showing ownership only.
+        assert_eq!(
+            db.get_subsystems_for_bug(id).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            stored_subsystem_sources(&db, id).await?,
+            vec![(
+                "ARM/QUALCOMM SUPPORT".to_string(),
+                "maintainers_section".to_string()
+            )]
+        );
+
+        let scope = vec![soc.to_ascii_lowercase()];
+        let (items, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!((total, items[0].id), (1, id));
+        let counts = db
+            .get_subsystems_bug_counts(
+                Some(BugLifecycleStatus::New),
+                BugVisibility::Sections(&scope),
+            )
+            .await?;
+        assert_eq!(counts, vec![("ARM/QUALCOMM SUPPORT".to_string(), 1)]);
+
+        // Replacing the attribution without the grant revokes it.
+        db.update_bug_subsystems(
+            id,
+            &[AttributedSubsystem::from_maintainers(
+                "ARM/QUALCOMM SUPPORT",
+            )],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_bug(id).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        let (_, total) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total, 0);
+
+        // Folding a candidate as a duplicate atomically persists its verified
+        // grant rows and attributable files, restoring canonical visibility.
+        let dup_bug: NewBug = serde_json::from_value(json!({"bugid": "b-dup", "title": "dup"}))?;
+        let dup_id = db.create_bug(&dup_bug).await?;
+        assert!(db.authorizing_sections_for_bug(dup_id).await?.is_empty());
+        let folded = db
+            .mark_bug_as_duplicate_with_attribution(
+                MarkDuplicateBugParams {
+                    preserve_triage: true,
+                    ephemeral_id: dup_id,
+                    canonical_id: id,
+                    reasoning: "same uaf",
+                    logs: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                    tokens_cached: None,
+                },
+                Some(&[
+                    AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+                    AttributedSubsystem::from_upstream_grant(soc),
+                ]),
+                Some(&["drivers/soc/qcom/smem.c".to_string()]),
+            )
+            .await?;
+        assert!(folded);
+        assert_eq!(
+            db.authorizing_sections_for_bug(dup_id).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            db.get_bug(dup_id).await?.unwrap().attributable_files(),
+            Some(vec!["drivers/soc/qcom/smem.c".to_string()])
+        );
+        let (_, total_after_fold) = db
+            .list_bugs(ListBugsParams {
+                visibility: BugVisibility::Sections(&scope),
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(total_after_fold, 1);
         Ok(())
     }
 
@@ -11215,6 +19074,250 @@ mod tests {
             .await?;
         let legacy_audit: String = legacy_rows.next().await?.unwrap().get(0)?;
         assert_eq!(legacy_audit, "sashiko:sashiko_bug");
+        sashiko_worker_db.abandon_exhausted_bugs(1).await?;
+
+        // Verify a gcc-* bug gets sashiko:gcc_patch_review and sashiko:gcc_bug attribution.
+        let gcc_bug = NewBug {
+            bugid: "gcc-fallback-test".to_string(),
+            title: "GCC fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 3000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("gcc")],
+        };
+        let gcc_bug_id = db
+            .create_bug_with_enrichment(
+                &gcc_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 3000,
+                    content: Some("gcc candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, gcc_bug_id, true).await?;
+
+        let gcc_summaries = db.bug_discovery_summaries(&[gcc_bug_id]).await?;
+        assert_eq!(
+            gcc_summaries[&gcc_bug_id]["tools"],
+            json!(["sashiko:gcc_patch_review"])
+        );
+        let gcc_resolved = db.resolve_bug_model_and_tool(gcc_bug_id).await?;
+        assert_eq!(
+            gcc_resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:gcc_patch_review".to_string()),
+            ))
+        );
+        let claimed_gcc = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending gcc bug to be claimed");
+        assert_eq!(claimed_gcc.id, gcc_bug_id);
+        let mut gcc_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![gcc_bug_id],
+            )
+            .await?;
+        let gcc_audit: String = gcc_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(gcc_audit, "sashiko:gcc_bug");
+
+        // Verify a qemu-* bug gets sashiko:qemu_patch_review and
+        // sashiko:qemu_bug attribution.
+        let qemu_bug = NewBug {
+            bugid: "qemu-fallback-test".to_string(),
+            title: "QEMU fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 4000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("hw/net")],
+        };
+        let qemu_bug_id = db
+            .create_bug_with_enrichment(
+                &qemu_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 4000,
+                    content: Some("qemu candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, qemu_bug_id, true).await?;
+
+        let qemu_summaries = db.bug_discovery_summaries(&[qemu_bug_id]).await?;
+        assert_eq!(
+            qemu_summaries[&qemu_bug_id]["tools"],
+            json!(["sashiko:qemu_patch_review"])
+        );
+        let qemu_resolved = db.resolve_bug_model_and_tool(qemu_bug_id).await?;
+        assert_eq!(
+            qemu_resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:qemu_patch_review".to_string()),
+            ))
+        );
+        let claimed_qemu = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending qemu bug to be claimed");
+        assert_eq!(claimed_qemu.id, qemu_bug_id);
+        let mut qemu_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![qemu_bug_id],
+            )
+            .await?;
+        let qemu_audit: String = qemu_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(qemu_audit, "sashiko:qemu_bug");
+
+        // Verify a zephyr-* bug gets sashiko:zephyr_patch_review and
+        // sashiko:zephyr_bug attribution.
+        let zephyr_bug = NewBug {
+            bugid: "zephyr-fallback-test".to_string(),
+            title: "Zephyr fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 5000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("drivers/spi")],
+        };
+        let zephyr_bug_id = db
+            .create_bug_with_enrichment(
+                &zephyr_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 5000,
+                    content: Some("zephyr candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, zephyr_bug_id, true).await?;
+
+        let zephyr_summaries = db.bug_discovery_summaries(&[zephyr_bug_id]).await?;
+        assert_eq!(
+            zephyr_summaries[&zephyr_bug_id]["tools"],
+            json!(["sashiko:zephyr_patch_review"])
+        );
+        let zephyr_resolved = db.resolve_bug_model_and_tool(zephyr_bug_id).await?;
+        assert_eq!(
+            zephyr_resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:zephyr_patch_review".to_string()),
+            ))
+        );
+        let claimed_zephyr = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending zephyr bug to be claimed");
+        assert_eq!(claimed_zephyr.id, zephyr_bug_id);
+        let mut zephyr_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![zephyr_bug_id],
+            )
+            .await?;
+        let zephyr_audit: String = zephyr_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(zephyr_audit, "sashiko:zephyr_bug");
+
+        // Verify an e2fsprogs-* bug gets sashiko:e2fsprogs_patch_review and
+        // sashiko:e2fsprogs_bug attribution.
+        let e2fs_bug = NewBug {
+            bugid: "e2fsprogs-fallback-test".to_string(),
+            title: "e2fsprogs fallback test".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 6000,
+            discovered_in_patchset_id: Some(ps_id),
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![AttributedSubsystem::from_path_prefix("lib/ext2fs")],
+        };
+        let e2fs_bug_id = db
+            .create_bug_with_enrichment(
+                &e2fs_bug,
+                Some(&NewBugEnrichment {
+                    kind: "candidate".to_string(),
+                    tool: String::new(),
+                    model: None,
+                    created_at: 6000,
+                    content: Some("e2fsprogs candidate".to_string()),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        db.link_review_to_bug(rev_id, e2fs_bug_id, true).await?;
+
+        let e2fs_summaries = db.bug_discovery_summaries(&[e2fs_bug_id]).await?;
+        assert_eq!(
+            e2fs_summaries[&e2fs_bug_id]["tools"],
+            json!(["sashiko:e2fsprogs_patch_review"])
+        );
+        let e2fs_resolved = db.resolve_bug_model_and_tool(e2fs_bug_id).await?;
+        assert_eq!(
+            e2fs_resolved,
+            Some((
+                Some("sashiko-model".to_string()),
+                Some("sashiko:e2fsprogs_patch_review".to_string()),
+            ))
+        );
+        let claimed_e2fs = db
+            .claim_pending_bug("worker-1", 60, 2)
+            .await?
+            .expect("expected pending e2fsprogs bug to be claimed");
+        assert_eq!(claimed_e2fs.id, e2fs_bug_id);
+        let mut e2fs_rows = db
+            .conn
+            .query(
+                "SELECT audit_tool FROM bugs WHERE id = ?",
+                libsql::params![e2fs_bug_id],
+            )
+            .await?;
+        let e2fs_audit: String = e2fs_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(e2fs_audit, "sashiko:e2fsprogs_bug");
 
         Ok(())
     }
@@ -11746,6 +19849,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_patchset_upstream_grant_rows_confer_access() -> Result<()> {
+        let db = setup_db().await;
+        let ps = patchset_for_sections(&db, 1).await?;
+        let soc = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)";
+
+        db.add_patchset_maintainer_sections(
+            ps,
+            &[
+                AttributedSubsystem::from_maintainers("ARM/QUALCOMM SUPPORT"),
+                AttributedSubsystem::from_upstream_grant(soc),
+            ],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec![soc.to_string(), "ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        assert_eq!(
+            db.patchset_maintainer_sections(ps)
+                .await?
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["ARM/QUALCOMM SUPPORT".to_string()],
+            "grant rows are not displayed as ownership"
+        );
+
+        db.replace_patchset_maintainer_sections(
+            ps,
+            &[AttributedSubsystem::from_maintainers(
+                "ARM/QUALCOMM SUPPORT",
+            )],
+        )
+        .await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+
+        db.replace_patchset_upstream_sections(ps, [soc]).await?;
+        db.clear_upstream_sections().await?;
+        assert_eq!(
+            db.authorizing_sections_for_patchset(ps).await?,
+            vec!["ARM/QUALCOMM SUPPORT".to_string()]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_patchset_with_no_sections_authorizes_nobody() -> Result<()> {
         let db = setup_db().await;
         let ps = patchset_for_sections(&db, 1).await?;
@@ -12268,6 +20420,263 @@ mod tests {
         assert_eq!(list[0].status.as_deref(), Some("Pending"));
     }
 
+    /// When review.auto_review = false a completed patchset must wait in
+    /// Awaiting Review until it is manually rerun.
+    #[tokio::test]
+    async fn test_manual_review_patchset_awaits_rerun() {
+        let db = setup_db().await;
+        let db = db.with_auto_review(false);
+        let thread_id = db
+            .create_thread("root_manual", "Manual Review Test", 60000)
+            .await
+            .unwrap();
+        let author = "Manual Author <manual@example.com>";
+
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_manual",
+                "Manual Review Test",
+                author,
+                60000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "msg_manual",
+            thread_id,
+            None,
+            author,
+            "Manual Review Test",
+            60000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_id, "msg_manual", 1, "diff")
+            .await
+            .unwrap();
+
+        // Complete but waiting on an operator: invisible to the Reviewer.
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert!(db.get_pending_patchsets(10).await.unwrap().is_empty());
+        assert!(!db.claim_patchset_for_review(ps_id).await.unwrap());
+
+        // A rerun is the manual trigger that queues the review; it is the
+        // first review, not a re-review, so the count stays put.
+        db.rerun_patchset(ps_id).await.unwrap();
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(list[0].status.as_deref(), Some("Pending"));
+        assert_eq!(db.get_pending_patchsets(10).await.unwrap()[0].id, ps_id);
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT target_review_count FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let count: Option<u32> = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count.unwrap_or(1), 1);
+
+        // A series that is still waiting can be withdrawn without force.
+        let thread_id = db
+            .create_thread("root_manual_cancel", "Manual Cancel Test", 60001)
+            .await
+            .unwrap();
+        let ps_cancel = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_manual_cancel",
+                "Manual Cancel Test",
+                author,
+                60001,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "msg_manual_cancel",
+            thread_id,
+            None,
+            author,
+            "Manual Cancel Test",
+            60001,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_cancel, "msg_manual_cancel", 1, "diff")
+            .await
+            .unwrap();
+        let list = db
+            .get_patchsets(2, 0, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.id == ps_cancel)
+            .collect::<Vec<_>>();
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert!(db.cancel_patchset(ps_cancel, false).await.unwrap());
+        let list = db
+            .get_patchsets(2, 0, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.id == ps_cancel)
+            .collect::<Vec<_>>();
+        assert_eq!(list[0].status.as_deref(), Some("Cancelled"));
+    }
+
+    /// With review.auto_review = false, unversioned patches that complete a
+    /// series flip it to Awaiting Review. A versioned cover letter from the
+    /// same git send-email batch that arrives afterwards must still attach to
+    /// it, exactly like it would attach to a Pending series.
+    #[tokio::test]
+    async fn test_late_versioned_cover_attaches_to_awaiting_review_series() {
+        let db = setup_db().await;
+        let db = db.with_auto_review(false);
+        let author = "Batch Author <batch@example.com>";
+        // git send-email stamps one timestamp prefix per batch; a prefix
+        // longer than ten characters is the same-batch signal.
+        let prefix = "20261103t0512000001";
+        let msgid = |n: u32| format!("{prefix}-{n}-batch@example.com");
+        let thread_id = db
+            .create_thread(&msgid(1), "Batch Series", 61000)
+            .await
+            .unwrap();
+
+        // Patches 1/2 and 2/2 arrive first, without a version tag.
+        let mut ps_id = None;
+        for (part, subj) in [(1, "[PATCH 1/2] One"), (2, "[PATCH 2/2] Two")] {
+            db.create_message(
+                &msgid(part),
+                thread_id,
+                None,
+                author,
+                subj,
+                61000 + i64::from(part),
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let id = db
+                .create_patchset(
+                    thread_id,
+                    None,
+                    &msgid(part),
+                    subj,
+                    author,
+                    61000 + i64::from(part),
+                    2,
+                    1,
+                    "",
+                    "",
+                    None,
+                    part,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            ps_id = Some(id);
+            db.create_patch(id, &msgid(part), part, "diff")
+                .await
+                .unwrap();
+        }
+        let ps_id = ps_id.unwrap();
+        let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+
+        // The versioned cover letter arrives last, from the same batch.
+        db.create_message(
+            &msgid(0),
+            thread_id,
+            None,
+            author,
+            "[PATCH 0/2 v2] Batch Series",
+            61003,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let cover_id = db
+            .create_patchset(
+                thread_id,
+                Some(&msgid(0)),
+                &msgid(0),
+                "[PATCH 0/2 v2] Batch Series",
+                author,
+                61003,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // It attaches to the existing series rather than orphaning a row.
+        assert_eq!(cover_id, Some(ps_id));
+        let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(list.len(), 1, "the late cover must not split the series");
+        assert_eq!(list[0].status.as_deref(), Some("Awaiting Review"));
+        assert_eq!(
+            list[0].subject.as_deref(),
+            Some("[PATCH 0/2 v2] Batch Series")
+        );
+    }
+
     #[tokio::test]
     async fn test_embargoed_patchset_dynamic_recalculation() {
         let db = setup_db().await;
@@ -12376,6 +20785,249 @@ mod tests {
         );
     }
 
+    /// A series whose only patch inherited a clean verdict is clean and
+    /// releasable, exactly as if the model had run and found nothing.
+    #[tokio::test]
+    async fn test_inherited_clean_skip_counts_as_a_clean_review() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("root_inherited_embargo", "Inherited", 70000)
+            .await
+            .unwrap();
+        db.create_message(
+            "msg_inherited_embargo",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Inherited",
+            70000,
+            "body",
+            "list@example.com",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "msg_inherited_embargo",
+                "Inherited",
+                "Author <author@example.com>",
+                70000,
+                1,
+                1,
+                "list@example.com",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "msg_inherited_embargo", 1, "diff")
+            .await
+            .unwrap();
+
+        // The review being inherited from lives on another patch; any
+        // completed review id serves the foreign key here.
+        let prior_review = db
+            .create_review(ps_id, None, "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(prior_review, "Reviewed", "done", None, None, None, None)
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Skipped",
+            "Skipped: unchanged",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.set_review_inherited_from(review_id, prior_review)
+            .await
+            .unwrap();
+        db.update_patch_status(patch_id, "Skipped").await.unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        // Remove the helper row so only the inherited Skipped row remains.
+        db.conn
+            .execute(
+                "UPDATE reviews SET status = 'Cancelled' WHERE id = ?",
+                libsql::params![prior_review],
+            )
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().timestamp();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+        // Behind the embargo the patch reads as any reviewed patch does,
+        // so a viewer cannot tell which patches came out clean.
+        for view in [
+            db.get_patchset_details(ps_id, None, None).await.unwrap(),
+            db.get_patchset_summary(ps_id, None, None).await.unwrap(),
+        ] {
+            let view = view.unwrap();
+            assert_eq!(view["patches"][0]["status"], "Embargoed");
+        }
+
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(releasable.iter().any(|patchset| patchset.id == ps_id));
+        assert!(db.claim_patchset_embargo_release(ps_id, now).await.unwrap());
+
+        // The inherited row is one finished pass for the retry accounting.
+        assert_eq!(
+            db.count_successful_reviews(ps_id, patch_id, None)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Provenance alone proves nothing: a row that failed after the
+        // provenance was written neither counts nor makes the series clean.
+        db.conn
+            .execute(
+                "UPDATE reviews SET status = 'Failed' WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.count_successful_reviews(ps_id, patch_id, None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        // Reclaiming a row for a fresh model run drops the provenance so a
+        // review the model produces is never mistaken for an inherited one.
+        db.conn
+            .execute(
+                "UPDATE reviews SET status = 'Pending' WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        db.set_review_baseline_commit(review_id, "tree")
+            .await
+            .unwrap();
+        db.set_review_coverage(
+            review_id,
+            &ReviewCoverage::new(true, Some(&["security".to_string()])),
+        )
+        .await
+        .unwrap();
+        let reclaimed = db
+            .claim_pending_review_id(ps_id, Some(patch_id))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, Some(review_id));
+        let mut row = db
+            .conn
+            .query(
+                "SELECT inherited_from_review_id, baseline_commit, stages, cheap
+                 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = row.next().await.unwrap().unwrap();
+        for column in 0..3 {
+            assert!(matches!(
+                row.get::<libsql::Value>(column).unwrap(),
+                libsql::Value::Null
+            ));
+        }
+        // The coverage of the run that was given up goes with it, so the
+        // row reads as a full review until the next run says otherwise.
+        assert_eq!(row.get::<i64>(3).unwrap(), 0);
+    }
+
+    /// A rerun that clears an interrupted attempt keeps the pending
+    /// Patchwork check of a patch whose finished pass inherited its
+    /// verdict, as it keeps the check of a Reviewed one.
+    #[tokio::test]
+    async fn test_rerun_keeps_inherited_patchwork_check() -> Result<()> {
+        let db = setup_db().await;
+        let pid = "0123456789abcdef0123456789abcdef01234567";
+        let (src_ps, src_patch) =
+            create_series_with_patch_id(&db, "src", Some(1), "d", pid).await?;
+        let source = complete_clean_review(&db, src_ps, src_patch, "pro").await?;
+        let (ps_id, patch_id) = create_series_with_patch_id(&db, "dup", Some(2), "d", pid).await?;
+
+        let inherited = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.complete_review(inherited, "Skipped", "inherited", None, None, None, None)
+            .await?;
+        db.set_review_inherited_from(inherited, source).await?;
+        db.insert_patchwork_outbox(
+            "<dup@example.org>",
+            "https://patchwork.example.org/api",
+            "success",
+            "clean",
+            "https://sashiko.example.org/",
+            "sashiko",
+        )
+        .await?;
+        // The attempt a rerun started and did not finish.
+        let interrupted = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+
+        db.rerun_patchset(ps_id).await?;
+
+        // The interrupted attempt is gone, so the cleanup did run.
+        let mut gone = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM reviews WHERE id = ?",
+                libsql::params![interrupted],
+            )
+            .await?;
+        assert_eq!(gone.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchwork_outbox WHERE patch_msg_id = '<dup@example.org>'",
+                (),
+            )
+            .await?;
+        assert_eq!(rows.next().await?.unwrap().get::<i64>(0)?, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_clean_patchset_is_releasable_before_embargo_expiry() {
         let db = setup_db().await;
@@ -12475,6 +21127,47 @@ mod tests {
         );
         db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
 
+        // An unmailed related pre-existing bug is held by the embargo too.
+        db.reserve_preexisting_disclosures(
+            "msg_clean_embargo",
+            &[NewPreexistingDisclosure {
+                fingerprint: "fp".to_string(),
+                problem: "related".to_string(),
+                severity: Severity::High,
+                relation: DisclosureRelation::SameCode,
+                locations_json: "[]".to_string(),
+                bug_key_json: "{}".to_string(),
+                report_text: "note".to_string(),
+                files: vec!["mm/foo.c".to_string()],
+                bug_id: None,
+                bugid: None,
+            }],
+            |_, _| false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::HasFindings
+        );
+        let releasable = db
+            .get_releasable_embargoed_patchsets(now, 10)
+            .await
+            .unwrap();
+        assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, now + 1201)
+                .await
+                .unwrap()
+        );
+        db.mark_preexisting_disclosed("msg_clean_embargo")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+
         db.create_finding(Finding {
             review_id,
             severity: Severity::Low,
@@ -12495,6 +21188,103 @@ mod tests {
             .await
             .unwrap();
         assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    #[tokio::test]
+    async fn test_patchset_predecessor_titles_walk_the_chain() {
+        let db = setup_db().await;
+        let mut ids = Vec::new();
+        for (i, subject) in [
+            "[RFC] mm: first idea",
+            "[RFC v2] mm: second idea",
+            "[PATCH] mm: final idea",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let msg = format!("chain-{i}@x");
+            // Distinct authors and subjects keep the three postings apart.
+            let author = format!("A{i} <a{i}@x>");
+            let thread_id = db
+                .create_thread(&msg, subject, 1000 + i as i64)
+                .await
+                .unwrap();
+            db.create_message(
+                &msg,
+                thread_id,
+                None,
+                &author,
+                subject,
+                1000 + i as i64,
+                "body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ps_id = db
+                .create_patchset(
+                    thread_id,
+                    None,
+                    &msg,
+                    subject,
+                    &author,
+                    1000 + i as i64,
+                    1,
+                    1,
+                    "",
+                    "",
+                    None,
+                    1,
+                    None,
+                    false,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            ids.push(ps_id);
+        }
+        for pair in ids.windows(2) {
+            db.execute(
+                "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+                libsql::params![pair[0], pair[1]],
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.get_patchset_predecessor_titles(ids[2]).await.unwrap(),
+            vec![
+                "[RFC v2] mm: second idea".to_string(),
+                "[RFC] mm: first idea".to_string()
+            ]
+        );
+        assert!(
+            db.get_patchset_predecessor_titles(ids[0])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A cycle stops instead of looping.
+        db.execute(
+            "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+            libsql::params![ids[2], ids[0]],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_predecessor_titles(ids[2])
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -15941,6 +24731,74 @@ mod tests {
         assert_eq!(updated["failed_reason"], "Fetch failed: timeout");
     }
 
+    #[tokio::test]
+    async fn test_injection_msgid_lookup_requires_a_unique_patchset() {
+        let db = setup_db().await;
+        let submission_id = "sashiko-inject-1-2@sashiko.local";
+        let thread_id = db
+            .ensure_thread_for_message(submission_id, 1000)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_patchset_id_by_msgid(submission_id).await.unwrap(),
+            None
+        );
+
+        for id in [1, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO patchsets (id, thread_id) VALUES (?, ?)",
+                    libsql::params![id, thread_id],
+                )
+                .await
+                .unwrap();
+            let expected = (id == 1).then_some(1);
+            for msgid in [
+                submission_id.to_string(),
+                format!("<{submission_id}>"),
+                "sashiko-inject-1-2".to_string(),
+            ] {
+                assert_eq!(
+                    db.find_patchset_id_by_msgid(&msgid).await.unwrap(),
+                    expected
+                );
+            }
+        }
+
+        // A direct identity still wins when its thread contains other series.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET cover_letter_message_id = ? WHERE id = 2",
+                libsql::params![submission_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_patchset_id_by_msgid(submission_id).await.unwrap(),
+            Some(2)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thread_lookup_does_not_alias_other_messages() {
+        let db = setup_db().await;
+        for msgid in [
+            "ordinary@example.com",
+            "sashiko-thread-1-2@sashiko.local",
+            "0123456789@sashiko.local",
+        ] {
+            let thread_id = db.ensure_thread_for_message(msgid, 1000).await.unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO patchsets (thread_id) VALUES (?)",
+                    libsql::params![thread_id],
+                )
+                .await
+                .unwrap();
+            assert_eq!(db.find_patchset_id_by_msgid(msgid).await.unwrap(), None);
+        }
+    }
+
     /// Until the repair migration has run, a cover letter message id can name
     /// two patchsets, because a series posted as a reply used to adopt the
     /// thread root as its own cover letter. The id resolves to the series that
@@ -16093,6 +24951,168 @@ mod tests {
                 .await
                 .unwrap(),
             "a message that was never ingested announces nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_find_in_thread_followup_version_promotes_author_v2_only() {
+        let db = setup_db().await;
+        let root_msg = "DM5P3EUN8K3T.1YPA4GAZE4SQL@gmail.com";
+        let v1_subject = "[PATCH] lra: Handle subregs in get_dependent_filter.";
+        let author = "\"Robin Dapp\" <rdapp.gcc@gmail.com>";
+        let reviewer = "\"Jeffrey Law\" <jeffrey.law@oss.qualcomm.com>";
+        let v1_diff = "diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc\n\
+                       --- a/gcc/lra-constraints.cc\n\
+                       +++ b/gcc/lra-constraints.cc\n\
+                       @@ -1 +1 @@\n-int x = 0;\n+int x = 1;\n";
+        let v2_diff = "diff --git a/gcc/lra-constraints.cc b/gcc/lra-constraints.cc\n\
+                       --- a/gcc/lra-constraints.cc\n\
+                       +++ b/gcc/lra-constraints.cc\n\
+                       @@ -1 +1 @@\n-int x = 0;\n+int x = 2;\n";
+
+        let thread_id = db.create_thread(root_msg, v1_subject, 1000).await.unwrap();
+        db.create_message(
+            root_msg, thread_id, None, author, v1_subject, 1000, v1_diff, "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                thread_id,
+                Some(root_msg),
+                root_msg,
+                v1_subject,
+                author,
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch_with_git_patch_id(ps1, root_msg, 1, v1_diff, Some("patchid-v1"))
+            .await
+            .unwrap();
+
+        let reply_subject = "Re: [PATCH] lra: Handle subregs in get_dependent_filter.";
+        let reply_msg = "DM8X7UJLCWHH.162RS1KRBL419@gmail.com";
+
+        // Different author replying in the thread is not promoted.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                reviewer,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        // Same author reposting the identical diff is not promoted.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v1"),
+                v1_diff,
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        // Same author posting an updated diff in-thread is promoted to v2.
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            Some(2)
+        );
+
+        // Even if a Fetching placeholder row already exists for reply_msg in the
+        // same thread, promotion to v2 still succeeds.
+        db.create_message(
+            reply_msg,
+            thread_id,
+            Some(root_msg),
+            author,
+            reply_subject,
+            1001,
+            v2_diff,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, author, date, status, total_parts, received_parts) \
+                 VALUES (?, ?, 'Fetching thread', 'Loading...', 1001, 'Fetching', 1, 0)",
+                libsql::params![thread_id, reply_msg],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            Some(2)
+        );
+
+        // Overflowing u32::MAX returns None rather than panicking or wrapping.
+        let max_ver_subject = format!(
+            "[PATCH v{}] lra: Handle subregs in get_dependent_filter.",
+            u32::MAX
+        );
+        db.conn
+            .execute(
+                "UPDATE patchsets SET subject = ? WHERE id = ?",
+                libsql::params![max_ver_subject, ps1],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.find_in_thread_followup_version(
+                thread_id,
+                reply_msg,
+                author,
+                reply_subject,
+                Some("patchid-v2"),
+                v2_diff,
+            )
+            .await
+            .unwrap(),
+            None
         );
     }
 
@@ -18661,6 +27681,17 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(items[0].id, mine);
 
+        let (items_upper, total_upper) = db
+            .list_bugs(ListBugsParams {
+                assignee: Some(AssigneeFilter::Is("ME@EXAMPLE.ORG")),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(total_upper, 1);
+        assert_eq!(items_upper[0].id, mine);
+
         let (items, total) = db
             .list_bugs(ListBugsParams {
                 assignee: Some(AssigneeFilter::Unassigned),
@@ -20217,6 +29248,162 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_forge_outbox_upgrades_incomplete_review_to_completed() {
+        let db = setup_db().await;
+
+        let ps_id = db
+            .create_fetching_patchset(
+                "mr-733-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #733",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/733"),
+                Some("Fix workflow retry"),
+                Some(733),
+                Some("sashiko-733"),
+            )
+            .await
+            .unwrap();
+
+        let incomplete_v1 = format!(
+            "### Sashiko review\n\n{} — 2 of 3 commits failed to complete review (`2/3`, `3/3`).\n",
+            crate::forge::INCOMPLETE_REVIEW_MARKER
+        );
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v1,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // While still unsent (Pending/Embargoed/Dry-Run), a partial re-run that
+        // discovers new findings updates the unsent incomplete row in place.
+        let incomplete_v2 = format!(
+            "### Sashiko review\n\n{} — 1 of 3 commits failed to complete review (`3/3`).\n\n#### Commit 2/3 — bug\n\nSeverity: HIGH\n",
+            crate::forge::INCOMPLETE_REVIEW_MARKER
+        );
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v2,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // Claim the incomplete row so it is in status = 'Sending' (in flight).
+        let in_flight = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("should claim updated incomplete row");
+        assert_eq!(in_flight.body, incomplete_v2);
+
+        // Upgrading to a completed review while the prior incomplete row is in
+        // flight ('Sending') replaces it with a fresh row ID so the worker's
+        // completion of the stale body cannot clobber the completed review.
+        let completed_body = "### Sashiko review\n\n✓ **No issues found** across 3 commits.\n";
+        db.insert_forge_outbox(
+            ps_id,
+            "github",
+            "sashiko-dev/sashiko",
+            733,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            completed_body,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+            "Pending",
+        )
+        .await
+        .unwrap();
+
+        // Stale worker finishing the old row (whether Sent or retry) is a no-op.
+        db.mark_forge_outbox_sent(in_flight.id).await.unwrap();
+        db.set_forge_outbox_retry_at(in_flight.id, 9_999_999_999, "stale 502")
+            .await
+            .unwrap();
+
+        let upgraded = db
+            .lock_pending_forge_outbox()
+            .await
+            .unwrap()
+            .expect("upgraded completed review should remain claimable");
+        assert!(upgraded.id > in_flight.id);
+        assert_eq!(upgraded.retry_count, 0);
+        assert_eq!(upgraded.body, completed_body);
+        db.mark_forge_outbox_sent(upgraded.id).await.unwrap();
+
+        // Also verify embargoed Failed patchsets hold while embargo_until > now
+        // and release once embargo_until <= now.
+        let now = chrono::Utc::now().timestamp();
+        let emb_ps = db
+            .create_fetching_patchset(
+                "mr-734-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #734",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/734"),
+                Some("Embargoed partial failure"),
+                Some(734),
+                Some("sashiko-734"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(emb_ps, "Failed").await.unwrap();
+        db.set_patchset_embargo_until(emb_ps, now + 3600)
+            .await
+            .unwrap();
+        db.insert_forge_outbox(
+            emb_ps,
+            "github",
+            "sashiko-dev/sashiko",
+            734,
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            &incomplete_v2,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-734",
+            "Embargoed",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !db.get_releasable_embargoed_patchsets(now, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == emb_ps)
+        );
+        assert!(
+            !db.claim_patchset_embargo_release(emb_ps, now)
+                .await
+                .unwrap()
+        );
+
+        assert!(
+            db.get_releasable_embargoed_patchsets(now + 3601, 10)
+                .await
+                .unwrap()
+                .iter()
+                .any(|p| p.id == emb_ps)
+        );
+        assert!(
+            db.claim_patchset_embargo_release(emb_ps, now + 3601)
+                .await
+                .unwrap()
+        );
+        assert_eq!(db.release_embargoed_forge_outbox(emb_ps).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
     async fn test_superseded_pr_versions_cancel_all_previous_and_outbox() {
         let db = setup_db().await;
         let mr_url = "https://github.com/sashiko-dev/sashiko/pull/515";
@@ -20798,6 +29985,56 @@ mod tests {
         .await
         .unwrap();
 
+        // Simulate a self-referential previous_patch_id between p2_a and p2_b
+        // and a downstream v2 patchset (30) pointing to patchset 20 and p1_b.
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'modified' WHERE id = ?",
+                libsql::params![p2_b, p2_a],
+            )
+            .await
+            .unwrap();
+        let v2_thread = db
+            .create_thread(
+                "20260921000000.200-1-author@example.com",
+                "[PATCH v2 1/1] Other series",
+                200000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "20260921000000.200-1-author@example.com",
+            v2_thread,
+            None,
+            author,
+            "[PATCH v2 1/1] Other series",
+            200000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, thread_id, cover_letter_message_id, subject, subject_index, author, date, status, total_parts, received_parts, previous_patchset_id)
+                 VALUES (30, ?, '20260921000000.200-1-author@example.com', '[PATCH v2 1/1] Other series', 1, ?, 200000, 'Pending', 1, 1, 20)",
+                libsql::params![v2_thread, author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patches (id, patchset_id, message_id, part_index, previous_patch_id, previous_patch_status)
+                 VALUES (300, 30, '20260921000000.200-1-author@example.com', 1, ?, 'modified')",
+                libsql::params![p1_b],
+            )
+            .await
+            .unwrap();
+        let p1_v2 = 300i64;
+
         // Ingesting 0/3 matches both patchset 10 and patchset 20 and merges 20 into 10.
         let merged_id = db
             .create_patchset(
@@ -20854,6 +30091,56 @@ mod tests {
             eo2_rows.next().await.unwrap().is_none(),
             "merging duplicate patches must not create duplicate email_outbox rows"
         );
+
+        // Verify downstream previous_patchset_id and previous_patch_id were re-pointed,
+        // and self-referential previous_patch_id on p2_a was cleared.
+        let mut v2_ps_rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id FROM patchsets WHERE id = 30",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            v2_ps_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            10
+        );
+        let mut v2_p_rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id FROM patches WHERE id = ?",
+                libsql::params![p1_v2],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            v2_p_rows
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            p1_a
+        );
+        let mut p2_self_rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id, previous_patch_status FROM patches WHERE id = ?",
+                libsql::params![p2_a],
+            )
+            .await
+            .unwrap();
+        let p2_self_row = p2_self_rows.next().await.unwrap().unwrap();
+        assert_eq!(p2_self_row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(p2_self_row.get::<Option<String>>(1).unwrap(), None);
 
         // Verify patches_subsystems was transferred to p1_a
         let mut ps_rows = db
@@ -22370,6 +31657,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_bug_returning_with_open_read_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("bug_read_back.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        for i in 0..3 {
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Subject {i}"), format!("<msg-{i}>")],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Concurrent tasks holding stepped cursors across every pooled read
+        // handle keep all read connections on the WAL snapshot taken before the
+        // bug is committed on `tx_conn`.
+        let mut cursors = Vec::new();
+        for reader in db.read_pool.iter() {
+            let mut cursor = reader
+                .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+                .await
+                .unwrap();
+            assert!(cursor.next().await.unwrap().is_some());
+            cursors.push(cursor);
+        }
+
+        let new_bug = |bugid: &str| NewBug {
+            bugid: bugid.to_string(),
+            title: "Read back after insert".to_string(),
+            lifecycle_status: BugLifecycleStatus::New,
+            pipeline_state: BugPipelineState::Pending,
+            assignee: None,
+            reporter: "sashiko".to_string(),
+            reported_at: 1,
+            discovered_in_patchset_id: None,
+            discovered_in_patch_id: None,
+            discovered_in_commit: None,
+            source_ref: None,
+            vector_json: None,
+            duplicate_of_id: None,
+            subsystems: vec![],
+        };
+        let enrichment = NewBugEnrichment {
+            kind: "candidate".to_string(),
+            content: Some("reasoning".to_string()),
+            ..Default::default()
+        };
+
+        // The stale snapshot is what made the old read-back return None.
+        let id = db
+            .create_bug_with_enrichment(&new_bug("linux-stale"), Some(&enrichment))
+            .await
+            .unwrap();
+        assert!(db.get_bug(id).await.unwrap().is_none());
+        assert!(
+            db.get_bug_on_write_conn(id).await.unwrap().is_some(),
+            "the write connection must see its own commit"
+        );
+
+        let bug = db
+            .create_bug_with_enrichment_returning(&new_bug("linux-fresh"), Some(&enrichment))
+            .await
+            .expect("the created bug must be returned despite the open cursor");
+        assert_eq!(bug.bugid, "linux-fresh");
+        assert!(bug.enrichments.iter().any(|e| e.kind == "candidate"));
+
+        drop(cursors);
+        assert!(db.get_bug(bug.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
     async fn test_transaction_commit_with_open_read_cursor() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("cursor_isolation.db");
@@ -22432,6 +31796,235 @@ mod tests {
 
         let second = cursor.next().await.unwrap();
         assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_and_review_queries_with_pinned_conn_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pinned_patchset_snapshot.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        for i in 0..3 {
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Seed {i}"), format!("<seed-{i}>")],
+            )
+            .await
+            .unwrap();
+        }
+
+        // Pin `db.conn` (`read_pool[0]`) on the pre-ingestion WAL snapshot so
+        // any residual `self.conn.query(...)` or cross-connection snapshot skew
+        // in `create_patchset_inner` would miss rows committed afterwards.
+        let mut pinned_conn_cursor = db
+            .conn
+            .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+            .await
+            .unwrap();
+        assert!(pinned_conn_cursor.next().await.unwrap().is_some());
+
+        // 1. A `Fetching` placeholder (`author = NULL`) created after `db.conn`
+        // was pinned must still be matched and upgraded in place by
+        // `create_patchset` without hitting `NullValue` in Step 2 or inserting
+        // a duplicate row in Step 3.
+        let fetch_clid = "deadbeef@sashiko.local";
+        let placeholder_id = db
+            .create_fetching_patchset(
+                fetch_clid,
+                "(placeholder)",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let tid_fetch = db
+            .create_thread("deadbeef", "[PATCH] Fetched singleton", 1700000100)
+            .await
+            .unwrap();
+        db.create_message(
+            "deadbeef",
+            tid_fetch,
+            None,
+            "Author <author@example.com>",
+            "[PATCH] Fetched singleton",
+            1700000100,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let matched_placeholder_id = db
+            .create_patchset(
+                tid_fetch,
+                Some(fetch_clid),
+                "deadbeef",
+                "[PATCH] Fetched singleton",
+                "Author <author@example.com>",
+                1700000100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .expect("create_patchset must upgrade Fetching placeholder cleanly")
+            .unwrap();
+        assert_eq!(matched_placeholder_id, placeholder_id);
+        let patch_id = db
+            .create_patch(placeholder_id, "deadbeef", 1, "diff --git a/f.c b/f.c\n")
+            .await
+            .unwrap();
+
+        // 2. A cover letter (0/2) followed by patch 1/2 while `db.conn` remains
+        // pinned on the older snapshot must attach 1/2 to the cover letter's
+        // patchset instead of inserting a duplicate patchset row.
+        let cover_id = "20261111000000.100-1-author@example.com";
+        let part1_id = "20261111000000.100-2-author@example.com";
+        let tid_series = db
+            .create_thread(cover_id, "[PATCH 0/2] Series cover", 1700000200)
+            .await
+            .unwrap();
+        db.create_message(
+            cover_id,
+            tid_series,
+            None,
+            "Author <author@example.com>",
+            "[PATCH 0/2] Series cover",
+            1700000200,
+            "cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            part1_id,
+            tid_series,
+            Some(cover_id),
+            "Author <author@example.com>",
+            "[PATCH 1/2] Part one",
+            1700000201,
+            "part 1 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let series_ps_0 = db
+            .create_patchset(
+                tid_series,
+                Some(cover_id),
+                cover_id,
+                "[PATCH 0/2] Series cover",
+                "Author <author@example.com>",
+                1700000200,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let series_ps_1 = db
+            .create_patchset(
+                tid_series,
+                Some(cover_id),
+                part1_id,
+                "[PATCH 1/2] Part one",
+                "Author <author@example.com>",
+                1700000201,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(series_ps_1, series_ps_0);
+
+        let mut count_rows = db
+            .tx_conn
+            .query("SELECT COUNT(*) FROM patchsets", ())
+            .await
+            .unwrap();
+        let total_patchsets: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        drop(count_rows);
+        assert_eq!(total_patchsets, 2);
+
+        // 3. `count_successful_reviews` and `has_failed_review` must route
+        // through `read_conn()` rather than the pinned `db.conn` handle.
+        let ok_rev = db
+            .create_review(placeholder_id, Some(patch_id), "gemini", "pro", None, None)
+            .await
+            .unwrap();
+        db.complete_review(ok_rev, "Reviewed", "clean", Some("clean"), None, None, None)
+            .await
+            .unwrap();
+        let fail_rev = db
+            .create_review(placeholder_id, Some(patch_id), "gemini", "pro", None, None)
+            .await
+            .unwrap();
+        db.update_review_status(fail_rev, "Failed", Some("infra timeout"))
+            .await
+            .unwrap();
+
+        // Advance `read_cursor` off index 0 (`db.conn`) so `read_conn()` uses
+        // the unpinned pooled readers while `pinned_conn_cursor` stays open.
+        db.read_cursor
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            db.count_successful_reviews(placeholder_id, patch_id, None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(
+            db.has_failed_review(placeholder_id, patch_id, None)
+                .await
+                .unwrap()
+        );
+
+        assert!(pinned_conn_cursor.next().await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -22521,6 +32114,3337 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_migrate_v14_version_lineage_columns() {
+        let db = setup_db().await;
+        let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: u32 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(version, 24);
+
+        for (table, expected_cols) in [
+            (
+                "patchsets",
+                &[
+                    "version",
+                    "change_id",
+                    "previous_patchset_id",
+                    "version_link_signal",
+                ][..],
+            ),
+            ("patches", &["previous_patch_id", "previous_patch_status"]),
+        ] {
+            let mut cols = db
+                .conn
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut col_names = Vec::new();
+            while let Some(row) = cols.next().await.unwrap() {
+                col_names.push(row.get::<String>(1).unwrap());
+            }
+            for col in expected_cols {
+                assert!(
+                    col_names.iter().any(|c| c == col),
+                    "expected column {col} on table {table}, found {col_names:?}"
+                );
+            }
+        }
+
+        for expected_idx in [
+            "idx_patchsets_change_id",
+            "idx_patchsets_previous_patchset_id",
+            "idx_patchsets_author_email_date",
+            "idx_patches_previous_patch_id",
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    libsql::params![expected_idx],
+                )
+                .await
+                .unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 1, "expected index {expected_idx} to exist");
+        }
+
+        // Verify duplicate patchset merge re-points previous_patchset_id and
+        // previous_patch_id without FK violations.
+        let m0 = "20261012220000.12345-0-a@kernel.org";
+        let m1 = "20261012220000.12345-1-a@kernel.org";
+        let m2 = "20261012220000.12345-2-a@kernel.org";
+        let t1 = db
+            .create_thread(m1, "[PATCH 1/2] foo: part 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            m1,
+            t1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 1/2] foo: part 1",
+            1000,
+            "body1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                None,
+                m1,
+                "[PATCH 1/2] foo: part 1",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _patch1_ps1 = db.create_patch(ps1, m1, 1, "diff1").await.unwrap();
+
+        let t2 = db
+            .create_thread("other-root@kernel.org", "[PATCH 2/2] foo: part 2", 1001)
+            .await
+            .unwrap();
+        db.create_message(
+            m2,
+            t2,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 2/2] foo: part 2",
+            1001,
+            "body2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        // Force ps2 to be created as a separate incomplete patchset before the cover letter links them
+        let ps2 = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH 2/2] foo: part 2', 'Author <a@kernel.org>', 1001, 2, 0, 'Incomplete', 1, '', '', 2, 1) RETURNING id",
+                libsql::params![t2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch2_ps2 = db.create_patch(ps2, m2, 2, "diff2").await.unwrap();
+
+        // Point a downstream patchset and patch at ps2 / patch2_ps2 before merging ps2 into ps1
+        let t3 = db
+            .create_thread("v2@kernel.org", "[PATCH 1/2] bar: downstream", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "v2@kernel.org",
+            t3,
+            None,
+            "Other <b@kernel.org>",
+            "[PATCH 0/2] bar: downstream",
+            2000,
+            "cover-v2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "v2-p2@kernel.org",
+            t3,
+            Some("v2@kernel.org"),
+            "Other <b@kernel.org>",
+            "[PATCH 2/2] bar: downstream",
+            2000,
+            "body2-v2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps3 = db
+            .create_patchset(
+                t3,
+                Some("v2@kernel.org"),
+                "v2@kernel.org",
+                "[PATCH 1/2] bar: downstream",
+                "Other <b@kernel.org>",
+                2000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch2_ps3 = db
+            .create_patch(ps3, "v2-p2@kernel.org", 2, "diff2-v2")
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, change_id = 'cid-1', version = 1 WHERE id = ?",
+                libsql::params![ps1, ps2],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ? WHERE id = ?",
+                libsql::params![ps2, ps3],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'unchanged' WHERE id = ?",
+                libsql::params![patch2_ps2, patch2_ps3],
+            )
+            .await
+            .unwrap();
+
+        // Arriving cover letter merges ps2 into ps1
+        db.create_message(
+            m0,
+            t1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 0/2] foo: cover",
+            1000,
+            "cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_id = db
+            .create_patchset(
+                t1,
+                Some(m0),
+                m0,
+                "[PATCH 0/2] foo: cover",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_id, ps1);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id FROM patchsets WHERE id = ?",
+                libsql::params![ps3],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            ps1
+        );
+        drop(rows);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id FROM patches WHERE id = ?",
+                libsql::params![patch2_ps3],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
+            patch2_ps2
+        );
+        drop(rows);
+    }
+
+    #[tokio::test]
+    async fn test_merge_self_linked_patchsets_clears_signal_and_preserves_upstream_patch_lineage() {
+        let db = setup_db().await;
+
+        // Case 1: Two partial patchsets temporarily linked to each other with no
+        // external previous version; merging them must clear BOTH previous_patchset_id
+        // and version_link_signal rather than leaving a dangling version_link_signal.
+        let s0 = "20261012230000.11111-0-a@kernel.org";
+        let s1 = "20261012230000.11111-1-a@kernel.org";
+        let s2 = "20261012230000.11111-2-a@kernel.org";
+        let t_self = db
+            .create_thread(s1, "[PATCH 1/2] self-link: part 1", 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            s1,
+            t_self,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 1/2] self-link: part 1",
+            1000,
+            "body1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_a = db
+            .create_patchset(
+                t_self,
+                None,
+                s1,
+                "[PATCH 1/2] self-link: part 1",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = db.create_patch(ps_a, s1, 1, "diff1").await.unwrap();
+
+        let t_self2 = db
+            .create_thread(
+                "other-self@kernel.org",
+                "[PATCH 2/2] self-link: part 2",
+                1001,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            s2,
+            t_self2,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 2/2] self-link: part 2",
+            1001,
+            "body2",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_b = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH 2/2] self-link: part 2', 'Author <a@kernel.org>', 1001, 2, 0, 'Incomplete', 1, 'to@kernel.org', '', 2, 1) RETURNING id",
+                libsql::params![t_self2],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = db.create_patch(ps_b, s2, 2, "diff2").await.unwrap();
+        assert_ne!(ps_a, ps_b);
+
+        // Temporarily link ps_a <-> ps_b before cover-letter arrival merges them.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_b, ps_a],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_a, ps_b],
+            )
+            .await
+            .unwrap();
+
+        db.create_message(
+            s0,
+            t_self,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH 0/2] self-link: cover",
+            1000,
+            "cover",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_self = db
+            .create_patchset(
+                t_self,
+                Some(s0),
+                s0,
+                "[PATCH 0/2] self-link: cover",
+                "Author <a@kernel.org>",
+                1000,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_self, ps_a);
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![merged_self],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<Option<i64>>(0).unwrap(), None);
+        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+        drop(rows);
+
+        // Case 2: Surviving target patch row temporarily pointed to merge_from's
+        // duplicate patch row while merge_from's patch row pointed to the real
+        // upstream v1 patch; merging must preserve the upstream v1 patch link and
+        // the upstream version_link_signal.
+        let t_v1 = db
+            .create_thread("v1_up@kernel.org", "[PATCH] upstream", 900)
+            .await
+            .unwrap();
+        db.create_message(
+            "v1_up@kernel.org",
+            t_v1,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH] upstream",
+            900,
+            "v1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v1 = db
+            .create_patchset(
+                t_v1,
+                Some("v1_up@kernel.org"),
+                "v1_up@kernel.org",
+                "[PATCH] upstream",
+                "Author <a@kernel.org>",
+                900,
+                1,
+                1,
+                "to@kernel.org",
+                "",
+                Some(1),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v1 = db
+            .create_patch(ps_v1, "v1_up@kernel.org", 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+
+        let u0 = "20261012231000.22222-0-a@kernel.org";
+        let u1 = "20261012231000.22222-1-a@kernel.org";
+        let u2 = "20261012231000.22222-2-a@kernel.org";
+        let t_v2_a = db
+            .create_thread(u1, "[PATCH v2 1/2] upstream: part 1", 1100)
+            .await
+            .unwrap();
+        db.create_message(
+            u1,
+            t_v2_a,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 1/2] upstream: part 1",
+            1100,
+            "p1",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2_target = db
+            .create_patchset(
+                t_v2_a,
+                None,
+                u1,
+                "[PATCH v2 1/2] upstream: part 1",
+                "Author <a@kernel.org>",
+                1100,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(2),
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v2_target = db
+            .create_patch(ps_v2_target, u1, 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+
+        let t_v2_b = db
+            .create_thread(
+                "other-up@kernel.org",
+                "[PATCH v2 2/2] upstream: part 2",
+                1101,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            u2,
+            t_v2_b,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 2/2] upstream: part 2",
+            1101,
+            "p2",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v2_from = db
+            .query_returning_i64(
+                "INSERT INTO patchsets (thread_id, subject, author, date, total_parts, received_parts, status, parser_version, to_recipients, cc_recipients, subject_index, version)
+                 VALUES (?, '[PATCH v2 2/2] upstream: part 2', 'Author <a@kernel.org>', 1101, 2, 0, 'Incomplete', 1, 'to@kernel.org', '', 2, 2) RETURNING id",
+                libsql::params![t_v2_b],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_v2_from = db
+            .create_patch(ps_v2_from, u1, 1, "diff --git a/u.c b/u.c")
+            .await
+            .unwrap();
+        let _ = db
+            .create_patch(ps_v2_from, u2, 2, "diff --git a/u2.c b/u2.c")
+            .await
+            .unwrap();
+
+        // Target temporarily linked to merge_from, while merge_from holds the real upstream v1 lineage.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'subject_author' WHERE id = ?",
+                libsql::params![ps_v2_from, ps_v2_target],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET previous_patchset_id = ?, version_link_signal = 'b4_change_id' WHERE id = ?",
+                libsql::params![ps_v1, ps_v2_from],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'unchanged' WHERE id = ?",
+                libsql::params![p_v2_from, p_v2_target],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET previous_patch_id = ?, previous_patch_status = 'modified' WHERE id = ?",
+                libsql::params![p_v1, p_v2_from],
+            )
+            .await
+            .unwrap();
+
+        db.create_message(
+            u0,
+            t_v2_a,
+            None,
+            "Author <a@kernel.org>",
+            "[PATCH v2 0/2] upstream: cover",
+            1100,
+            "cover",
+            "to@kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let merged_v2 = db
+            .create_patchset(
+                t_v2_a,
+                Some(u0),
+                u0,
+                "[PATCH v2 0/2] upstream: cover",
+                "Author <a@kernel.org>",
+                1100,
+                2,
+                1,
+                "to@kernel.org",
+                "",
+                Some(2),
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(merged_v2, ps_v2_target);
+
+        let mut ps_rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![merged_v2],
+            )
+            .await
+            .unwrap();
+        let ps_row = ps_rows.next().await.unwrap().unwrap();
+        assert_eq!(ps_row.get::<Option<i64>>(0).unwrap(), Some(ps_v1));
+        assert_eq!(
+            ps_row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("b4_change_id")
+        );
+        drop(ps_rows);
+
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT previous_patch_id, previous_patch_status FROM patches WHERE patchset_id = ? AND part_index = 1",
+                libsql::params![merged_v2],
+            )
+            .await
+            .unwrap();
+        let p_row = p_rows.next().await.unwrap().unwrap();
+        assert_eq!(p_row.get::<Option<i64>>(0).unwrap(), Some(p_v1));
+        assert_eq!(
+            p_row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("modified")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_signal_1_forge_mr_and_patch_lineage() {
+        let db = setup_db().await;
+        let mr_url = "https://github.com/owner/repo/pull/42";
+        let author = "Alice <alice@example.com>";
+
+        // v1 of PR #42 with 2 commits
+        let t1 = db
+            .ensure_thread_for_message("pr-42-v1@sashiko.local", 1000)
+            .await
+            .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("pr-42-v1@sashiko.local"),
+                "pr-42-v1@sashiko.local",
+                "[PR #42] Fix race",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps1, Some(mr_url), Some("Fix race"), Some(42), None)
+            .await
+            .unwrap();
+        db.create_message(
+            "pr42-v1-p1@sashiko.local",
+            t1,
+            Some("pr-42-v1@sashiko.local"),
+            author,
+            "net: lock queue before drain",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let p1_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr42-v1-p1@sashiko.local",
+                1,
+                "diff --git a/net/a.c b/net/a.c\n",
+                Some("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"),
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "pr42-v1-p2@sashiko.local",
+            t1,
+            Some("pr-42-v1@sashiko.local"),
+            author,
+            "net: add selftest",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let p2_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr42-v1-p2@sashiko.local",
+                2,
+                "diff --git a/net/test.c b/net/test.c\n+v1\n",
+                Some("bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222"),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps1, "Reviewed").await.unwrap();
+
+        // v2 of PR #42: patch 1 unchanged (same git_patch_id), patch 2 modified (same subject, new git_patch_id)
+        let t2 = db
+            .ensure_thread_for_message("pr-42-v2@sashiko.local", 2000)
+            .await
+            .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("pr-42-v2@sashiko.local"),
+                "pr-42-v2@sashiko.local",
+                "[PR #42 v2] Fix race",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps2, Some(mr_url), Some("Fix race"), Some(42), None)
+            .await
+            .unwrap();
+        db.create_message(
+            "pr42-v2-p1@sashiko.local",
+            t2,
+            Some("pr-42-v2@sashiko.local"),
+            author,
+            "net: lock queue before drain",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr42-v2-p1@sashiko.local",
+            1,
+            "diff --git a/net/a.c b/net/a.c\n",
+            Some("aaaa1111aaaa1111aaaa1111aaaa1111aaaa1111"),
+        )
+        .await
+        .unwrap();
+        db.create_message(
+            "pr42-v2-p2@sashiko.local",
+            t2,
+            Some("pr-42-v2@sashiko.local"),
+            author,
+            "net: add selftest",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr42-v2-p2@sashiko.local",
+            2,
+            "diff --git a/net/test.c b/net/test.c\n+v2\n",
+            Some("cccc3333cccc3333cccc3333cccc3333cccc3333"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details["version"], 2);
+        assert_eq!(details["previous_patchset_id"], ps1);
+        assert_eq!(details["version_link_signal"], "forge_mr");
+
+        let versions = details["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0]["id"], ps1);
+        assert_eq!(versions[0]["version"], 1);
+        assert_eq!(versions[1]["id"], ps2);
+        assert_eq!(versions[1]["version"], 2);
+
+        let patches = details["patches"].as_array().unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0]["previous_patch"]["id"], p1_v1);
+        assert_eq!(patches[0]["previous_patch"]["status"], "unchanged");
+        assert_eq!(patches[0]["previous_patch"]["version"], 1);
+        assert_eq!(patches[1]["previous_patch"]["id"], p2_v1);
+        assert_eq!(patches[1]["previous_patch"]["status"], "modified");
+        assert_eq!(patches[1]["previous_patch"]["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_patch_lineage_uses_patch_diffs_equivalent() {
+        let db = setup_db().await;
+        let mr_url = "https://github.com/owner/repo/pull/99";
+        let author = "Alice <alice@example.com>";
+
+        let t1 = db
+            .ensure_thread_for_message("pr-99-v1@sashiko.local", 1000)
+            .await
+            .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("pr-99-v1@sashiko.local"),
+                "pr-99-v1@sashiko.local",
+                "[PR #99] Series",
+                author,
+                1000,
+                2,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps1, Some(mr_url), Some("Series"), Some(99), None)
+            .await
+            .unwrap();
+
+        for (mid, subj) in [
+            ("pr99-v1-p1@sashiko.local", "net: rebased clean patch"),
+            ("pr99-v1-p2@sashiko.local", "net: reindented patch"),
+        ] {
+            db.create_message(
+                mid,
+                t1,
+                Some("pr-99-v1@sashiko.local"),
+                author,
+                subj,
+                1000,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let v1_rebased_diff = "diff --git a/net/a.c b/net/a.c\nindex 1111111..2222222 100644\n--- a/net/a.c\n+++ b/net/a.c\n@@ -1 +1 @@\n-old\n+\tkeep\n-- \n2.47.0\n";
+        let v1_indent_diff = "diff --git a/net/b.c b/net/b.c\nindex 3333333..4444444 100644\n--- a/net/b.c\n+++ b/net/b.c\n@@ -1 +1 @@\n-old\n+\treturn 1;\n";
+
+        let p1_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr99-v1-p1@sashiko.local",
+                1,
+                v1_rebased_diff,
+                Some("1111111111111111111111111111111111111111"),
+            )
+            .await
+            .unwrap();
+        let p2_v1 = db
+            .create_patch_with_git_patch_id(
+                ps1,
+                "pr99-v1-p2@sashiko.local",
+                2,
+                v1_indent_diff,
+                Some("2222222222222222222222222222222222222222"),
+            )
+            .await
+            .unwrap();
+
+        let t2 = db
+            .ensure_thread_for_message("pr-99-v2@sashiko.local", 2000)
+            .await
+            .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("pr-99-v2@sashiko.local"),
+                "pr-99-v2@sashiko.local",
+                "[PR #99 v2] Series",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_mr_metadata(ps2, Some(mr_url), Some("Series"), Some(99), None)
+            .await
+            .unwrap();
+
+        for (mid, subj) in [
+            ("pr99-v2-p1@sashiko.local", "net: rebased clean patch"),
+            ("pr99-v2-p2@sashiko.local", "net: reindented patch"),
+        ] {
+            db.create_message(
+                mid,
+                t2,
+                Some("pr-99-v2@sashiko.local"),
+                author,
+                subj,
+                2000,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let v2_rebased_diff = "diff --git a/net/a.c b/net/a.c\nindex aaaaaaa..bbbbbbb 100644\n--- a/net/a.c\n+++ b/net/a.c\n@@ -25 +27 @@\n-old\n+\tkeep\nbase-commit: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n-- \n2.48.1\n";
+        let v2_indent_diff = v1_indent_diff.replace("+\treturn 1;", "+    return 1;");
+
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr99-v2-p1@sashiko.local",
+            1,
+            v2_rebased_diff,
+            Some("1111111111111111111111111111111111111111"),
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps2,
+            "pr99-v2-p2@sashiko.local",
+            2,
+            &v2_indent_diff,
+            Some("2222222222222222222222222222222222222222"),
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let patches = details["patches"].as_array().unwrap();
+        assert_eq!(patches.len(), 2);
+        assert_eq!(patches[0]["previous_patch"]["id"], p1_v1);
+        assert_eq!(patches[0]["previous_patch"]["status"], "unchanged");
+        assert_eq!(patches[1]["previous_patch"]["id"], p2_v1);
+        assert_eq!(patches[1]["previous_patch"]["status"], "modified");
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_signal_2_b4_change_id_and_signal_3_message_ref() {
+        let db = setup_db().await;
+        let author = "Bob <bob@kernel.org>";
+
+        // Signal 2: b4 change-id links v1 and v2 even when the cover letter title changes completely
+        let t1 = db
+            .create_thread(
+                "b4-v1-cover@kernel.org",
+                "[PATCH 0/1] Initial approach",
+                1000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "b4-v1-cover@kernel.org",
+            t1,
+            None,
+            author,
+            "[PATCH 0/1] Initial approach",
+            1000,
+            "Cover letter v1\n\n---\nchange-id: 20261012-mm-reclaim-9f8e7d6c5b4a\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("b4-v1-cover@kernel.org"),
+                "b4-v1-cover@kernel.org",
+                "[PATCH 0/1] Initial approach",
+                author,
+                1000,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "b4-v1-p1@kernel.org",
+            t1,
+            Some("b4-v1-cover@kernel.org"),
+            author,
+            "[PATCH 1/1] mm: initial reclaim helper",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let p1_v1 = db
+            .create_patch(ps1, "b4-v1-p1@kernel.org", 1, "diff v1")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps1, "Reviewed").await.unwrap();
+
+        let t2 = db
+            .create_thread(
+                "b4-v2-cover@kernel.org",
+                "[PATCH v2 0/1] Completely renamed series title",
+                2000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "b4-v2-cover@kernel.org",
+            t2,
+            None,
+            author,
+            "[PATCH v2 0/1] Completely renamed series title",
+            2000,
+            "Cover letter v2\n\n---\nchange-id: 20261012-mm-reclaim-9f8e7d6c5b4a\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("b4-v2-cover@kernel.org"),
+                "b4-v2-cover@kernel.org",
+                "[PATCH v2 0/1] Completely renamed series title",
+                author,
+                2000,
+                1,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "b4-v2-p1@kernel.org",
+            t2,
+            Some("b4-v2-cover@kernel.org"),
+            author,
+            "[PATCH v2 1/1] mm: reworked reclaim shrinker",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps2, "b4-v2-p1@kernel.org", 1, "diff v2")
+            .await
+            .unwrap();
+
+        // Signal 3: v3 omits change-id and changes title again, but cites v2 via Lore link in changelog
+        let t3 = db
+            .create_thread(
+                "b4-v3-cover@kernel.org",
+                "[PATCH v3 0/1] Yet another title for shrinker",
+                3000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "b4-v3-cover@kernel.org",
+            t3,
+            None,
+            author,
+            "[PATCH v3 0/1] Yet another title for shrinker",
+            3000,
+            "Changes since v2:\n- Fixed lock ordering\n- Link to v2: https://lore.kernel.org/r/b4-v2-cover@kernel.org\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps3 = db
+            .create_patchset(
+                t3,
+                Some("b4-v3-cover@kernel.org"),
+                "b4-v3-cover@kernel.org",
+                "[PATCH v3 0/1] Yet another title for shrinker",
+                author,
+                3000,
+                1,
+                1,
+                "",
+                "",
+                Some(3),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "b4-v3-p1@kernel.org",
+            t3,
+            Some("b4-v3-cover@kernel.org"),
+            author,
+            "[PATCH v3 1/1] mm: final shrinker fix",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps3, "b4-v3-p1@kernel.org", 1, "diff v3")
+            .await
+            .unwrap();
+
+        let details2 = db
+            .get_patchset_details(ps2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details2["previous_patchset_id"], ps1);
+        assert_eq!(details2["version_link_signal"], "change_id");
+        // Tier 3 singleton fallback links p1_v2 -> p1_v1 even though the patch subject changed
+        assert_eq!(details2["patches"][0]["previous_patch"]["id"], p1_v1);
+        assert_eq!(
+            details2["patches"][0]["previous_patch"]["status"],
+            "modified"
+        );
+
+        let details3 = db
+            .get_patchset_details(ps3, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(details3["previous_patchset_id"], ps2);
+        assert_eq!(details3["version_link_signal"], "message_ref");
+        let versions = details3["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0]["id"], ps1);
+        assert_eq!(versions[1]["id"], ps2);
+        assert_eq!(versions[2]["id"], ps3);
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_out_of_order_arrival_and_reviewed_preservation() {
+        let db = setup_db().await;
+        let author = "Carol <carol@kernel.org>";
+
+        // Ingest v3 first
+        let t3 = db
+            .create_thread(
+                "ooo-v3@kernel.org",
+                "[PATCH v3 1/1] bpf: verifier bounds",
+                3000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "ooo-v3@kernel.org",
+            t3,
+            None,
+            author,
+            "[PATCH v3 1/1] bpf: verifier bounds",
+            3000,
+            "v3 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps3 = db
+            .create_patchset(
+                t3,
+                Some("ooo-v3@kernel.org"),
+                "ooo-v3@kernel.org",
+                "[PATCH v3 1/1] bpf: verifier bounds",
+                author,
+                3000,
+                1,
+                1,
+                "",
+                "",
+                Some(3),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps3, "ooo-v3@kernel.org", 1, "diff v3")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps3, "Reviewed").await.unwrap();
+
+        // Ingest v1 second (backfill)
+        let t1 = db
+            .create_thread(
+                "ooo-v1@kernel.org",
+                "[PATCH 1/1] bpf: verifier bounds",
+                1000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "ooo-v1@kernel.org",
+            t1,
+            None,
+            author,
+            "[PATCH 1/1] bpf: verifier bounds",
+            1000,
+            "v1 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps1 = db
+            .create_patchset(
+                t1,
+                Some("ooo-v1@kernel.org"),
+                "ooo-v1@kernel.org",
+                "[PATCH 1/1] bpf: verifier bounds",
+                author,
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps1, "ooo-v1@kernel.org", 1, "diff v1")
+            .await
+            .unwrap();
+
+        // v1 arrives after v3: v1 has no older predecessor, v3 is not
+        // re-linked retroactively, and neither is cancelled.
+        assert_ne!(
+            db.get_patchset_status(ps1).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        let d1_mid = db
+            .get_patchset_details(ps1, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(d1_mid["previous_patchset_id"].is_null());
+        let d3_mid = db
+            .get_patchset_details(ps3, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(d3_mid["previous_patchset_id"].is_null());
+        assert_eq!(d3_mid["status"], "Reviewed");
+
+        // Now ingest v2 third: v2 links back to v1 (the display name differs,
+        // the email matches), but v3 is not re-stitched; that miss is
+        // accepted.
+        let t2 = db
+            .create_thread(
+                "ooo-v2@kernel.org",
+                "[PATCH v2 1/1] bpf: verifier bounds",
+                2000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "ooo-v2@kernel.org",
+            t2,
+            None,
+            "Carol Danvers <carol@kernel.org>",
+            "[PATCH v2 1/1] bpf: verifier bounds",
+            2000,
+            "v2 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps2 = db
+            .create_patchset(
+                t2,
+                Some("ooo-v2@kernel.org"),
+                "ooo-v2@kernel.org",
+                "[PATCH v2 1/1] bpf: verifier bounds",
+                "Carol Danvers <carol@kernel.org>",
+                2000,
+                1,
+                1,
+                "",
+                "",
+                Some(2),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_patch(ps2, "ooo-v2@kernel.org", 1, "diff v2")
+            .await
+            .unwrap();
+
+        let d2 = db
+            .get_patchset_details(ps2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let d3 = db
+            .get_patchset_details(ps3, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(d2["previous_patchset_id"], ps1);
+        assert_eq!(d2["version_link_signal"], "subject_author");
+        assert!(d3["previous_patchset_id"].is_null());
+        assert_eq!(d3["status"], "Reviewed");
+
+        let chain: Vec<i64> = d2["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(chain, vec![ps1, ps2]);
+
+        // Out-of-order 0/4 cover letter arriving after 2/4 and 3/4 (received_parts == 2 < 4)
+        // must still reconcile immediately and link/cancel the prior version.
+        let t_v4_1 = db
+            .create_thread("ooo-cover-v1@kernel.org", "[PATCH 0/4] mm: reclaim", 4000)
+            .await
+            .unwrap();
+        db.create_message(
+            "ooo-cover-v1@kernel.org",
+            t_v4_1,
+            None,
+            author,
+            "[PATCH 0/4] mm: reclaim",
+            4000,
+            "v1 cover\n\nchange-id: 20261012-mm-reclaim-abcd1234\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v4_1 = db
+            .create_patchset(
+                t_v4_1,
+                Some("ooo-cover-v1@kernel.org"),
+                "ooo-cover-v1@kernel.org",
+                "[PATCH 0/4] mm: reclaim",
+                author,
+                4000,
+                4,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(ps_v4_1, "Pending").await.unwrap();
+
+        let t_v4_2 = db
+            .ensure_thread_for_message("ooo-cover-v2@kernel.org", 5000)
+            .await
+            .unwrap();
+        for idx in [2u32, 3u32] {
+            let mid = format!("ooo-cover-v2-p{idx}@kernel.org");
+            let subj = format!("[PATCH v2 {idx}/4] mm: step {idx}");
+            db.create_message(
+                &mid,
+                t_v4_2,
+                Some("ooo-cover-v2@kernel.org"),
+                author,
+                &subj,
+                5000,
+                "patch body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ps_v4_2 = db
+                .create_patchset(
+                    t_v4_2,
+                    None,
+                    &mid,
+                    &subj,
+                    author,
+                    5000,
+                    4,
+                    1,
+                    "",
+                    "",
+                    Some(2),
+                    idx,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            db.create_patch(ps_v4_2, &mid, idx, "diff step")
+                .await
+                .unwrap();
+        }
+        // Now 0/4 arrives out of order while received_parts == 2 < 4
+        db.create_message(
+            "ooo-cover-v2@kernel.org",
+            t_v4_2,
+            None,
+            author,
+            "[PATCH v2 0/4] mm: reclaim",
+            5000,
+            "v2 cover\n\nchange-id: 20261012-mm-reclaim-abcd1234\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_v4_2 = db
+            .create_patchset(
+                t_v4_2,
+                Some("ooo-cover-v2@kernel.org"),
+                "ooo-cover-v2@kernel.org",
+                "[PATCH v2 0/4] mm: reclaim",
+                author,
+                5000,
+                4,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let d_v4_2 = db
+            .get_patchset_details(ps_v4_2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(d_v4_2["previous_patchset_id"], ps_v4_1);
+        assert_eq!(d_v4_2["version_link_signal"], "change_id");
+        assert_eq!(
+            db.get_patchset_status(ps_v4_1).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_git_patch_id_only_maps_patches_and_prerequisite_exclusion() {
+        let db = setup_db().await;
+        let author = "Dave <dave@kernel.org>";
+        let shared_gpid = "1111222233334444555566667777888899990000";
+        let prereq_gpid = "9999888877776666555544443333222211110000";
+
+        // Prerequisite series (v1)
+        let tp = db
+            .create_thread("prereq-cover@kernel.org", "[PATCH 0/1] Base infra", 500)
+            .await
+            .unwrap();
+        db.create_message(
+            "prereq-cover@kernel.org",
+            tp,
+            None,
+            author,
+            "[PATCH 0/1] Base infra",
+            500,
+            "Base infra cover",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_prereq = db
+            .create_patchset(
+                tp,
+                Some("prereq-cover@kernel.org"),
+                "prereq-cover@kernel.org",
+                "[PATCH 0/1] Base infra",
+                author,
+                500,
+                1,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "prereq-p1@kernel.org",
+            tp,
+            Some("prereq-cover@kernel.org"),
+            author,
+            "[PATCH 1/1] core: add helper",
+            500,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps_prereq,
+            "prereq-p1@kernel.org",
+            1,
+            "diff prereq",
+            Some(prereq_gpid),
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_prereq, "Reviewed")
+            .await
+            .unwrap();
+
+        // Series A v2 declares ps_prereq as a prerequisite-message-id AND shares prereq_gpid:
+        // must NOT link to ps_prereq!
+        let ta = db
+            .create_thread(
+                "series-a-v2@kernel.org",
+                "[PATCH v2 0/1] Unrelated feature",
+                1000,
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "series-a-v2@kernel.org",
+            ta,
+            None,
+            author,
+            "[PATCH v2 0/1] Unrelated feature",
+            1000,
+            "Feature cover\n\nprerequisite-message-id: <prereq-cover@kernel.org>\nprerequisite-patch-id: 9999888877776666555544443333222211110000\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_a = db
+            .create_patchset(
+                ta,
+                Some("series-a-v2@kernel.org"),
+                "series-a-v2@kernel.org",
+                "[PATCH v2 0/1] Unrelated feature",
+                author,
+                1000,
+                1,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "series-a-v2-p1@kernel.org",
+            ta,
+            Some("series-a-v2@kernel.org"),
+            author,
+            "[PATCH v2 1/1] subsys: use helper",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps_a,
+            "series-a-v2-p1@kernel.org",
+            1,
+            "diff prereq",
+            Some(prereq_gpid),
+        )
+        .await
+        .unwrap();
+
+        let da = db
+            .get_patchset_details(ps_a, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(da["previous_patchset_id"].is_null());
+
+        // v1 and v2 have different cover letter subjects and no change-id,
+        // but share an unchanged patch (`shared_gpid`). A shared patch does
+        // not link two series.
+        let tb1 = db
+            .create_thread("sig5-v1@kernel.org", "[PATCH 0/2] Old cover title", 2000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sig5-v1@kernel.org",
+            tb1,
+            None,
+            author,
+            "[PATCH 0/2] Old cover title",
+            2000,
+            "Old cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_b1 = db
+            .create_patchset(
+                tb1,
+                Some("sig5-v1@kernel.org"),
+                "sig5-v1@kernel.org",
+                "[PATCH 0/2] Old cover title",
+                author,
+                2000,
+                2,
+                1,
+                "",
+                "",
+                Some(1),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "sig5-v1-p1@kernel.org",
+            tb1,
+            Some("sig5-v1@kernel.org"),
+            author,
+            "[PATCH 1/2] drv: prep work",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let prep_diff =
+            "diff --git a/drv.c b/drv.c\n--- a/drv.c\n+++ b/drv.c\n@@ -1 +1 @@\n-old\n+prep\n";
+        let p1_b1 = db
+            .create_patch_with_git_patch_id(
+                ps_b1,
+                "sig5-v1-p1@kernel.org",
+                1,
+                prep_diff,
+                Some(shared_gpid),
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "sig5-v1-p2@kernel.org",
+            tb1,
+            Some("sig5-v1@kernel.org"),
+            author,
+            "[PATCH 2/2] drv: old implementation",
+            2000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let p2_b1 = db
+            .create_patch(ps_b1, "sig5-v1-p2@kernel.org", 2, "diff old impl")
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_b1, "Reviewed").await.unwrap();
+
+        // Attach a Low finding on patch 1 and a High finding on patch 2 of v1.
+        let rev_b1_p1 = db
+            .create_review(ps_b1, Some(p1_b1), "gemini", "gemini-2.5-pro", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            rev_b1_p1,
+            "Reviewed",
+            "Found minor issue",
+            Some("Low severity issue"),
+            None,
+            Some("Inline review p1"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_finding(Finding {
+            review_id: rev_b1_p1,
+            severity: Severity::Low,
+            severity_explanation: Some("Minor issue".to_string()),
+            problem: "Minor error path cleanup order in drv_prep".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        let rev_b1 = db
+            .create_review(ps_b1, Some(p2_b1), "gemini", "gemini-2.5-pro", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            rev_b1,
+            "Reviewed",
+            "Found bug",
+            Some("Null deref in drv"),
+            None,
+            Some("Inline review text"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_finding(Finding {
+            review_id: rev_b1,
+            severity: Severity::High,
+            severity_explanation: Some("Crash on NULL pointer".to_string()),
+            problem: "Unchecked kzalloc return in drv_probe".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await
+        .unwrap();
+
+        // Ingest v2 with a renamed cover letter subject, sharing patch 1's git_patch_id
+        let tb2 = db
+            .create_thread("sig5-v2@kernel.org", "[PATCH v2 0/2] New cover title", 3000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sig5-v2@kernel.org",
+            tb2,
+            None,
+            author,
+            "[PATCH v2 0/2] New cover title",
+            3000,
+            "New cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_b2 = db
+            .create_patchset(
+                tb2,
+                Some("sig5-v2@kernel.org"),
+                "sig5-v2@kernel.org",
+                "[PATCH v2 0/2] New cover title",
+                author,
+                3000,
+                2,
+                1,
+                "",
+                "",
+                Some(2),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "sig5-v2-p1@kernel.org",
+            tb2,
+            Some("sig5-v2@kernel.org"),
+            author,
+            "[PATCH v2 1/2] drv: prep work",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let p1_b2 = db
+            .create_patch_with_git_patch_id(
+                ps_b2,
+                "sig5-v2-p1@kernel.org",
+                1,
+                prep_diff,
+                Some(shared_gpid),
+            )
+            .await
+            .unwrap();
+        db.create_message(
+            "sig5-v2-p2@kernel.org",
+            tb2,
+            Some("sig5-v2@kernel.org"),
+            author,
+            "[PATCH v2 2/2] drv: new implementation",
+            3000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch(ps_b2, "sig5-v2-p2@kernel.org", 2, "diff new impl")
+            .await
+            .unwrap();
+
+        let db2 = db
+            .get_patchset_details(ps_b2, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(db2["previous_patchset_id"].is_null());
+        assert!(db2["version_link_signal"].is_null());
+        let patches_b2 = db2["patches"].as_array().unwrap();
+        assert_eq!(patches_b2.len(), 2);
+        assert!(patches_b2[0]["previous_patch"].is_null());
+        assert!(patches_b2[1]["previous_patch"].is_null());
+
+        // v3 keeps v2's cover letter subject, so it links to v2, and the
+        // shared git_patch_id maps patch 1 as unchanged.
+        let tb3 = db
+            .create_thread("sig5-v3@kernel.org", "[PATCH v3 0/2] New cover title", 4000)
+            .await
+            .unwrap();
+        db.create_message(
+            "sig5-v3@kernel.org",
+            tb3,
+            None,
+            author,
+            "[PATCH v3 0/2] New cover title",
+            4000,
+            "v3 cover body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_b3 = db
+            .create_patchset(
+                tb3,
+                Some("sig5-v3@kernel.org"),
+                "sig5-v3@kernel.org",
+                "[PATCH v3 0/2] New cover title",
+                author,
+                4000,
+                2,
+                1,
+                "",
+                "",
+                Some(3),
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_message(
+            "sig5-v3-p1@kernel.org",
+            tb3,
+            Some("sig5-v3@kernel.org"),
+            author,
+            "[PATCH v3 1/2] drv: prep work",
+            4000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps_b3,
+            "sig5-v3-p1@kernel.org",
+            1,
+            prep_diff,
+            Some(shared_gpid),
+        )
+        .await
+        .unwrap();
+
+        let db3 = db
+            .get_patchset_details(ps_b3, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(db3["previous_patchset_id"], ps_b2);
+        assert_eq!(db3["version_link_signal"], "subject_author");
+        let patches_b3 = db3["patches"].as_array().unwrap();
+        assert_eq!(patches_b3[0]["previous_patch"]["id"], p1_b2);
+        assert_eq!(patches_b3[0]["previous_patch"]["status"], "unchanged");
+    }
+
+    /// One message of a test series: Message-ID, subject, body and an
+    /// optional git patch ID.
+    struct TestPart<'a> {
+        msgid: &'a str,
+        subject: &'a str,
+        body: &'a str,
+        git_patch_id: Option<&'a str>,
+    }
+
+    impl<'a> TestPart<'a> {
+        fn new(msgid: &'a str, subject: &'a str) -> Self {
+            Self {
+                msgid,
+                subject,
+                body: "",
+                git_patch_id: None,
+            }
+        }
+
+        fn body(mut self, body: &'a str) -> Self {
+            self.body = body;
+            self
+        }
+
+        fn git_patch_id(mut self, git_patch_id: &'a str) -> Self {
+            self.git_patch_id = Some(git_patch_id);
+            self
+        }
+    }
+
+    /// Ingests a series the way the email ingestion path does: the cover
+    /// letter (when given) or patch 1 creates the patchset, then every
+    /// patch is attached. The root message replies to `in_reply_to`.
+    async fn ingest_test_series(
+        db: &Database,
+        author: &str,
+        date: i64,
+        cover: Option<TestPart<'_>>,
+        patches: &[TestPart<'_>],
+        in_reply_to: Option<&str>,
+    ) -> i64 {
+        let total = u32::try_from(patches.len()).unwrap();
+        let (root, root_index) = match cover.as_ref() {
+            Some(c) => (c, 0),
+            None => (&patches[0], 1),
+        };
+        let thread = db
+            .create_thread(root.msgid, root.subject, date)
+            .await
+            .unwrap();
+        db.create_message(
+            root.msgid,
+            thread,
+            in_reply_to,
+            author,
+            root.subject,
+            date,
+            root.body,
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                thread,
+                Some(root.msgid),
+                root.msgid,
+                root.subject,
+                author,
+                date,
+                total,
+                1,
+                "",
+                "",
+                crate::patch::parse_subject_version(root.subject),
+                root_index,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        for (i, part) in patches.iter().enumerate() {
+            let idx = u32::try_from(i).unwrap() + 1;
+            if root_index != 1 || idx != 1 {
+                db.create_message(
+                    part.msgid,
+                    thread,
+                    Some(root.msgid),
+                    author,
+                    part.subject,
+                    date,
+                    part.body,
+                    "",
+                    "",
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+            db.create_patch_with_git_patch_id(
+                ps,
+                part.msgid,
+                idx,
+                &format!("diff --git a/{0} b/{0}\n+{0}\n", part.msgid),
+                part.git_patch_id,
+            )
+            .await
+            .unwrap();
+        }
+        ps
+    }
+
+    async fn previous_patchset_of(db: &Database, id: i64) -> (Option<i64>, Option<String>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT previous_patchset_id, version_link_signal FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    async fn assert_not_linked(db: &Database, id: i64) {
+        assert_eq!(
+            previous_patchset_of(db, id).await,
+            (None, None),
+            "patchset {id} must not be linked to a previous version"
+        );
+    }
+
+    async fn assert_linked(db: &Database, id: i64, prev: i64, signal: &str) {
+        assert_eq!(
+            previous_patchset_of(db, id).await,
+            (Some(prev), Some(signal.to_string())),
+            "patchset {id} must be linked to {prev} via {signal}"
+        );
+    }
+
+    async fn assert_status(db: &Database, id: i64, status: &str) {
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some(status),
+            "patchset {id} status"
+        );
+    }
+
+    const DAY: i64 = 86400;
+
+    /// Ingests a single-patch series with an empty body.
+    async fn ingest_single(
+        db: &Database,
+        author: &str,
+        date: i64,
+        msgid: &str,
+        subject: &str,
+    ) -> i64 {
+        ingest_test_series(
+            db,
+            author,
+            date,
+            None,
+            &[TestPart::new(msgid, subject)],
+            None,
+        )
+        .await
+    }
+
+    /// A QEMU series whose cover letter lists the version links of its
+    /// companion kernel series (patchsets 39050 and 39053 in the audited
+    /// database) is not linked to the newer-tagged kernel series, while a
+    /// b4 change-id still follows an unchanged or mistyped tag.
+    #[test]
+    fn test_version_link_signal_admits_by_step() {
+        use RevisionStep::{Advances, Regresses, SameLabel};
+        let day = 86_400;
+        assert!(!VersionLinkSignal::MessageRef.admits(Regresses, 600, true));
+        assert!(!VersionLinkSignal::MessageRef.admits(SameLabel, day, true));
+        assert!(VersionLinkSignal::MessageRef.admits(Advances, 600, true));
+        assert!(VersionLinkSignal::ChangeId.admits(Regresses, day, true));
+        assert!(VersionLinkSignal::ChangeId.admits(SameLabel, day, true));
+        assert!(!VersionLinkSignal::ChangeId.admits(SameLabel, 600, true));
+        assert!(VersionLinkSignal::SubjectAuthor.admits(SameLabel, day, true));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(SameLabel, day, false));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(SameLabel, 31 * day, true));
+        assert!(!VersionLinkSignal::SubjectAuthor.admits(Regresses, day, true));
+        assert!(VersionLinkSignal::SubjectAuthor.admits(Advances, 100 * day, false));
+    }
+
+    /// An RFC followed by a plain [PATCH] (the most common RFC flow, never
+    /// linked by a strictly-lower-version rule) links through the exact
+    /// subject, and numbering restarted after RFC v2 still links.
+    #[tokio::test]
+    async fn test_version_lineage_rfc_followed_by_unversioned_patch() {
+        let db = setup_db().await;
+        let author = "SJ <sj@kernel.org>";
+        let d0 = 1_790_000_000;
+        let rfc = ingest_single(
+            &db,
+            author,
+            d0,
+            "rfc-1@k.org",
+            "[RFC PATCH] mm/damon/core: fix quota",
+        )
+        .await;
+        let rfc2 = ingest_single(
+            &db,
+            author,
+            d0 + 2 * DAY,
+            "rfc-2@k.org",
+            "[RFC PATCH v2] mm/damon/core: fix quota",
+        )
+        .await;
+        assert_linked(&db, rfc2, rfc, "subject_author").await;
+        let v1 = ingest_single(
+            &db,
+            author,
+            d0 + 5 * DAY,
+            "v1@k.org",
+            "[PATCH] mm/damon/core: fix quota",
+        )
+        .await;
+        assert_linked(&db, v1, rfc2, "subject_author").await;
+        // The RFC to non-RFC step moves the tag forward, so the in-flight
+        // RFC is superseded like any older version.
+        assert_status(&db, rfc2, "Cancelled").await;
+    }
+
+    /// `RFC v2 -> v1 -> v2`: the final v2 follows the newest posting of
+    /// the series (v1), not the highest number (RFC v2).
+    #[tokio::test]
+    async fn test_version_lineage_restarted_numbering_follows_chronology() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] net: foo: fix teardown race");
+        let d0 = 1_790_000_000;
+        let rfc2 = ingest_single(&db, author, d0, "a@x", &subj("RFC PATCH v2")).await;
+        let v1 = ingest_single(&db, author, d0 + 3 * DAY, "b@x", &subj("PATCH")).await;
+        let v2 = ingest_single(&db, author, d0 + 6 * DAY, "c@x", &subj("PATCH v2")).await;
+        assert_linked(&db, v1, rfc2, "subject_author").await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+        // The version chain lists postings in chain order, not by tag.
+        let chain: Vec<i64> = db
+            .get_patchset_version_chain(v1, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(chain, vec![rfc2, v1, v2]);
+    }
+
+    /// A subject-only link between postings with the same tag is dropped
+    /// once the current patchset's subject no longer matches, and a link
+    /// with an unknown signal is held to the forward-tag-only rule.
+    #[tokio::test]
+    async fn test_version_lineage_stale_same_label_link_is_dropped() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = "[PATCH] gpio: foo: fix irq leak on remove";
+        let d0 = 1_790_000_000;
+        let first = ingest_single(&db, author, d0, "t1@x", subj).await;
+        let second = ingest_single(&db, author, d0 + DAY, "t2@x", subj).await;
+        assert_linked(&db, second, first, "subject_author").await;
+
+        db.execute(
+            "UPDATE patchsets SET subject = ? WHERE id = ?",
+            libsql::params!["[PATCH] gpio: bar: rework probe ordering", second],
+        )
+        .await
+        .unwrap();
+        db.reconcile_version_lineage(second).await.unwrap();
+        assert_not_linked(&db, second).await;
+
+        let third = ingest_single(&db, author, d0 + 2 * DAY, "t3@x", subj).await;
+        assert_linked(&db, third, first, "subject_author").await;
+        db.execute(
+            "UPDATE patchsets SET version_link_signal = 'unknown', subject = ? WHERE id = ?",
+            libsql::params!["[PATCH] gpio: baz: unrelated", third],
+        )
+        .await
+        .unwrap();
+        db.reconcile_version_lineage(third).await.unwrap();
+        assert_not_linked(&db, third).await;
+    }
+
+    /// Pre-migration-14 rows (`version IS NULL`, unlinked) for an RFC and
+    /// the v1 that followed it: when v2 arrives, the lazy ancestor pass
+    /// also links v1 to the RFC instead of stopping at version 1.
+    #[tokio::test]
+    async fn test_version_lineage_lazily_links_pre_migration_v1_to_rfc() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] mm: damon: fix quota reset");
+        let d0 = 1_780_000_000;
+        let rfc = ingest_single(&db, author, d0, "l1@x", &subj("RFC PATCH")).await;
+        let v1 = ingest_single(&db, author, d0 + 3 * DAY, "l2@x", &subj("PATCH")).await;
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?)",
+            libsql::params![rfc, v1],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+            libsql::params![rfc],
+        )
+        .await
+        .unwrap();
+
+        let v2 = ingest_single(&db, author, d0 + 6 * DAY, "l3@x", &subj("PATCH v2")).await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+        assert_linked(&db, v1, rfc, "subject_author").await;
+        // Lazy reconciliation never cancels a historical predecessor.
+        assert_status(&db, rfc, "Pending").await;
+    }
+
+    /// A new version posted without changing the tag (a day later) links
+    /// through the subject but leaves the predecessor's review running. A
+    /// double send minutes apart is not a new version of the posting it
+    /// repeats, and a subject without a PATCH tag or a repost beyond 30
+    /// days is not linked.
+    #[tokio::test]
+    async fn test_version_lineage_unchanged_tag_links_by_chronology() {
+        let db = setup_db().await;
+        let author = "Krzysztof <krzk@kernel.org>";
+        let d0 = 1_790_000_000;
+        let subj = "[PATCH] wifi: ath10k: drop unused qmi_elem_info arrays";
+        let first = ingest_single(&db, author, d0, "w1@k.org", subj).await;
+        db.update_patchset_status(first, "Pending").await.unwrap();
+        let next_day = ingest_single(&db, author, d0 + DAY, "w2@k.org", subj).await;
+        assert_linked(&db, next_day, first, "subject_author").await;
+        assert_status(&db, first, "Pending").await;
+
+        // A double send of next_day is not its next version; it links to
+        // the same predecessor as the posting it repeats.
+        let double_send = ingest_single(&db, author, d0 + DAY + 300, "w3@k.org", subj).await;
+        assert_linked(&db, double_send, first, "subject_author").await;
+
+        let much_later = ingest_single(&db, author, d0 + 70 * DAY, "w4@k.org", subj).await;
+        assert_not_linked(&db, much_later).await;
+
+        let merge = "linux-next: manual merge of the drm tree with the origin tree";
+        let m1 = ingest_single(&db, author, d0, "m1@k.org", merge).await;
+        let m2 = ingest_single(&db, author, d0 + 2 * DAY, "m2@k.org", merge).await;
+        assert_not_linked(&db, m1).await;
+        assert_not_linked(&db, m2).await;
+    }
+
+    /// A tag that goes backwards is not followed by the subject signal,
+    /// and a stale resend of an old version posted after a newer version
+    /// does not become the predecessor of the next version.
+    #[tokio::test]
+    async fn test_version_lineage_regressing_tag_and_stale_resend() {
+        let db = setup_db().await;
+        let author = "Dev <dev@example.org>";
+        let subj = |tag: &str| format!("[{tag}] spi: fsl: release DMA channels on remove");
+        let d0 = 1_790_000_000;
+        let v1 = ingest_single(&db, author, d0, "s1@x", &subj("PATCH")).await;
+        let v2 = ingest_single(&db, author, d0 + 2 * DAY, "s2@x", &subj("PATCH v2")).await;
+        let resend_v1 = ingest_single(&db, author, d0 + 4 * DAY, "s3@x", &subj("PATCH")).await;
+        let v3 = ingest_single(&db, author, d0 + 6 * DAY, "s4@x", &subj("PATCH v3")).await;
+        assert_linked(&db, v2, v1, "subject_author").await;
+        // [PATCH] after [PATCH v2] regresses; its only same-label
+        // candidate, v1, is still accepted.
+        assert_linked(&db, resend_v1, v1, "subject_author").await;
+        assert_linked(&db, v3, v2, "subject_author").await;
+    }
+
+    /// A renamed non-RFC posting that names its RFC predecessor with an
+    /// "RFC: <url>" line links through the explicit reference.
+    #[tokio::test]
+    async fn test_version_lineage_rfc_link_line_links_renamed_series() {
+        let db = setup_db().await;
+        let author = "Tom <t.tonhauser@pobox.sk>";
+        let d0 = 1_790_000_000;
+        let rfc = ingest_single(
+            &db,
+            author,
+            d0,
+            "20261003192957.761090-1-t.tonhauser@pobox.sk",
+            "[RFC PATCH] wifi: ath9k: keep non-aggregate frames",
+        )
+        .await;
+        let body = "Fix frame loss.\n---\n\
+RFC: https://lore.kernel.org/linux-wireless/20261003192957.761090-1-t.tonhauser@pobox.sk/\n";
+        let v1 = ingest_test_series(
+            &db,
+            author,
+            d0 + 9 * DAY,
+            None,
+            &[TestPart::new(
+                "20261012-ath9k-v1@pobox.sk",
+                "[PATCH] wifi: ath9k: fix loss of non-aggregate frames",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, v1, rfc, "message_ref").await;
+    }
+
+    #[test]
+    fn test_choose_predecessor_newest_posting_of_series() {
+        let cand = |id: i64, date: i64, subject: &str| {
+            let version = crate::patch::parse_subject_version(subject).unwrap_or(1);
+            LineageCandidate {
+                id,
+                subject: subject.to_string(),
+                subject_index: 1,
+                author: String::new(),
+                date,
+                total_parts: 1,
+                cover_id: None,
+                version,
+                revision: SubjectRevision::with_number(subject, version),
+            }
+        };
+        let chosen = |cands: Vec<LineageCandidate>, signal| match Database::choose_predecessor(
+            cands, signal,
+        ) {
+            PredecessorChoice::Chosen(c) => Some(c.id),
+            PredecessorChoice::Ambiguous(_) | PredecessorChoice::NoCandidate => None,
+        };
+        // RFC, RFC v2 and v1 are all older than v2: v1 is the newest.
+        let rfc_chain = || {
+            vec![
+                cand(1, 10, "[RFC PATCH] x"),
+                cand(2, 20, "[RFC PATCH v2] x"),
+                cand(3, 30, "[PATCH] x"),
+            ]
+        };
+        assert_eq!(
+            chosen(rfc_chain(), VersionLinkSignal::SubjectAuthor),
+            Some(3)
+        );
+        assert_eq!(chosen(rfc_chain(), VersionLinkSignal::MessageRef), Some(3));
+        // v1 -> RFC v2 keeps one counter: RFC v2 is newest.
+        let counted = vec![cand(1, 10, "[PATCH] x"), cand(2, 20, "[RFC PATCH v2] x")];
+        assert_eq!(chosen(counted, VersionLinkSignal::SubjectAuthor), Some(2));
+        // Two explicit references with the same tag stay ambiguous.
+        let two_refs = vec![cand(1, 10, "[PATCH v2] a"), cand(2, 20, "[PATCH v2] b")];
+        assert!(matches!(
+            Database::choose_predecessor(two_refs, VersionLinkSignal::MessageRef),
+            PredecessorChoice::Ambiguous(_)
+        ));
+        assert!(matches!(
+            Database::choose_predecessor(Vec::new(), VersionLinkSignal::ChangeId),
+            PredecessorChoice::NoCandidate
+        ));
+    }
+
+    /// Oliver Hartkopp's CAN series (patchsets 87034, 90825 and 91985 in
+    /// the audited database) share one patch but are different series. A
+    /// shared git patch ID must not chain them, nor cancel the older ones.
+    #[tokio::test]
+    async fn test_version_lineage_regression_shared_patch_does_not_chain_series() {
+        let db = setup_db().await;
+        let author = "\"Oliver Hartkopp\" <socketcan@hartkopp.net>";
+        let shared = "1111111111111111111111111111111111111111";
+        let d0 = 1_791_548_073;
+
+        let ps_convert = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "20261009121115.61012-1-socketcan@hartkopp.net",
+                "[PATCH] can: convert unreliable ARPHRD_CAN type checks to robust can_get_ml_priv()",
+            )
+            .git_patch_id(shared)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_convert, "Pending")
+            .await
+            .unwrap();
+
+        let ps_proc = ingest_test_series(
+            &db,
+            author,
+            d0 + 6 * DAY,
+            None,
+            &[TestPart::new(
+                "20261016110905.422684-1-socketcan@hartkopp.net",
+                "[PATCH can-next v2] can: proc: reset pkg_stats atomics individually",
+            )
+            .git_patch_id(shared)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_proc, "Pending").await.unwrap();
+
+        let ps_rx_lock = ingest_test_series(
+            &db,
+            author,
+            d0 + 9 * DAY,
+            Some(TestPart::new(
+                "20261019074244.50391-1-socketcan@hartkopp.net",
+                "[PATCH can-next v3 0/2] can: protect the receive lists with a per-device lock",
+            )),
+            &[
+                TestPart::new(
+                    "20261019074244.50391-2-socketcan@hartkopp.net",
+                    "[PATCH can-next v3 1/2] can: proc: reset pkg_stats atomics individually",
+                )
+                .git_patch_id(shared),
+                TestPart::new(
+                    "20261019074244.50391-3-socketcan@hartkopp.net",
+                    "[PATCH can-next v3 2/2] can: protect the receive lists with a per-device lock",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_proc).await;
+        assert_not_linked(&db, ps_rx_lock).await;
+        assert_status(&db, ps_convert, "Pending").await;
+        assert_status(&db, ps_proc, "Pending").await;
+    }
+
+    /// Johannes Thumshirn's btrfs series 88601 (v2, "allocate METADATA on
+    /// conventional zones") and 93927 (v3, "fixes for generic/747") share
+    /// their first patches but have different cover letters. Patch
+    /// subjects must not be matched against the other series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_same_author_different_cover_not_linked() {
+        let db = setup_db().await;
+        let author = "\"Johannes Thumshirn\" <johannes.thumshirn@wdc.com>";
+        let d0 = 1_791_876_623;
+        let patch_subjects_v2 = [
+            "[PATCH v2 01/12] btrfs: zoned: fix possible race for reserved_active_zones",
+            "[PATCH v2 02/12] btrfs: zoned: don't activate conventional zones of mixed block groups",
+        ];
+        let patch_subjects_v3 = [
+            "[PATCH v3 01/25] btrfs: zoned: fix possible race for reserved_active_zones",
+            "[PATCH v3 02/25] btrfs: zoned: don't activate conventional zones of mixed block groups",
+        ];
+
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            Some(TestPart::new(
+                "20261013072941.424029-1-johannes.thumshirn@wdc.com",
+                "[PATCH v2 00/12] btrfs: zoned: allocate METADATA on conventional zones",
+            )),
+            &[
+                TestPart::new(
+                    "20261013072941.424029-2-johannes.thumshirn@wdc.com",
+                    patch_subjects_v2[0],
+                ),
+                TestPart::new(
+                    "20261013072941.424029-3-johannes.thumshirn@wdc.com",
+                    patch_subjects_v2[1],
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v2, "In Review").await.unwrap();
+
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 8 * DAY,
+            Some(TestPart::new(
+                "20261021080000.500000-1-johannes.thumshirn@wdc.com",
+                "[PATCH v3 00/25] btrfs: zoned: fixes for generic/747",
+            )),
+            &[
+                TestPart::new(
+                    "20261021080000.500000-2-johannes.thumshirn@wdc.com",
+                    patch_subjects_v3[0],
+                ),
+                TestPart::new(
+                    "20261021080000.500000-3-johannes.thumshirn@wdc.com",
+                    patch_subjects_v3[1],
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_v3).await;
+        assert_status(&db, ps_v2, "In Review").await;
+    }
+
+    /// Hao Ge's vmalloc v3 cover letter (96268) cites a patch of his older
+    /// alloc_tag v10 series (74286) as a footnote below "Changes since
+    /// v2:" and links its real v2 with "v2 link:". Only v2 may be linked;
+    /// the alloc_tag series must neither be linked to nor cancel the
+    /// newer series, even when it is reconciled again afterwards.
+    #[tokio::test]
+    async fn test_version_lineage_regression_dependency_link_after_changelog_heading() {
+        let db = setup_db().await;
+        let author = "\"Hao Ge\" <hao.ge@linux.dev>";
+        let d_alloc_tag = 1_789_455_555;
+
+        let ps_alloc_tag = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag,
+            Some(TestPart::new(
+                "20260915070001.113559-1-hao.ge@linux.dev",
+                "[PATCH v10 0/2] alloc_tag and module codetag section fixes",
+            )),
+            &[
+                TestPart::new(
+                    "20260915070001.113559-2-hao.ge@linux.dev",
+                    "[PATCH v10 1/2] alloc_tag: move release_module_tags() above reserve_module_tags()",
+                ),
+                TestPart::new(
+                    "20260915070001.113559-3-hao.ge@linux.dev",
+                    "[PATCH v10 2/2] alloc_tag: roll back a failed module tags populate",
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_alloc_tag, "Pending")
+            .await
+            .unwrap();
+
+        let ps_vmalloc_v2 = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag + 34 * DAY,
+            Some(TestPart::new(
+                "20261019054531.87652-1-hao.ge@linux.dev",
+                "[PATCH v2 0/1] mm/vmalloc: make the mapping functions undo their partial mappings",
+            )),
+            &[TestPart::new(
+                "20261019054531.87652-2-hao.ge@linux.dev",
+                "[PATCH v2 1/1] mm/vmalloc: undo partial mappings inside the mapping functions",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_vmalloc_v2, "Reviewed")
+            .await
+            .unwrap();
+
+        let v3_cover = "After discussing with Suren and Ulad [1], we move the rollback into\n\
+the mapping functions.\n\
+\n\
+Changes since v2:\n\
+- new patches fix the range checks and the error reporting\n\
+- commit messages reworded\n\
+\n\
+[1] https://lore.kernel.org/all/20260915070001.113559-3-hao.ge@linux.dev/\n\
+\n\
+v2 link: https://lore.kernel.org/all/20261019054531.87652-1-hao.ge@linux.dev/\n\
+v1 link: https://lore.kernel.org/all/20261009063619.112313-1-hao.ge@linux.dev/\n";
+        let ps_vmalloc_v3 = ingest_test_series(
+            &db,
+            author,
+            d_alloc_tag + 41 * DAY,
+            Some(
+                TestPart::new(
+                    "20261026080329.140244-1-hao.ge@linux.dev",
+                    "[PATCH v3 00/02] mm/vmalloc: fix up vmap error handling",
+                )
+                .body(v3_cover),
+            ),
+            &[
+                TestPart::new(
+                    "20261026080329.140244-2-hao.ge@linux.dev",
+                    "[PATCH v3 01/02] mm/kmsan: undo the shadow mapping when the origin mapping fails",
+                ),
+                TestPart::new(
+                    "20261026080329.140244-3-hao.ge@linux.dev",
+                    "[PATCH v3 02/02] mm/kmsan: skip vunmap_range_noflush when KMSAN is disabled",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_linked(&db, ps_vmalloc_v3, ps_vmalloc_v2, "message_ref").await;
+        assert_not_linked(&db, ps_alloc_tag).await;
+        assert_status(&db, ps_alloc_tag, "Pending").await;
+        assert_status(&db, ps_vmalloc_v2, "Reviewed").await;
+
+        // A late reconciliation of the older alloc_tag series must not
+        // adopt the newer vmalloc series as its predecessor.
+        db.reconcile_version_lineage(ps_alloc_tag).await.unwrap();
+        assert_not_linked(&db, ps_alloc_tag).await;
+        assert_ne!(
+            db.get_patchset_status(ps_vmalloc_v3)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Cancelled")
+        );
+    }
+
+    /// A new series posted as a reply into an older thread of the same
+    /// author must not become the next version of that thread's series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_reply_into_other_thread_not_linked() {
+        let db = setup_db().await;
+        let author = "Erin <erin@example.org>";
+
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "erin-old-1@example.org",
+                "[PATCH] ipv6: raw: fix use-after-free in rawv6_send_hdrinc()",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            10_000 + DAY,
+            None,
+            &[TestPart::new(
+                "erin-new-1@example.org",
+                "[PATCH v2] ipv6: raw: drop the stale hdrincl fast path",
+            )],
+            Some("erin-old-1@example.org"),
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_old, "Pending").await;
+    }
+
+    /// Kernel-version prose ("since v6.8") next to a Lore link does not
+    /// name a previous version.
+    #[tokio::test]
+    async fn test_version_lineage_regression_kernel_version_prose_not_linked() {
+        let db = setup_db().await;
+        let author = "Frank <frank@example.org>";
+
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "frank-old-1@example.org",
+                "[PATCH] drm/amd/display: set allow_freesync before validating a new state",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+
+        let body = "This regressed since v6.8, see https://lore.kernel.org/r/frank-old-1@example.org\n\
+and was partially fixed in v6.12 (https://lore.kernel.org/all/frank-old-1@example.org/).\n";
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            10_000 + DAY,
+            None,
+            &[TestPart::new(
+                "frank-new-1@example.org",
+                "[PATCH v2] drm/amd/display: keep vrr state across modesets",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_old, "Pending").await;
+    }
+
+    /// Karl Mehltretter's single patch 96263 was split out of his series
+    /// 91975 (it was patch 1/4 there). A single patch is only compared
+    /// with single patches, so it is not linked to the series.
+    #[tokio::test]
+    async fn test_version_lineage_regression_split_out_single_patch_not_linked() {
+        let db = setup_db().await;
+        let author = "\"Karl Mehltretter\" <kmehltretter@gmail.com>";
+        let d0 = 1_792_394_000;
+
+        let ps_series = ingest_test_series(
+            &db,
+            author,
+            d0,
+            Some(TestPart::new(
+                "20261019070000.10000-1-kmehltretter@gmail.com",
+                "[PATCH 0/2] media: synchronize CPU access to imported DMA-BUFs",
+            )),
+            &[
+                TestPart::new(
+                    "20261019070000.10000-2-kmehltretter@gmail.com",
+                    "[PATCH 1/2] media: videobuf2: finish prepared buffers in VIDIOC_REMOVE_BUFS",
+                ),
+                TestPart::new(
+                    "20261019070000.10000-3-kmehltretter@gmail.com",
+                    "[PATCH 2/2] media: videobuf2: add opt-in DMA-BUF CPU access",
+                ),
+            ],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_series, "Pending")
+            .await
+            .unwrap();
+
+        let ps_single = ingest_test_series(
+            &db,
+            author,
+            d0 + 7 * DAY,
+            None,
+            &[TestPart::new(
+                "20261026071735.37220-1-kmehltretter@gmail.com",
+                "[PATCH v2] media: videobuf2: finish prepared buffers in VIDIOC_REMOVE_BUFS",
+            )],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_single).await;
+        assert_status(&db, ps_series, "Pending").await;
+    }
+
+    /// Two different patchsets at the same top version linked from the
+    /// body are ambiguous: nothing is linked and nothing is cancelled.
+    #[tokio::test]
+    async fn test_version_lineage_equally_ranked_candidates_not_linked() {
+        let db = setup_db().await;
+        let author = "Grace <grace@example.org>";
+
+        let ps_a = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "grace-a-1@example.org",
+                "[PATCH v2] mm: compaction: skip isolated pageblocks",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_a, "Pending").await.unwrap();
+        let ps_b = ingest_test_series(
+            &db,
+            author,
+            11_000,
+            None,
+            &[TestPart::new(
+                "grace-b-1@example.org",
+                "[PATCH v2] mm: page_alloc: drain pcp lists earlier",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_b, "Pending").await.unwrap();
+
+        let body = "Merged two series into one.\n\
+---\n\
+v2: https://lore.kernel.org/linux-mm/grace-a-1@example.org/\n\
+v2: https://lore.kernel.org/linux-mm/grace-b-1@example.org/\n";
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            12_000,
+            None,
+            &[TestPart::new(
+                "grace-new-1@example.org",
+                "[PATCH v3] mm: compaction: skip isolated pageblocks",
+            )
+            .body(body)],
+            None,
+        )
+        .await;
+
+        assert_not_linked(&db, ps_new).await;
+        assert_status(&db, ps_a, "Pending").await;
+        assert_status(&db, ps_b, "Pending").await;
+    }
+
+    /// Positive cases: an exact single-patch subject links v1 -> v2, b4's
+    /// "Link to v2" links a renamed v3, and an explicit "v3: <url>" links
+    /// v4. Each new link cancels only its direct in-flight predecessor.
+    #[tokio::test]
+    async fn test_version_lineage_explicit_links_and_exact_subject() {
+        let db = setup_db().await;
+        let author = "\"Andrea Amer\" <and.amer@gmail.com>";
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            10_000,
+            None,
+            &[TestPart::new(
+                "20261012-iio-rescale-offset-v1-1-14ed15979ff2@gmail.com",
+                "[PATCH] iio: afe: rescale: always expose offset",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v1, "Reviewed").await.unwrap();
+
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 4 * DAY,
+            None,
+            &[TestPart::new(
+                "20261016-iio-rescale-offset-v2-1-02c825967139@gmail.com",
+                "[PATCH v2] iio: afe: rescale: always expose offset",
+            )
+            .body("Fix offset.\n---\nChanges in v2:\n- Use the source offset\n")],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v2, ps_v1, "subject_author").await;
+        db.update_patchset_status(ps_v2, "Pending").await.unwrap();
+
+        let v3_body = "Expose offset.\n---\nChanges in v3:\n- Only expose offset when present\n\
+- Link to v2: https://lore.kernel.org/r/20261016-iio-rescale-offset-v2-1-02c825967139@gmail.com\n";
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 13 * DAY,
+            None,
+            &[TestPart::new(
+                "20261025-iio-rescale-offset-v3-1-aaaaaaaaaaaa@gmail.com",
+                "[PATCH v3] iio: afe: rescale: expose offset if rescaler or source has one",
+            )
+            .body(v3_body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v3, ps_v2, "message_ref").await;
+        assert_status(&db, ps_v2, "Cancelled").await;
+        assert_status(&db, ps_v1, "Reviewed").await;
+
+        let v4_body = "Expose offset.\n---\nv3: https://lore.kernel.org/all/20261025-iio-rescale-offset-v3-1-aaaaaaaaaaaa@gmail.com/\n";
+        let ps_v4 = ingest_test_series(
+            &db,
+            author,
+            10_000 + 20 * DAY,
+            None,
+            &[TestPart::new(
+                "20261101-iio-rescale-offset-v4-1-bbbbbbbbbbbb@gmail.com",
+                "[PATCH v4] iio: afe: rescale: report the combined offset",
+            )
+            .body(v4_body)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v4, ps_v3, "message_ref").await;
+
+        let chain: Vec<i64> = db
+            .get_patchset_version_chain(ps_v4, 0)
+            .await
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(chain, vec![ps_v1, ps_v2, ps_v3, ps_v4]);
+    }
+
+    /// Superseding cancels only the predecessor of a new link, never its
+    /// own predecessors, never an explicitly rerun predecessor of an
+    /// existing link, and a subject-only link only within 30 days.
+    #[tokio::test]
+    async fn test_version_lineage_supersedes_only_new_direct_predecessor() {
+        let db = setup_db().await;
+        let author = "Heidi <heidi@example.org>";
+        let subject_v1 = "[PATCH] spi: fsl: release the DMA channels on remove";
+        let subject_v2 = "[PATCH v2] spi: fsl: release the DMA channels on remove";
+        let subject_v3 = "[PATCH v3] spi: fsl: release the DMA channels on remove";
+        let d0 = 1_790_000_000;
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new("heidi-v1@example.org", subject_v1)],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_v1, "Pending").await.unwrap();
+
+        // An exact subject 45 days later links but is too old to supersede.
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0 + 45 * DAY,
+            None,
+            &[TestPart::new("heidi-v2@example.org", subject_v2)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v2, ps_v1, "subject_author").await;
+        assert_status(&db, ps_v1, "Pending").await;
+        db.update_patchset_status(ps_v2, "Pending").await.unwrap();
+
+        // v3 supersedes v2 within 30 days, but not v1 transitively.
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 50 * DAY,
+            None,
+            &[TestPart::new("heidi-v3@example.org", subject_v3)],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_v3, ps_v2, "subject_author").await;
+        assert_status(&db, ps_v2, "Cancelled").await;
+        assert_status(&db, ps_v1, "Pending").await;
+
+        // An explicit rerun of v2 is respected when v3 is reconciled again
+        // with the same link.
+        db.rerun_patchset(ps_v2).await.unwrap();
+        assert_status(&db, ps_v2, "Pending").await;
+        db.reconcile_version_lineage(ps_v3).await.unwrap();
+        assert_linked(&db, ps_v3, ps_v2, "subject_author").await;
+        assert_status(&db, ps_v2, "Pending").await;
+
+        // An explicit previous-version link supersedes regardless of age.
+        let ps_old = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "heidi-old-v1@example.org",
+                "[PATCH] spi: fsl: fix the chip select polarity",
+            )],
+            None,
+        )
+        .await;
+        db.update_patchset_status(ps_old, "Pending").await.unwrap();
+        let ps_new = ingest_test_series(
+            &db,
+            author,
+            d0 + 90 * DAY,
+            None,
+            &[TestPart::new(
+                "heidi-new-v2@example.org",
+                "[PATCH v2] spi: fsl: honour the chip select polarity from DT",
+            )
+            .body("Rework.\n---\nv1: https://lore.kernel.org/all/heidi-old-v1@example.org/\n")],
+            None,
+        )
+        .await;
+        assert_linked(&db, ps_new, ps_old, "message_ref").await;
+        assert_status(&db, ps_old, "Cancelled").await;
+
+        // Upgrading a >30d link from subject_author to change_id supersedes
+        // the predecessor once, and respects a later rerun.
+        db.set_patchset_change_id_if_unset(ps_v1, "heidi-dma-series")
+            .await
+            .unwrap();
+        db.set_patchset_change_id_if_unset(ps_v2, "heidi-dma-series")
+            .await
+            .unwrap();
+        assert_linked(&db, ps_v2, ps_v1, "change_id").await;
+        assert_status(&db, ps_v1, "Cancelled").await;
+        db.rerun_patchset(ps_v1).await.unwrap();
+        assert_status(&db, ps_v1, "Pending").await;
+        db.reconcile_version_lineage(ps_v2).await.unwrap();
+        assert_status(&db, ps_v1, "Pending").await;
+    }
+
+    #[tokio::test]
+    async fn test_version_lineage_lazily_links_pre_migration_14_ancestor_chain() {
+        let db = setup_db().await;
+        let author = "Zhan Xusheng <zhanxusheng1024@gmail.com>";
+        let d0 = 1_780_000_000i64;
+
+        let ps_v1 = ingest_test_series(
+            &db,
+            author,
+            d0,
+            None,
+            &[TestPart::new(
+                "20261016032732.2328852-1-zhanxusheng@xiaomi.com",
+                "[PATCH] Input: sysrq - reset the per-device key state when reparsing reset_seq",
+            )],
+            None,
+        )
+        .await;
+        let ps_v2 = ingest_test_series(
+            &db,
+            author,
+            d0 + DAY,
+            None,
+            &[TestPart::new(
+                "20261016070636.2559899-1-zhanxusheng@xiaomi.com",
+                "[PATCH v2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+            )
+            .body("Fix state.\n---\nv1: https://lore.kernel.org/all/20261016032732.2328852-1-zhanxusheng@xiaomi.com/\n")],
+            None,
+        )
+        .await;
+        let ps_v3 = ingest_test_series(
+            &db,
+            author,
+            d0 + 5 * DAY,
+            Some(
+                TestPart::new(
+                    "20261021022007.1717207-1-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 0/2] tty: sysrq: fix the reset sequence state kept per input device",
+                )
+                .body("Cover v3.\n\nv2: https://lore.kernel.org/all/20261016070636.2559899-1-zhanxusheng@xiaomi.com/\nv1: https://lore.kernel.org/all/20261016032732.2328852-1-zhanxusheng@xiaomi.com/\n"),
+            ),
+            &[
+                TestPart::new(
+                    "20261021022007.1717207-2-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 1/2] tty: sysrq: move reset sequence state to sysrq_state",
+                ),
+                TestPart::new(
+                    "20261021022007.1717207-3-zhanxusheng1024@gmail.com",
+                    "[PATCH v3 2/2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        // Simulate pre-migration-14 rows for v1, v2, and v3 (version IS NULL,
+        // previous_patchset_id IS NULL, and Pending status on v2 to verify
+        // lazy ancestor reconciliation never cancels historical predecessors).
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?, ?)",
+            libsql::params![ps_v1, ps_v2, ps_v3],
+        )
+        .await
+        .unwrap();
+        db.execute(
+            "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+            libsql::params![ps_v2],
+        )
+        .await
+        .unwrap();
+
+        let ps_v4 = ingest_test_series(
+            &db,
+            author,
+            d0 + 14 * DAY,
+            Some(
+                TestPart::new(
+                    "20261030045854.153556-1-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 0/2] tty: sysrq: fix the reset sequence kept per input device",
+                )
+                .body("Cover v4.\n\nv3: https://lore.kernel.org/all/20261021022007.1717207-1-zhanxusheng1024@gmail.com/\n"),
+            ),
+            &[
+                TestPart::new(
+                    "20261030045854.153556-2-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 1/2] tty: sysrq: move reset sequence state to sysrq_state",
+                ),
+                TestPart::new(
+                    "20261030045854.153556-3-zhanxusheng1024@gmail.com",
+                    "[PATCH v4 2/2] tty: sysrq: reset the per-device key state when reparsing reset_seq",
+                ),
+            ],
+            None,
+        )
+        .await;
+
+        assert_linked(&db, ps_v4, ps_v3, "message_ref").await;
+        assert_linked(&db, ps_v3, ps_v2, "message_ref").await;
+        assert_linked(&db, ps_v2, ps_v1, "message_ref").await;
+        // Historical ancestor ps_v2 must not be cancelled when lazily linked.
+        assert_status(&db, ps_v2, "Pending").await;
+
+        // Also verify lazy on-read reconciliation when v4 was already linked to v3
+        // before v3 and v2 were reconciled.
+        db.execute(
+            "UPDATE patchsets SET version = NULL, previous_patchset_id = NULL, version_link_signal = NULL WHERE id IN (?, ?)",
+            libsql::params![ps_v2, ps_v3],
+        )
+        .await
+        .unwrap();
+
+        let details = db
+            .get_patchset_details(ps_v4, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let versions: Vec<i64> = details["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(versions, vec![ps_v1, ps_v2, ps_v3, ps_v4]);
+    }
+
+    #[test]
+    fn test_author_email_candidates_and_generic_short_subject_heuristics() {
+        let regular = Database::author_email_candidates("Alice Dev <Alice.Dev@Example.COM>");
+        assert_eq!(regular[0], "alice.dev@example.com");
+        assert_eq!(regular[1], "devnull+alice.dev.example.com@kernel.org");
+        assert_eq!(regular[2], "devnull+alice.dev.example.com@linux.dev");
+        assert_eq!(regular[3], "alice.dev@example.com");
+
+        let relay = Database::author_email_candidates(
+            "Alice via B4 Relay <devnull+alice.dev.example.com@kernel.org>",
+        );
+        assert_eq!(relay[0], "devnull+alice.dev.example.com@kernel.org");
+        assert!(relay.contains(&"alice.dev@example.com".to_string()));
+
+        let empty = Database::author_email_candidates("   ");
+        assert_eq!(empty, ["", "", "", ""]);
+
+        assert!(Database::is_generic_short_subject("fix typo", &[]));
+        assert!(Database::is_generic_short_subject("  Clean Up  ", &[]));
+        assert!(!Database::is_generic_short_subject(
+            "fix typo",
+            &["net".to_string()]
+        ));
+        assert!(!Database::is_generic_short_subject(
+            "mm: fix page_alloc race",
+            &[]
+        ));
+    }
+
     fn collect_rust_sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
         let entries = std::fs::read_dir(dir).expect("readable source directory");
         for entry in entries.flatten() {
@@ -22533,10 +35457,160 @@ mod tests {
         }
     }
 
+    /// Strips items annotated with `#[cfg(test)]` or `#[cfg(all(test, ...))]`
+    /// while preserving any production items declared after an inline test
+    /// module or helper.
+    fn strip_cfg_test_items(src: &str) -> String {
+        fn advance_non_code(bytes: &[u8], i: usize) -> Option<usize> {
+            let n = bytes.len();
+            if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+                let mut j = i + 2;
+                while j < n && bytes[j] != b'\n' {
+                    j += 1;
+                }
+                return Some(j);
+            }
+            if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                let mut j = i + 2;
+                let mut depth = 1usize;
+                while j + 1 < n && depth > 0 {
+                    if bytes[j] == b'/' && bytes[j + 1] == b'*' {
+                        depth += 1;
+                        j += 2;
+                    } else if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                return Some(if depth == 0 { j } else { n });
+            }
+            // Raw string literal: r"...", r#"..."#, br#"..."#
+            let raw_start = if bytes[i] == b'r' {
+                Some(i + 1)
+            } else if i + 1 < n && bytes[i] == b'b' && bytes[i + 1] == b'r' {
+                Some(i + 2)
+            } else {
+                None
+            };
+            if let Some(mut k) = raw_start {
+                let mut hashes = 0usize;
+                while k < n && bytes[k] == b'#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && bytes[k] == b'"' {
+                    k += 1;
+                    while k < n {
+                        if bytes[k] == b'"'
+                            && k + 1 + hashes <= n
+                            && bytes[k + 1..k + 1 + hashes].iter().all(|&b| b == b'#')
+                        {
+                            return Some(k + 1 + hashes);
+                        }
+                        k += 1;
+                    }
+                    return Some(n);
+                }
+            }
+            if bytes[i] == b'"' {
+                let mut j = i + 1;
+                while j < n {
+                    if bytes[j] == b'\\' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b'"' {
+                        return Some(j + 1);
+                    }
+                    j += 1;
+                }
+                return Some(n);
+            }
+            // Character or byte-char literal (`'x'` or `'\x'`), distinct from `'lifetime`.
+            if bytes[i] == b'\'' && i + 2 < n {
+                if bytes[i + 1] == b'\\' {
+                    let mut j = i + 2;
+                    while j < n && j <= i + 6 && bytes[j] != b'\n' {
+                        if bytes[j] == b'\'' {
+                            return Some(j + 1);
+                        }
+                        j += 1;
+                    }
+                } else if i + 2 < n && bytes[i + 2] == b'\'' {
+                    return Some(i + 3);
+                }
+            }
+            None
+        }
+
+        let bytes = src.as_bytes();
+        let n = bytes.len();
+        let mut out = String::with_capacity(n);
+        let mut copy_from = 0usize;
+        let mut i = 0usize;
+
+        while i < n {
+            if let Some(next_i) = advance_non_code(bytes, i) {
+                i = next_i;
+                continue;
+            }
+            let tail = &src[i..];
+            if tail.starts_with("#[cfg(test)]") || tail.starts_with("#[cfg(all(test,") {
+                out.push_str(&src[copy_from..i]);
+                let mut j = i + 2;
+                // Skip past the attribute and any subsequent attributes/signature up to `;` or `{`.
+                while j < n && bytes[j] != b';' && bytes[j] != b'{' {
+                    if let Some(next_j) = advance_non_code(bytes, j) {
+                        j = next_j;
+                    } else {
+                        j += 1;
+                    }
+                }
+                if j < n && bytes[j] == b';' {
+                    i = j + 1;
+                    copy_from = i;
+                    continue;
+                }
+                if j < n && bytes[j] == b'{' {
+                    let mut depth = 1usize;
+                    j += 1;
+                    while j < n && depth > 0 {
+                        if let Some(next_j) = advance_non_code(bytes, j) {
+                            j = next_j;
+                        } else {
+                            if bytes[j] == b'{' {
+                                depth += 1;
+                            } else if bytes[j] == b'}' {
+                                depth -= 1;
+                            }
+                            j += 1;
+                        }
+                    }
+                    i = j;
+                    copy_from = i;
+                    continue;
+                }
+            }
+            i += src[i..].chars().next().map_or(1, char::len_utf8);
+        }
+        out.push_str(&src[copy_from..]);
+        out
+    }
+
     /// Every explicit SQLite transaction and production write must go through
-    /// `Database` methods on `tx_conn` under `tx_lock`.
+    /// `Database` methods on `tx_conn` under `tx_lock`, and every production
+    /// `SELECT` must go through `Database::read_conn()`.
     #[test]
     fn test_no_unserialized_database_transactions() {
+        let synthetic = "fn before() {}\n#[cfg(test)]\nmod tests {\n    fn t() { db.conn.query(\"SELECT 1\", ()); }\n}\nfn after() { state.db.conn.query(\"SELECT 1\", ()); }\n";
+        let stripped = strip_cfg_test_items(synthetic);
+        assert!(
+            stripped.contains("state.db.conn.query") && !stripped.contains("fn t()"),
+            "strip_cfg_test_items must retain production items after #[cfg(test)] blocks: {stripped}"
+        );
+
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let mut files = Vec::new();
         for dir in ["src", "tests"] {
@@ -22551,9 +35625,10 @@ mod tests {
             concat!(".execute(\"BEGIN", " IMMEDIATE"),
             concat!(".execute(\"BEGIN", " TRANSACTION"),
         ];
-        let forbidden_prod_writes = [
+        let forbidden_prod_conn_calls = [
             concat!(".conn", ".execute("),
             concat!(".conn", ".execute_batch("),
+            concat!(".conn", ".query("),
         ];
 
         let mut offenders = Vec::new();
@@ -22564,16 +35639,15 @@ mod tests {
                     offenders.push(format!("{} (contains `{pattern}`)", path.display()));
                 }
             }
-            if path.starts_with(manifest_dir.join("src")) {
-                let prod_slice = content
-                    .split("#[cfg(test)]")
-                    .next()
-                    .unwrap_or(&content)
-                    .split("#[cfg(all(test,")
-                    .next()
-                    .unwrap_or(&content);
-                for pattern in forbidden_prod_writes {
-                    if prod_slice.contains(pattern) {
+            if path.starts_with(manifest_dir.join("src")) && !path.ends_with("src/ai/cache.rs") {
+                let prod_slice = strip_cfg_test_items(&content);
+                let compact_prod: String = prod_slice
+                    .lines()
+                    .map(|line| line.split("//").next().unwrap_or(""))
+                    .flat_map(|line| line.chars().filter(|c| !c.is_whitespace()))
+                    .collect();
+                for pattern in forbidden_prod_conn_calls {
+                    if compact_prod.contains(pattern) {
                         offenders.push(format!(
                             "{} production code (contains `{pattern}`)",
                             path.display()
@@ -22585,9 +35659,10 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "Unserialized database transactions or writes on conn detected. Always use \
-             Database::execute, Database::execute_batch, Database::begin_transaction, or \
-             Database::begin_immediate_transaction instead of writing on conn directly. \
+            "Direct `Database::conn` query/write or unserialized transaction detected in \
+             production code. Always use `Database::read_conn()` for SELECTs and \
+             `Database::execute`, `Database::execute_batch`, `Database::begin_transaction`, or \
+             `Database::begin_immediate_transaction` for writes. \
              Offenders: {}",
             offenders.join(", ")
         );
@@ -22789,5 +35864,3505 @@ mod tests {
                 "unexpected uncompressed text row > 1024 bytes in {table}.{col}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_rerun_patchset_cleans_in_review_artifacts_and_resets_to_pending() -> Result<()> {
+        let db = setup_db().await;
+        let tid = db
+            .create_thread("in_review_cleanup@kernel.org", "[PATCH] test", 1000)
+            .await?;
+        db.create_message(
+            "in_review_cleanup@kernel.org",
+            tid,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] test",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                None,
+                "in_review_cleanup@kernel.org",
+                "[PATCH] test",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(ps_id, "in_review_cleanup@kernel.org", 1, "diff")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_ai_interaction(AiInteractionParams {
+            id: "inter-aborted-1",
+            parent_id: None,
+            workflow_id: None,
+            provider: "gemini",
+            model: "pro",
+            input: "in",
+            output: "out",
+            tokens_in: 10,
+            tokens_out: 20,
+            tokens_cached: 0,
+        })
+        .await?;
+        db.update_review_status(review_id, "In Review", Some("inter-aborted-1"))
+            .await?;
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: Some("partial finding before DB completion error".to_string()),
+            problem: "partial finding".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.create_tool_usage(ToolUsage {
+            review_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "git_diff".to_string(),
+            arguments: Some("{}".to_string()),
+            output_length: 12,
+        })
+        .await?;
+        let bug_id = db
+            .create_bug(&NewBug {
+                bugid: "linux-aborted-rerun-1".to_string(),
+                title: "Partial bug candidate".to_string(),
+                lifecycle_status: BugLifecycleStatus::New,
+                pipeline_state: BugPipelineState::Pending,
+                assignee: None,
+                reporter: "sashiko".to_string(),
+                reported_at: 1000,
+                discovered_in_patchset_id: Some(ps_id),
+                discovered_in_patch_id: Some(patch_id),
+                discovered_in_commit: None,
+                source_ref: None,
+                vector_json: None,
+                duplicate_of_id: None,
+                subsystems: vec![],
+            })
+            .await?;
+        db.link_review_to_bug(review_id, bug_id, true).await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "stale outbox body",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "stale patchwork check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+
+        db.rerun_patchset(ps_id).await?;
+
+        let reused_id = db.get_pending_review_id(ps_id, Some(patch_id)).await?;
+        assert_eq!(reused_id, None);
+
+        let mut eo_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let eo_count: i64 = eo_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(eo_count, 0);
+
+        let mut pw_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        let pw_count: i64 = pw_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(pw_count, 0);
+
+        let mut br_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM bug_reviews WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let br_count: i64 = br_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(br_count, 0);
+
+        let mut f_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let f_count: i64 = f_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(
+            f_count, 0,
+            "rerun_patchset must delete partial findings from In Review rows"
+        );
+
+        let mut t_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let t_count: i64 = t_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(t_count, 0);
+
+        let mut rev_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        assert!(rev_rows.next().await?.is_none());
+
+        assert!(
+            db.complete_review(
+                review_id,
+                "Reviewed",
+                "late completion from old worker",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert!(db.clear_aborted_review_artifacts(review_id).await.is_err());
+
+        // Also verify clear_aborted_review_artifacts on a claimed Pending row
+        let retry_rev_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id: retry_rev_id,
+            severity: Severity::Medium,
+            severity_explanation: Some("aborted finding".to_string()),
+            problem: "aborted".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.create_tool_usage(ToolUsage {
+            review_id: retry_rev_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "git_diff".to_string(),
+            arguments: Some("{}".to_string()),
+            output_length: 8,
+        })
+        .await?;
+        db.link_review_to_bug(retry_rev_id, bug_id, true).await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "aborted body",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "aborted patchwork check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+
+        let claimed = db.claim_pending_review_id(ps_id, Some(patch_id)).await?;
+        assert_eq!(claimed, Some(retry_rev_id));
+
+        for table in ["findings", "tool_usages", "bug_reviews"] {
+            let mut rows = db
+                .conn
+                .query(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE review_id = ?"),
+                    libsql::params![retry_rev_id],
+                )
+                .await?;
+            let count: i64 = rows.next().await?.unwrap().get(0)?;
+            assert_eq!(count, 0, "expected {table} to be cleared");
+        }
+        let mut eo2 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        assert_eq!(eo2.next().await?.unwrap().get::<i64>(0)?, 0);
+        let mut pw2 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        assert_eq!(pw2.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        // While retry_rev_id is actively 'In Review', claim_or_create_in_review
+        // must NOT reclaim a live 'In Review' row (which would allow two workers
+        // to share a review ID); once a daemon restarts and reset_reviewing_status()
+        // transitions retry_rev_id back to 'Pending', claim_or_create_in_review
+        // reclaims it and clears any orphaned findings.
+        db.create_finding(Finding {
+            review_id: retry_rev_id,
+            severity: Severity::Low,
+            severity_explanation: Some("orphaned finding".to_string()),
+            problem: "orphaned".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+        db.reset_reviewing_status().await?;
+        let reclaimed_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_eq!(reclaimed_id, retry_rev_id);
+        let mut orphaned_f_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                libsql::params![retry_rev_id],
+            )
+            .await?;
+        assert_eq!(orphaned_f_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        // Once the active review reaches a terminal status, a subsequent
+        // claim_or_create_in_review inserts a fresh row directly in 'In Review'.
+        db.complete_review(
+            retry_rev_id,
+            "Reviewed",
+            "completed",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let fresh_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_ne!(fresh_id, retry_rev_id);
+
+        // Verify that unsent outbox rows ('Skipped', 'Dry-Run', 'Pending') are
+        // refreshed in place when a subsequent review run queues notifications.
+        db.insert_email_outbox(
+            patch_id,
+            "Skipped",
+            "to@b.c",
+            "",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "clean body",
+        )
+        .await?;
+        db.insert_email_outbox(
+            patch_id,
+            "Pending",
+            "to@b.c",
+            "cc@b.c",
+            "Re: [PATCH] test",
+            "<in_review_cleanup@kernel.org>",
+            "<in_review_cleanup@kernel.org>",
+            "finding body",
+        )
+        .await?;
+        let mut eo_refresh = db
+            .conn
+            .query(
+                "SELECT status, body FROM email_outbox WHERE patch_id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let eo_row = eo_refresh.next().await?.unwrap();
+        assert_eq!(eo_row.get::<String>(0)?, "Pending");
+        assert_eq!(eo_row.get::<String>(1)?, "finding body");
+        assert!(eo_refresh.next().await?.is_none());
+
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "success",
+            "clean check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+        db.insert_patchwork_outbox(
+            "in_review_cleanup@kernel.org",
+            "https://patchwork.kernel.org/api/1.2",
+            "warning",
+            "finding check",
+            "https://sashiko.dev/#/patchset/in_review_cleanup@kernel.org",
+            "sashiko",
+        )
+        .await?;
+        let mut pw_refresh = db
+            .conn
+            .query(
+                "SELECT check_state, description FROM patchwork_outbox WHERE patch_msg_id = ?",
+                libsql::params!["in_review_cleanup@kernel.org"],
+            )
+            .await?;
+        let pw_row = pw_refresh.next().await?.unwrap();
+        assert_eq!(pw_row.get::<String>(0)?, "warning");
+        assert_eq!(pw_row.get::<String>(1)?, "finding check");
+        assert!(pw_refresh.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cancelled_worker_cannot_poison_concurrent_rerun() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("late_cancel_rerun@kernel.org", "[PATCH] test", 1000)
+            .await?;
+        db.create_message(
+            "late_cancel_rerun@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] test late cancel vs rerun",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("late_cancel_rerun@kernel.org"),
+                "late_cancel_rerun@kernel.org",
+                "[PATCH] test late cancel vs rerun",
+                "Author <a@b.c>",
+                1000,
+                1,
+                0,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "late_cancel_rerun@kernel.org",
+                1,
+                "diff --git a/x.c b/x.c",
+            )
+            .await?;
+
+        assert!(db.claim_patchset_for_review(ps_id).await?);
+        let first_rev_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id: first_rev_id,
+            severity: Severity::Medium,
+            severity_explanation: Some("first attempt partial finding".to_string()),
+            problem: "partial".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await?;
+
+        // Operator cancels the in-flight patchset, then immediately triggers a rerun
+        // before the old worker finishes unwinding.
+        assert!(db.cancel_patchset(ps_id, true).await?);
+
+        // An in-flight worker racing against cancellation on the ignore_files or
+        // normal review path cannot claim/insert a new 'In Review' row or mark an
+        // existing row 'Skipped' / 'Reviewed' once patchsets.status is 'Cancelled'.
+        let claim_err = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await
+            .expect_err("claim_or_create_in_review must reject cancelled patchset");
+        assert!(
+            claim_err.to_string().contains("no longer exists"),
+            "unexpected claim error: {claim_err}"
+        );
+        let complete_err = db
+            .complete_review(
+                first_rev_id,
+                "Skipped",
+                "Skipped: touches only ignored files",
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("complete_review must reject non-Cancelled write on cancelled patchset");
+        assert!(
+            complete_err.to_string().contains("no longer exists"),
+            "unexpected complete error: {complete_err}"
+        );
+
+        // An in-flight worker racing between get_patchset_status and its first AI
+        // request cannot revert the cancelled review back to 'In Review' or insert
+        // orphaned tool_usages rows.
+        db.update_review_status(first_rev_id, "In Review", None)
+            .await?;
+        assert!(!db.mark_review_in_review_if_active(first_rev_id).await?);
+        db.create_tool_usage(ToolUsage {
+            review_id: first_rev_id,
+            provider: "gemini".to_string(),
+            model: "pro".to_string(),
+            tool_name: "ai_request".to_string(),
+            arguments: None,
+            output_length: 42,
+        })
+        .await?;
+        let mut tu_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![first_rev_id],
+            )
+            .await?;
+        assert_eq!(tu_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        db.rerun_patchset(ps_id).await?;
+
+        // Rerun worker claims the patchset and creates/claims a new review row.
+        assert!(db.claim_patchset_for_review(ps_id).await?);
+        let pending_rev_id = db
+            .create_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(
+            pending_rev_id > first_rev_id,
+            "rerun must allocate a strictly newer review ID ({pending_rev_id} <= {first_rev_id})"
+        );
+
+        // Late unwinding worker from the cancelled attempt now runs its cleanup calls.
+        db.cancel_aborted_review(
+            first_rev_id,
+            "Cancelled because patchset was superseded or cancelled",
+        )
+        .await?;
+        db.cancel_pending_review_for_patch(
+            ps_id,
+            Some(patch_id),
+            "Cancelled because patchset was superseded or cancelled",
+        )
+        .await?;
+        db.update_patch_status(patch_id, "Cancelled").await?;
+
+        // Neither the patch status nor the newly created Pending review row may be
+        // poisoned back to 'Cancelled'.
+        let mut p_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let p_status: String = p_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(p_status, "Pending");
+
+        let mut r_rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE id = ?",
+                libsql::params![pending_rev_id],
+            )
+            .await?;
+        let r_status: String = r_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(r_status, "Pending");
+
+        // Rerun worker can now claim pending_rev_id and transition patch_id to 'Reviewed'.
+        let claimed_id = db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert_eq!(claimed_id, pending_rev_id);
+        db.update_patch_status(patch_id, "Reviewed").await?;
+
+        let mut p_rows2 = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let p_status2: String = p_rows2.next().await?.unwrap().get(0)?;
+        assert_eq!(p_status2, "Reviewed");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_review_failure_reason_lifecycle() -> Result<()> {
+        let db = setup_db().await;
+        let root = "failed_reason@kernel.org";
+        let thread_id = db.create_thread(root, "[PATCH] reason", 1000).await?;
+        db.create_message(
+            root,
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] reason",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some(root),
+                root,
+                "[PATCH] reason",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, root, 1, "diff --git a/r.c b/r.c")
+            .await?;
+        let read = |db: Arc<Database>| async move {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT status, failed_reason FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await?;
+            let row = rows.next().await?.expect("patchset row");
+            Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<Option<String>>(1)?))
+        };
+
+        // A failed run records its reason under the active claim.
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker1 = db.with_patchset_claim(ps_id, gen1);
+        assert!(
+            worker1
+                .complete_patchset_review(ps_id, "Failed", Some("1 of 1 patch reviews failed"))
+                .await?
+        );
+        assert_eq!(
+            read(db.clone()).await?,
+            (
+                "Failed".to_string(),
+                Some("1 of 1 patch reviews failed".to_string())
+            )
+        );
+
+        // A rerun clears the stale reason, and a superseded worker cannot
+        // write a reason over the new run.
+        db.rerun_patchset(ps_id).await?;
+        assert_eq!(read(db.clone()).await?, ("Pending".to_string(), None));
+        let gen2 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        assert!(
+            !worker1
+                .complete_patchset_review(ps_id, "Failed", Some("stale worker"))
+                .await?
+        );
+        assert_eq!(read(db.clone()).await?, ("In Review".to_string(), None));
+
+        // A successful completion leaves no reason behind.
+        let worker2 = db.with_patchset_claim(ps_id, gen2);
+        assert!(
+            worker2
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+        assert_eq!(read(db.clone()).await?, ("Reviewed".to_string(), None));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_review_claim_generation_fences_superseded_worker_on_rerun() -> Result<()>
+    {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("gen_fence_rerun@kernel.org", "[PATCH] gen fence", 1000)
+            .await?;
+        db.create_message(
+            "gen_fence_rerun@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH] gen fence",
+            1000,
+            "body",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("gen_fence_rerun@kernel.org"),
+                "gen_fence_rerun@kernel.org",
+                "[PATCH] gen fence",
+                "Author <a@b.c>",
+                1000,
+                1,
+                1,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "gen_fence_rerun@kernel.org",
+                1,
+                "diff --git a/g.c b/g.c",
+            )
+            .await?;
+
+        // Worker 1 claims patchset under generation 1.
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker1_db = db.with_patchset_claim(ps_id, gen1);
+        assert!(worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let rev1_id = worker1_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(worker1_db.mark_review_in_review_if_active(rev1_id).await?);
+
+        // Operator calls rerun_patchset directly on the In Review patchset (without cancel_patchset),
+        // and Worker 2 immediately claims the patchset under generation 2.
+        db.rerun_patchset(ps_id).await?;
+        assert!(!worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let gen2 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        assert!(gen2 > gen1);
+        let worker2_db = db.with_patchset_claim(ps_id, gen2);
+        assert!(worker2_db.is_patchset_claim_active(ps_id).await?);
+        // Even though patchsets.status is back to 'In Review', Worker 1 remains fenced out!
+        assert!(!worker1_db.is_patchset_claim_active(ps_id).await?);
+
+        let rev2_id = worker2_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        assert!(rev2_id > rev1_id);
+
+        // Every write attempted by superseded Worker 1 (even targeting rev2_id or ps_id) must fail or no-op.
+        assert!(!worker1_db.mark_review_in_review_if_active(rev1_id).await?);
+        assert!(!worker1_db.mark_review_in_review_if_active(rev2_id).await?);
+        assert!(
+            worker1_db
+                .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .clear_aborted_review_artifacts(rev2_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .create_finding(Finding {
+                    review_id: rev2_id,
+                    severity: Severity::High,
+                    severity_explanation: Some("stale worker".to_string()),
+                    problem: "stale".to_string(),
+                    preexisting: Some(false),
+                    locations: None,
+                })
+                .await
+                .is_err()
+        );
+        assert!(
+            worker1_db
+                .complete_review(rev2_id, "Failed", "stale fail", None, None, None, None)
+                .await
+                .is_err()
+        );
+        worker1_db
+            .update_patch_application_status(ps_id, 1, "error", Some("stale git am"))
+            .await?;
+        worker1_db.update_patch_status(patch_id, "Failed").await?;
+        assert!(
+            !worker1_db
+                .complete_patchset_review_status(ps_id, "Failed")
+                .await?
+        );
+        worker1_db
+            .fail_orphaned_in_review_rows(ps_id, "stale panic")
+            .await?;
+        worker1_db.release_patchset_claim().await?;
+
+        // Worker 2's active claim, review row, and patch status are completely untouched.
+        assert!(worker2_db.is_patchset_claim_active(ps_id).await?);
+        assert!(worker2_db.mark_review_in_review_if_active(rev2_id).await?);
+        worker2_db
+            .complete_review(rev2_id, "Reviewed", "clean", Some("ok"), None, None, None)
+            .await?;
+        worker2_db.update_patch_status(patch_id, "Reviewed").await?;
+        assert!(
+            worker2_db
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+        worker2_db.release_patchset_claim().await?;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Reviewed")
+        );
+        let mut meta_rows = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert_eq!(meta_rows.next().await?.unwrap().get::<i64>(0)?, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cancel_patchset_cancels_applied_unreviewed_patches_and_blocks_late_apply_status()
+    -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("cancel_applied@kernel.org", "[PATCH 0/2] cancel", 1000)
+            .await?;
+        db.create_message(
+            "cancel_applied_1@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 1/2] cancel 1",
+            1000,
+            "body1",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_message(
+            "cancel_applied_2@kernel.org",
+            thread_id,
+            None,
+            "Author <a@b.c>",
+            "[PATCH 2/2] cancel 2",
+            1001,
+            "body2",
+            "to@b.c",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                "cancel_applied_1@kernel.org",
+                "[PATCH 1/2] cancel 1",
+                "Author <a@b.c>",
+                1000,
+                2,
+                2,
+                "to@b.c",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let p1 = db
+            .create_patch(
+                ps_id,
+                "cancel_applied_1@kernel.org",
+                1,
+                "diff --git a/a.c b/a.c",
+            )
+            .await?;
+        let p2 = db
+            .create_patch(
+                ps_id,
+                "cancel_applied_2@kernel.org",
+                2,
+                "diff --git a/b.c b/b.c",
+            )
+            .await?;
+
+        let gen1 = db.claim_patchset_for_review_with_gen(ps_id).await?.unwrap();
+        let worker_db = db.with_patchset_claim(ps_id, gen1);
+
+        // Patch 1 already has a completed 'Reviewed' review (with status = 'applied' or 'Reviewed'),
+        // while Patch 2 was marked 'applied' during git am and is still mid-review ('In Review').
+        let r1 = worker_db
+            .claim_or_create_in_review(ps_id, Some(p1), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        worker_db
+            .complete_review(r1, "Reviewed", "ok", None, None, None, None)
+            .await?;
+        worker_db.update_patch_status(p1, "Reviewed").await?;
+
+        let _r2 = worker_db
+            .claim_or_create_in_review(ps_id, Some(p2), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+
+        // Force-cancel the in-flight patchset.
+        assert!(db.cancel_patchset(ps_id, true).await?);
+
+        // Late update_patch_application_status calls (both claimed and unscoped) must not
+        // overwrite either the Reviewed patch 1 or the Cancelled patch 2 back to 'applied'.
+        worker_db
+            .update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        worker_db
+            .update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+        db.update_patch_application_status(ps_id, 1, "applied", None)
+            .await?;
+        db.update_patch_application_status(ps_id, 2, "applied", None)
+            .await?;
+
+        let mut p1_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![p1],
+            )
+            .await?;
+        assert_eq!(p1_rows.next().await?.unwrap().get::<String>(0)?, "Reviewed");
+
+        let mut p2_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![p2],
+            )
+            .await?;
+        assert_eq!(
+            p2_rows.next().await?.unwrap().get::<String>(0)?,
+            "Cancelled"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_release_patchset_claim_preserves_marker_until_terminal_status() -> Result<()> {
+        let db = setup_db().await;
+        let t_id = db
+            .create_thread("msg_release_guard", "Release Guard", 1000)
+            .await?;
+        let ps_id = db
+            .create_patchset(
+                t_id,
+                None,
+                "msg_release_guard",
+                "Release Guard",
+                "Author <a@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                0,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+
+        let generation = db
+            .enter_patchset_review_with_gen(ps_id)
+            .await?
+            .expect("expected active generation");
+        let worker_db = db.with_patchset_claim(ps_id, generation);
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+
+        // Releasing while patchsets.status is still 'In Review' must keep the
+        // active generation marker intact so a failed terminal status write
+        // never leaves an unfenced 'In Review' patchset row behind.
+        worker_db.release_patchset_claim().await?;
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+
+        // Once the patchset exits 'In Review', release_patchset_claim cleans up
+        // the meta marker row.
+        assert!(
+            worker_db
+                .complete_patchset_review_status(ps_id, "Failed")
+                .await?
+        );
+        worker_db.release_patchset_claim().await?;
+        let mut meta_rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM meta WHERE key = 'patchset_active_gen:' || CAST(? AS TEXT)",
+                libsql::params![ps_id],
+            )
+            .await?;
+        assert!(meta_rows.next().await?.is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_claim_and_release_queries_visible_with_open_read_cursor() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("patchset_claim_snapshot.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+
+        let t_id = db
+            .create_thread("msg_wal_claim_root", "[PATCH] net: fix", 1000)
+            .await?;
+        db.create_message(
+            "msg_wal_claim_p1",
+            t_id,
+            None,
+            "Author <a@example.com>",
+            "[PATCH] net: fix",
+            1000,
+            "commit body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                t_id,
+                None,
+                "msg_wal_claim_p1",
+                "[PATCH] net: fix",
+                "Author <a@example.com>",
+                1000,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                "msg_wal_claim_p1",
+                1,
+                "diff --git a/net/foo.c b/net/foo.c\n",
+            )
+            .await?;
+
+        // Seed rows so a stepped cursor on `db.conn` stays open across `.await`
+        // and pins `db.conn` to the pre-claim WAL read snapshot.
+        for i in 0..3 {
+            db.execute(
+                "INSERT INTO email_outbox (kind, status, to_addresses, cc_addresses, subject, in_reply_to, references_hdr, body, created_at)
+                 VALUES ('review_notification', 'Pending', '[]', '[]', ?, ?, '', 'body', 1700000000)",
+                libsql::params![format!("Seed {i}"), format!("<seed-{i}>")],
+            )
+            .await?;
+        }
+        let mut pinned_cursor = db
+            .conn
+            .query("SELECT id FROM email_outbox ORDER BY id ASC", ())
+            .await?;
+        assert!(pinned_cursor.next().await?.is_some());
+
+        // Claiming on `tx_conn` while `db.conn` is pinned must remain visible
+        // to `is_patchset_claim_active` and `get_patchset_status`.
+        let generation = db
+            .claim_patchset_for_review_with_gen(ps_id)
+            .await?
+            .expect("expected Pending patchset to be claimed");
+        let worker_db = db.with_patchset_claim(ps_id, generation);
+
+        // Sanity-check that `db.conn` really is pinned on the pre-claim snapshot.
+        let mut stale_rows = db
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await?;
+        let stale_status: String = stale_rows.next().await?.unwrap().get(0)?;
+        assert_eq!(stale_status, "Pending");
+        drop(stale_rows);
+
+        assert!(worker_db.is_patchset_claim_active(ps_id).await?);
+        assert!(
+            worker_db
+                .is_patchset_claim_active_for_outbox(Some(ps_id))
+                .await?
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("In Review")
+        );
+
+        // Complete a review and patchset while `db.conn` is still pinned, and
+        // verify post-review release/outbox queries see the committed rows.
+        let rev_id = worker_db
+            .claim_or_create_in_review(ps_id, Some(patch_id), "gemini", "pro", None, None)
+            .await?;
+        worker_db
+            .complete_review(
+                rev_id,
+                "Reviewed",
+                "Summary text",
+                None,
+                None,
+                Some("Inline body"),
+                None,
+            )
+            .await?;
+        worker_db.update_patch_status(patch_id, "Reviewed").await?;
+        assert!(
+            worker_db
+                .complete_patchset_review_status(ps_id, "Reviewed")
+                .await?
+        );
+
+        let statuses = worker_db.get_patch_statuses_for_patchset(ps_id).await?;
+        assert_eq!(
+            statuses.get(&patch_id).map(String::as_str),
+            Some("Reviewed")
+        );
+        let completed = worker_db.get_completed_reviews_for_release(ps_id).await?;
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].id, rev_id);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Reviewed")
+        );
+
+        drop(pinned_cursor);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_queue_lifecycle_and_startup_recovery() {
+        let db = setup_db().await;
+
+        // Reject embedded credentials at the DB boundary.
+        assert!(
+            db.enqueue_fetch_request(
+                Some("https://oauth2:secret_pat@github.com/org/repo.git"),
+                "aaa..bbb",
+                None,
+                None,
+                None,
+            )
+            .await
+            .is_err()
+        );
+
+        let backed_ps = db
+            .create_fetching_patchset(
+                "mr-738-aaa..bbb@sashiko.local",
+                "Fetching GitHub PR/MR: #738",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+                Some("Durable fetch queue"),
+                Some(738),
+                Some("sashiko-738"),
+            )
+            .await
+            .unwrap();
+        let unbacked_ps = db
+            .create_fetching_patchset(
+                "lore-thread@example.com",
+                "Fetching thread...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "aaa..bbb",
+            Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+            Some("Durable fetch queue"),
+            Some(738),
+        )
+        .await
+        .unwrap();
+
+        // Simulate daemon restart while fetch was mid-flight ('Fetching'):
+        // fail_interrupted_fetching_patchsets resets fetch_queue to Pending,
+        // preserves backed_ps in Fetching, and fails unbacked_ps.
+        let claimed = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim pending fetch request");
+        assert_eq!(claimed.article_id, "mr-738-aaa..bbb");
+        assert_eq!(claimed.status, "Fetching");
+
+        let failed_count = db.fail_interrupted_fetching_patchsets().await.unwrap();
+        assert_eq!(failed_count, 1);
+        assert_eq!(
+            db.get_patchset_status(backed_ps).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+        assert_eq!(
+            db.get_patchset_status(unbacked_ps)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Failed")
+        );
+
+        // Stale lease from before restart is fenced out.
+        assert!(
+            !db.mark_fetch_queue_done(claimed.id, claimed.locked_at)
+                .await
+                .unwrap()
+        );
+
+        let reclaimed = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should reclaim after startup reset");
+        assert_eq!(reclaimed.id, claimed.id);
+
+        // Schedule backoff retry and verify secret redaction in error_log.
+        let future_ts = chrono::Utc::now().timestamp() + 60;
+        assert!(
+            db.set_fetch_queue_retry_at(
+                reclaimed.id,
+                reclaimed.locked_at,
+                future_ts,
+                "https://user:topsecret@github.com/org/repo.git returned 502",
+            )
+            .await
+            .unwrap()
+        );
+        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+
+        // Re-enqueuing clears next_retry_at for an immediate retry.
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "aaa..bbb",
+            Some("https://github.com/sashiko-dev/sashiko/pull/738"),
+            Some("Durable fetch queue"),
+            Some(738),
+        )
+        .await
+        .unwrap();
+
+        let retried = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("immediate re-enqueue should clear backoff");
+        assert_eq!(retried.retry_count, 1);
+        assert!(
+            !retried
+                .error_log
+                .as_deref()
+                .unwrap_or_default()
+                .contains("topsecret")
+        );
+        assert!(
+            db.mark_fetch_queue_done(retried.id, retried.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(db.lock_pending_fetch_queue().await.unwrap().is_none());
+
+        // If a daemon restarts after fetch_queue is marked Done but before the
+        // ingestion pipeline moves the patchset out of Fetching or Incomplete,
+        // startup recovery resets the fetch_queue row back to Pending.
+        db.update_patchset_status(backed_ps, "Incomplete")
+            .await
+            .unwrap();
+        assert_eq!(db.fail_interrupted_fetching_patchsets().await.unwrap(), 0);
+        let recovered = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("Done fetch_queue row with Incomplete patchset must reset to Pending");
+        assert_eq!(recovered.id, retried.id);
+        db.update_patchset_status(backed_ps, "Pending")
+            .await
+            .unwrap();
+        assert!(
+            db.mark_fetch_queue_done(recovered.id, recovered.locked_at)
+                .await
+                .unwrap()
+        );
+
+        // Cancelling a placeholder patchset cancels an in-flight Fetching lease
+        // and prevents late error or slug updates from mutating the cancelled row.
+        let cancelled_ps = db
+            .create_fetching_patchset(
+                "mr-739-ccc..ddd@sashiko.local",
+                "Fetching GitHub PR/MR: #739",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+                Some("Cancelled PR"),
+                Some(739),
+                Some("sashiko-739"),
+            )
+            .await
+            .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "ccc..ddd",
+            Some("https://github.com/sashiko-dev/sashiko/pull/739"),
+            Some("Cancelled PR"),
+            Some(739),
+        )
+        .await
+        .unwrap();
+        let active_claim = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim PR #739 fetch");
+        assert!(
+            db.has_fetch_queue_lease(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        db.cancel_patchset(cancelled_ps, true).await.unwrap();
+        assert!(
+            !db.has_fetch_queue_lease(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.mark_fetch_queue_done(active_claim.id, active_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.mark_fetch_queue_failed(
+                active_claim.id,
+                active_claim.locked_at,
+                "late fetch failure"
+            )
+            .await
+            .unwrap()
+        );
+        db.update_patchset_error("mr-739-ccc..ddd@sashiko.local", "late error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(cancelled_ps)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Cancelled")
+        );
+
+        // If a sibling candidate patchset row is Cancelled while another
+        // matching candidate patchset row is actively Fetching, lease checks
+        // and completion transitions still succeed.
+        let sibling_cancelled_ps = db
+            .create_fetching_patchset(
+                "<mr-740-eee..fff>",
+                "Sibling cancelled PR #740",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.cancel_patchset(sibling_cancelled_ps, true)
+            .await
+            .unwrap();
+        let active_ps = db
+            .create_fetching_patchset(
+                "mr-740-eee..fff@sashiko.local",
+                "Fetching GitHub PR/MR: #740",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/740"),
+                Some("Active PR"),
+                Some(740),
+                Some("sashiko-740"),
+            )
+            .await
+            .unwrap();
+        assert_ne!(sibling_cancelled_ps, active_ps);
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "eee..fff",
+            Some("https://github.com/sashiko-dev/sashiko/pull/740"),
+            Some("Active PR"),
+            Some(740),
+        )
+        .await
+        .unwrap();
+        let sibling_claim = db
+            .lock_pending_fetch_queue()
+            .await
+            .unwrap()
+            .expect("should claim PR #740 fetch despite sibling Cancelled row");
+        assert!(
+            db.has_fetch_queue_lease(sibling_claim.id, sibling_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.mark_fetch_queue_done(sibling_claim.id, sibling_claim.locked_at)
+                .await
+                .unwrap()
+        );
+        db.update_patchset_status(active_ps, "Reviewed")
+            .await
+            .unwrap();
+        db.update_patchset_error("mr-740-eee..fff@sashiko.local", "late error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(active_ps).await.unwrap().as_deref(),
+            Some("Reviewed")
+        );
+
+        // A partially ingested multi-patch series (0 < received_parts < total_parts)
+        // is NOT marked Failed by fail_fetching_patchset, and if marked Failed by
+        // mark_fetch_queue_failed or update_patchset_error, reopens to Incomplete
+        // and reaches Pending once the remaining patches arrive.
+        let partial_root = "mr-741-111..222@sashiko.local";
+        let partial_ps = db
+            .create_fetching_patchset(
+                partial_root,
+                "Fetching GitHub PR/MR: #741",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/741"),
+                Some("Partial series"),
+                Some(741),
+                Some("sashiko-741"),
+            )
+            .await
+            .unwrap();
+        let thread_741 = db
+            .ensure_thread_for_message(partial_root, 1_000)
+            .await
+            .unwrap();
+        db.ensure_thread_for_message("msg-741-p1@sashiko.local", 1_000)
+            .await
+            .unwrap();
+        db.ensure_thread_for_message("msg-741-p2@sashiko.local", 1_001)
+            .await
+            .unwrap();
+        let ps_after_p1 = db
+            .create_patchset(
+                thread_741,
+                Some(partial_root),
+                "msg-741-p1@sashiko.local",
+                "[PATCH 1/2] Part one",
+                "Alice <alice@example.com>",
+                1_000,
+                2,
+                1,
+                "alice@example.com",
+                "",
+                Some(1),
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_after_p1, partial_ps);
+        db.create_patch(
+            partial_ps,
+            "msg-741-p1@sashiko.local",
+            1,
+            "diff --git a/a.rs b/a.rs",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Incomplete")
+        );
+
+        // Single-message error (fail_fetching_patchset) must NOT fail a series with received_parts > 0.
+        db.fail_fetching_patchset(partial_root, "duplicate part error")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Incomplete")
+        );
+
+        // Fetch-level failure transitions Incomplete -> Failed, and ingesting the remaining
+        // part reopens Failed -> Incomplete -> Pending.
+        db.update_patchset_error(partial_root, "Fetch interrupted")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Failed")
+        );
+        let ps_after_p2 = db
+            .create_patchset(
+                thread_741,
+                Some(partial_root),
+                "msg-741-p2@sashiko.local",
+                "[PATCH 2/2] Part two",
+                "Bob <bob@example.com>",
+                1_001,
+                2,
+                2,
+                "bob@example.com",
+                "",
+                Some(1),
+                2,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ps_after_p2, partial_ps);
+        let mut author_rows = db
+            .conn
+            .query(
+                "SELECT author FROM patchsets WHERE id = ?",
+                libsql::params![partial_ps],
+            )
+            .await
+            .unwrap();
+        let preserved_author: String = author_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(preserved_author, "Alice <alice@example.com>");
+        db.create_patch(
+            partial_ps,
+            "msg-741-p2@sashiko.local",
+            2,
+            "diff --git a/b.rs b/b.rs",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_patchset_status(partial_ps).await.unwrap().as_deref(),
+            Some("Pending")
+        );
+
+        // Cancelling a patchset marks its child patches Cancelled; re-submitting
+        // via create_fetching_patchset and create_patch resets child patches back
+        // to Pending so review transitions (update_patch_status) succeed.
+        db.cancel_patchset(partial_ps, true).await.unwrap();
+        let re_ps = db
+            .create_fetching_patchset(
+                partial_root,
+                "Fetching GitHub PR/MR: #741",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/741"),
+                Some("Partial series"),
+                Some(741),
+                Some("sashiko-741"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(re_ps, partial_ps);
+        let p1_id = db
+            .create_patch(
+                partial_ps,
+                "msg-741-p1@sashiko.local",
+                1,
+                "diff --git a/a.rs b/a.rs",
+            )
+            .await
+            .unwrap();
+        let p2_id = db
+            .create_patch(
+                partial_ps,
+                "msg-741-p2@sashiko.local",
+                2,
+                "diff --git a/b.rs b/b.rs",
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(partial_ps, "In Review")
+            .await
+            .unwrap();
+        db.update_patch_status(p1_id, "Reviewed").await.unwrap();
+        db.update_patch_status(p2_id, "Reviewed").await.unwrap();
+        // If a fetch fails via mark_fetch_queue_failed and the same patchset is
+        // re-submitted before the earlier attempt's queued IngestionFailed event
+        // reaches update_patchset_error, the active fetch_queue entry protects
+        // the newly re-submitted Fetching patchset from being clobbered.
+        let resub_root = "mr-742-333..444@sashiko.local";
+        let resub_ps = db
+            .create_fetching_patchset(
+                resub_root,
+                "Fetching GitHub PR/MR: #742",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+                Some("Resubmitted PR"),
+                Some(742),
+                Some("sashiko-742"),
+            )
+            .await
+            .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "333..444",
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+        )
+        .await
+        .unwrap();
+        let failed_claim = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        assert!(
+            db.mark_fetch_queue_failed(failed_claim.id, failed_claim.locked_at, "attempt 1 failed")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_patchset_status(resub_ps).await.unwrap().as_deref(),
+            Some("Failed")
+        );
+        db.create_fetching_patchset(
+            resub_root,
+            "Fetching GitHub PR/MR: #742",
+            None,
+            None,
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+            Some("sashiko-742"),
+        )
+        .await
+        .unwrap();
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            "333..444",
+            Some("https://github.com/sashiko-dev/sashiko/pull/742"),
+            Some("Resubmitted PR"),
+            Some(742),
+        )
+        .await
+        .unwrap();
+        db.update_patchset_error(resub_root, "late IngestionFailed from attempt 1")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_status(resub_ps).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        let patch_statuses = db
+            .get_patch_statuses_for_patchset(partial_ps)
+            .await
+            .unwrap();
+        assert_eq!(
+            patch_statuses.get(&p1_id).map(String::as_str),
+            Some("Reviewed")
+        );
+        assert_eq!(
+            patch_statuses.get(&p2_id).map(String::as_str),
+            Some("Reviewed")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forge_poll_watermark_and_head_sha_deduplication() {
+        let settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        // Empty DB bootstraps with a 5-minute lookback.
+        let wm_empty = db
+            .bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 10_000)
+            .await
+            .unwrap();
+        assert_eq!(wm_empty, 9_700);
+
+        // Subsequent calls return the persisted value.
+        assert_eq!(
+            db.bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 20_000)
+                .await
+                .unwrap(),
+            9_700
+        );
+        db.set_forge_poll_watermark("sashiko-dev/sashiko", 12_345)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bootstrap_or_get_forge_poll_watermark("sashiko-dev/sashiko", 20_000)
+                .await
+                .unwrap(),
+            12_345
+        );
+
+        let head1 = "2222222222222222222222222222222222222222";
+        let head2 = "3333333333333333333333333333333333333333";
+        let range1 = format!("1111111111111111111111111111111111111111..{head1}");
+
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Unbacked Fetching placeholder is NOT considered ingested until backed by fetch_queue.
+        let ps_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Once backed by fetch_queue, it is considered active/ingested.
+        db.enqueue_fetch_request(
+            Some("https://github.com/sashiko-dev/sashiko.git"),
+            &range1,
+            Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+            Some("Test PR"),
+            Some(500),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Different repo with same PR number and head_sha is not matched.
+        assert!(
+            !db.has_forge_pr_head_ingested("other-org/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // During the handoff window when fetch_queue is marked Done before
+        // PatchSubmitted events transition the patchset out of Fetching,
+        // has_forge_pr_head_ingested still returns true.
+        let locked = db.lock_pending_fetch_queue().await.unwrap().unwrap();
+        db.mark_fetch_queue_done(locked.id, locked.locked_at)
+            .await
+            .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Once fetch completes and patchset is Reviewed (or Failed during review),
+        // it remains deduplicated even if main advances (different base_sha, same head_sha).
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head2)
+                .await
+                .unwrap()
+        );
+
+        // Review-time failure is NOT re-ingested by the poller, whereas
+        // 'Interrupted before fetch completed' and 'Failed to enqueue fetch request'
+        // ARE eligible for recovery.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Review workflow failed' WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        for recoverable_reason in [
+            "Interrupted before fetch completed",
+            "Failed to verify placeholder patchset status",
+            "Failed to enqueue fetch request",
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE id = ?",
+                    libsql::params![recoverable_reason, ps_id],
+                )
+                .await
+                .unwrap();
+            assert!(
+                !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                    .await
+                    .unwrap(),
+                "reason {recoverable_reason} should be recoverable"
+            );
+        }
+
+        // Force-pushing head1 -> head2 -> head1 supersedes ps_id (head1), so
+        // re-pushing head1 is not blocked by the superseded row even if ps_id
+        // was already Reviewed, preserves its archived cover letter body and
+        // messages_subsystems links, and clears v1's stale Done fetch_queue row.
+        assert_eq!(
+            db.conn
+                .execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    libsql::params!["v1 description", format!("mr-500-{range1}@sashiko.local")],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        let sub_id = db.ensure_subsystem("core", "all").await.unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO messages_subsystems (message_id, subsystem_id)
+                 SELECT id, ? FROM messages WHERE message_id = ?",
+                libsql::params![sub_id, format!("mr-500-{range1}@sashiko.local")],
+            )
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        let range2 = format!("1111111111111111111111111111111111111111..{head2}");
+        let ps2_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range2}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+        let ps3_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap(),
+            "stale Done fetch_queue row from v1 must be cleared so an unbacked v3 Fetching placeholder is recoverable"
+        );
+        assert_eq!(
+            db.conn
+                .execute(
+                    "UPDATE messages SET body = ? WHERE message_id = ?",
+                    libsql::params!["v3 description", format!("mr-500-{range1}@sashiko.local")],
+                )
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(ps3_id > ps2_id);
+        assert_eq!(
+            db.get_patchset_status(ps2_id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+        assert_eq!(
+            db.get_patchset_status(ps3_id).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+        assert_eq!(
+            db.get_message_body(&format!("superseded-{ps_id}-mr-500-{range1}@sashiko.local"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v1 description")
+        );
+        assert_eq!(
+            db.get_message_body(&format!("mr-500-{range1}@sashiko.local"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("v3 description")
+        );
+        let mut tid_rows = db
+            .conn
+            .query(
+                "SELECT id, thread_id FROM patchsets WHERE id IN (?, ?) ORDER BY id ASC",
+                libsql::params![ps_id, ps3_id],
+            )
+            .await
+            .unwrap();
+        let tid_v1: i64 = tid_rows.next().await.unwrap().unwrap().get(1).unwrap();
+        let tid_v3: i64 = tid_rows.next().await.unwrap().unwrap().get(1).unwrap();
+        drop(tid_rows);
+        assert_ne!(
+            tid_v1, tid_v3,
+            "re-pushed revision after A -> B -> A must get a distinct thread_id"
+        );
+
+        // If the newest row (ps3_id) fails with a recoverable reason after A -> B -> A,
+        // has_forge_pr_head_ingested must return false rather than matching the older
+        // Reviewed ps_id row.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = 'Interrupted before fetch completed' WHERE id = ?",
+                libsql::params![ps3_id],
+            )
+            .await
+            .unwrap();
+        assert!(
+            !db.has_forge_pr_head_ingested("sashiko-dev/sashiko", 500, head1)
+                .await
+                .unwrap()
+        );
+
+        // Cross-repository isolation: another repo with PR #500 gets [v1] without
+        // inflating version numbers or falsely superseding sashiko-dev/sashiko PR #500.
+        let other_range =
+            "4444444444444444444444444444444444444444..5555555555555555555555555555555555555555";
+        let other_repo_ps_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{other_range}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/other-org/sashiko/pull/500"),
+                Some("Fork PR"),
+                Some(500),
+                Some("other-sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert!(other_repo_ps_id > ps3_id);
+        assert_eq!(
+            db.get_mr_version_for_commit_range_in_repo(
+                500,
+                Some("https://github.com/other-org/sashiko/pull/500"),
+                &format!("mr-500-{other_range}@sashiko.local"),
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        // Re-fetching sashiko-dev/sashiko PR #500 reuses ps3_id instead of treating
+        // other_repo_ps_id (id > ps3_id) as a superseding revision.
+        let ps3_retry_id = db
+            .create_fetching_patchset(
+                &format!("mr-500-{range1}@sashiko.local"),
+                "Fetching GitHub PR/MR: #500",
+                None,
+                None,
+                Some("https://github.com/sashiko-dev/sashiko/pull/500"),
+                Some("Test PR"),
+                Some(500),
+                Some("sashiko-500"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ps3_retry_id, ps3_id);
+
+        // Non-empty DB bootstraps a new repo's watermark with a 24h (86400s) lookback.
+        let wm_non_empty = db
+            .bootstrap_or_get_forge_poll_watermark("torvalds/linux", 100_000)
+            .await
+            .unwrap();
+        assert_eq!(wm_non_empty, 13_600);
+    }
+
+    #[tokio::test]
+    async fn test_database_new_rejects_remote_urls() {
+        for url in [
+            "libsql://sashiko.example.turso.io",
+            "https://sashiko.example.turso.io",
+            "http://localhost:8080",
+        ] {
+            let err = Database::new(&DatabaseSettings {
+                url: url.to_string(),
+                token: String::new(),
+            })
+            .await
+            .err()
+            .expect("remote URL must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("remote database URLs are not supported"),
+                "unexpected error for {url}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pending_patchset_queue_priority_order() {
+        let db = setup_db().await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (1, 'Normal Old', 'alice', 1000, 'Pending', 500)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (2, 'Urgent New', 'bob', 2000, 'Pending', 900)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (3, 'Normal Older', 'charlie', 500, 'Pending', 500)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (4, 'Reviewed Ignored', 'dave', 100, 'Reviewed', 1000)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 3);
+        // First should be id 2 (priority 900)
+        assert_eq!(pending[0].id, 2);
+        assert_eq!(pending[0].priority, Some(900));
+        // Second should be id 3 (priority 500, date 500)
+        assert_eq!(pending[1].id, 3);
+        assert_eq!(pending[1].priority, Some(500));
+        // Third should be id 1 (priority 500, date 1000)
+        assert_eq!(pending[2].id, 1);
+        assert_eq!(pending[2].priority, Some(500));
+    }
+
+    #[tokio::test]
+    async fn test_deprioritize_author_batch_and_count() {
+        let db = setup_db().await;
+        let author = "batcher@example.com";
+        let other = "innocent@example.com";
+
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (1, 'p1', ?, 1000, 'Pending', 500)",
+                libsql::params![author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (2, 'p2', ?, 1010, 'Pending', 500)",
+                libsql::params![author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (3, 'p3', ?, 1020, 'Pending', 200)",
+                libsql::params![author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (4, 'p4_old', ?, 500, 'Pending', 500)",
+                libsql::params![author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (5, 'p5_reviewed', ?, 1015, 'Reviewed', 500)",
+                libsql::params![author],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (6, 'other', ?, 1010, 'Pending', 500)",
+                libsql::params![other],
+            )
+            .await
+            .unwrap();
+
+        let count_author = db
+            .count_recent_patchsets_by_author(author, 1000, 1030)
+            .await
+            .unwrap();
+        assert_eq!(count_author, 4);
+
+        let count_author_all = db
+            .count_recent_patchsets_by_author(author, 0, 2000)
+            .await
+            .unwrap();
+        assert_eq!(count_author_all, 5);
+
+        let count_other = db
+            .count_recent_patchsets_by_author(other, 1000, 1030)
+            .await
+            .unwrap();
+        assert_eq!(count_other, 1);
+
+        // Bounded upper window test: count only within [1000, 1010]
+        let count_bounded = db
+            .count_recent_patchsets_by_author(author, 1000, 1010)
+            .await
+            .unwrap();
+        assert_eq!(count_bounded, 2); // p1 (1000), p2 (1010)
+
+        let affected = db
+            .deprioritize_author_batch(author, 1000, 1030, 300)
+            .await
+            .unwrap();
+        assert_eq!(affected, 3);
+
+        let mut rows = db
+            .conn
+            .query("SELECT id, priority FROM patchsets ORDER BY id ASC", ())
+            .await
+            .unwrap();
+        let mut priorities = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            priorities.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        }
+        assert_eq!(
+            priorities,
+            vec![(1, 300), (2, 300), (3, 200), (4, 500), (5, 500), (6, 500),]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_patchset_priority_on_ingest() {
+        let db = setup_db().await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (1, 'p1', 'author', 1000, 'Pending', 500)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // 1. Part with elevated priority sets the priority
+        db.update_patchset_priority_on_ingest(1, 900, 500)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(p[0].priority, Some(900));
+
+        // 2. Subsequent part with default priority does NOT overwrite 900
+        db.update_patchset_priority_on_ingest(1, 500, 500)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(p[0].priority, Some(900));
+
+        // 3. Subsequent part with even higher elevated priority raises it
+        db.update_patchset_priority_on_ingest(1, 950, 500)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(p[0].priority, Some(950));
+
+        // 4. Batch tier demotion demotes to 300
+        db.deprioritize_author_batch("author", 500, 1500, 300)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(p[0].priority, Some(300));
+
+        // 5. Subsequent part with default priority does NOT clobber demoted 300
+        db.update_patchset_priority_on_ingest(1, 500, 500)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(p[0].priority, Some(300));
+
+        // 6. Uninitialized row with custom default priority (300) is updated directly to 300
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status) VALUES (2, 'p2', 'author', 1000, 'Pending')",
+                (),
+            )
+            .await
+            .unwrap();
+        db.update_patchset_priority_on_ingest(2, 300, 300)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(10).await.unwrap();
+        let p2 = p.iter().find(|row| row.id == 2).unwrap();
+        assert_eq!(p2.priority, Some(300));
+
+        // 7. Subsequent part with custom default priority does NOT overwrite 300
+        db.update_patchset_priority_on_ingest(2, 300, 300)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(10).await.unwrap();
+        let p2 = p.iter().find(|row| row.id == 2).unwrap();
+        assert_eq!(p2.priority, Some(300));
+
+        // 8. Subsequent part with elevated rule (450) raises custom default 300
+        db.update_patchset_priority_on_ingest(2, 450, 300)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(10).await.unwrap();
+        let p2 = p.iter().find(|row| row.id == 2).unwrap();
+        assert_eq!(p2.priority, Some(450));
+
+        // 9. Subsequent part with demoted rule (200) demotes custom default 300
+        db.update_patchset_priority_on_ingest(2, 200, 300)
+            .await
+            .unwrap();
+        let p = db.get_pending_patchsets(10).await.unwrap();
+        let p2 = p.iter().find(|row| row.id == 2).unwrap();
+        assert_eq!(p2.priority, Some(200));
+    }
+
+    #[tokio::test]
+    async fn test_set_patchset_priority() {
+        let db = setup_db().await;
+        db.conn
+            .execute(
+                "INSERT INTO patchsets (id, subject, author, date, status, priority) VALUES (1, 'p1', 'author', 1000, 'Pending', 500)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        db.set_patchset_priority(1, 850).await.unwrap();
+
+        let pending = db.get_pending_patchsets(1).await.unwrap();
+        assert_eq!(pending[0].priority, Some(850));
+    }
+
+    #[tokio::test]
+    async fn test_create_patchset_priority_folding_preserves_demotion_and_custom_default() {
+        let db = setup_db().await;
+        let author = "author@example.com";
+        let thread_id = db
+            .create_thread("msg_0", "[PATCH 0/3] Series", 1000)
+            .await
+            .unwrap();
+
+        for (msg_id, subj, ts) in [
+            ("msg_1", "[PATCH 1/3] Part 1", 1000),
+            ("msg_0", "[PATCH 0/3] Cover", 100000),
+            ("msg_3", "[PATCH 3/3] Part 3", 55000),
+        ] {
+            db.create_message(
+                msg_id, thread_id, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        // 1. Partial series merge with custom default_priority (300) and elevated part (450)
+        let ps_a = db
+            .create_patchset_with_default_priority(
+                thread_id,
+                Some("msg_1"),
+                "msg_1",
+                "[PATCH 1/3] Part 1",
+                author,
+                1000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                300,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_patchset_priority(ps_a, 300).await.unwrap();
+
+        let ps_b = db
+            .create_patchset_with_default_priority(
+                thread_id,
+                Some("msg_0"),
+                "msg_0",
+                "[PATCH 0/3] Cover",
+                author,
+                100000,
+                3,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                300,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_patchset_priority(ps_b, 450).await.unwrap();
+
+        // Bridging patch merges ps_b into ps_a
+        let ps_merged = db
+            .create_patchset_with_default_priority(
+                thread_id,
+                Some("msg_3"),
+                "msg_3",
+                "[PATCH 3/3] Part 3",
+                author,
+                55000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                3,
+                None,
+                true,
+                None,
+                None,
+                300,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut row = db
+            .conn
+            .query(
+                "SELECT priority FROM patchsets WHERE id = ?",
+                libsql::params![ps_merged],
+            )
+            .await
+            .unwrap();
+        let prio: i64 = row.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(prio, 450);
+
+        // 2. Partial series merge with default 500, batch-demoted part (400), and elevated part (900)
+        let thread_id2 = db
+            .create_thread("msg_10", "[PATCH 0/3] Series 2", 2000)
+            .await
+            .unwrap();
+        for (msg_id, subj, ts) in [
+            ("msg_11", "[PATCH 1/3] Part 1", 2000),
+            ("msg_10", "[PATCH 0/3] Cover", 102000),
+            ("msg_13", "[PATCH 3/3] Part 3", 56000),
+        ] {
+            db.create_message(
+                msg_id, thread_id2, None, author, subj, ts, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let ps_c = db
+            .create_patchset_with_default_priority(
+                thread_id2,
+                Some("msg_11"),
+                "msg_11",
+                "[PATCH 1/3] Part 1",
+                author,
+                2000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+                500,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_patchset_priority(ps_c, 400).await.unwrap();
+
+        let ps_d = db
+            .create_patchset_with_default_priority(
+                thread_id2,
+                Some("msg_10"),
+                "msg_10",
+                "[PATCH 0/3] Cover",
+                author,
+                102000,
+                3,
+                0,
+                "",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+                500,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_patchset_priority(ps_d, 900).await.unwrap();
+
+        let ps_merged2 = db
+            .create_patchset_with_default_priority(
+                thread_id2,
+                Some("msg_13"),
+                "msg_13",
+                "[PATCH 3/3] Part 3",
+                author,
+                56000,
+                3,
+                1,
+                "",
+                "",
+                None,
+                3,
+                None,
+                true,
+                None,
+                None,
+                500,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut row2 = db
+            .conn
+            .query(
+                "SELECT priority FROM patchsets WHERE id = ?",
+                libsql::params![ps_merged2],
+            )
+            .await
+            .unwrap();
+        let prio2: i64 = row2.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(prio2, 400);
+    }
+
+    #[tokio::test]
+    async fn test_migrate_v21_bug_security_evaluation_and_trigger() -> Result<()> {
+        use crate::security_eval::{
+            RawCvssV4Metrics, RawMetricJustifications, RawSecurityEvaluationOutput, SecurityClass,
+            SecurityEvaluation, SecurityRating,
+        };
+
+        let db = setup_db().await;
+
+        let mut cols = db.conn.query("PRAGMA table_info(bugs)", ()).await?;
+        let mut col_names = Vec::new();
+        while let Some(row) = cols.next().await? {
+            col_names.push(row.get::<String>(1)?);
+        }
+        for expected in [
+            "security_score_tenths",
+            "security_class",
+            "cvss_vector",
+            "security_eval_attempts",
+            "security_eval_requested",
+        ] {
+            assert!(
+                col_names.iter().any(|c| c == expected),
+                "expected column {expected} on bugs, found {col_names:?}"
+            );
+        }
+
+        for expected_idx in [
+            "idx_bugs_security_score",
+            "idx_bugs_security_class",
+            "idx_bugs_security_backfill",
+        ] {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+                    libsql::params![expected_idx],
+                )
+                .await?;
+            let count: i64 = rows.next().await?.unwrap().get(0)?;
+            assert_eq!(count, 1, "expected index {expected_idx} to exist");
+        }
+
+        let bug: NewBug = serde_json::from_value(json!({
+            "bugid": "linux-sec-001",
+            "title": "net/ipv6: slab-out-of-bounds write in ipv6_push_frag_opts",
+            "lifecycle_status": "open",
+            "pipeline_state": "succeeded"
+        }))?;
+        let id = db.create_bug(&bug).await?;
+
+        assert!(
+            db.request_bug_security_eval(id, Some("Threat model updated"))
+                .await?
+        );
+        let requested_bug = db.get_bug(id).await?.unwrap();
+        assert!(requested_bug.security_eval_requested());
+        assert!(requested_bug.security_evaluation().is_none());
+
+        let claimed = db
+            .claim_bug_for_security_eval("sec-worker-1", 300, 3)
+            .await?
+            .expect("should claim queued open bug");
+        assert_eq!(claimed.id, id);
+
+        let eval = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "vulnerability".to_string(),
+                trust_boundary: Some("Remote unauthenticated IPv6 packet -> kernel".to_string()),
+                attacker_model: Some("Remote network peer sending crafted fragments".to_string()),
+                summary: "Remote unauthenticated heap out-of-bounds write in IPv6 option parsing."
+                    .to_string(),
+                cvss_v4: Some(RawCvssV4Metrics {
+                    av: "N".to_string(),
+                    ac: "L".to_string(),
+                    at: "N".to_string(),
+                    pr: "N".to_string(),
+                    ui: "N".to_string(),
+                    vc: "H".to_string(),
+                    vi: "H".to_string(),
+                    va: "H".to_string(),
+                    sc: "N".to_string(),
+                    si: "N".to_string(),
+                    sa: "N".to_string(),
+                    ..Default::default()
+                }),
+                metric_justifications: Some(RawMetricJustifications {
+                    exploitability: "Triggered directly by inbound IPv6 fragments without auth."
+                        .to_string(),
+                    vulnerable_system_impact:
+                        "Kernel heap corruption enables arbitrary code execution and panic."
+                            .to_string(),
+                    subsequent_system_impact: "No cross-host or hypervisor escape.".to_string(),
+                }),
+            },
+            Some("deadbeef1234".to_string()),
+            Some("cafebabe5678".to_string()),
+        )
+        .expect("valid security evaluation");
+
+        let recorded = db
+            .with_bug_claim(id, "sec-worker-1")
+            .with_bug_actor(
+                "sashiko",
+                "sashiko:linux_bug:security_eval",
+                Some("test-model".to_string()),
+            )
+            .record_bug_security_evaluation(
+                id,
+                SecurityEvaluationRecordParams {
+                    evaluation: &eval,
+                    logs: Some("[{\"turn\":1}]"),
+                    tokens_in: Some(500),
+                    tokens_out: Some(120),
+                    tokens_cached: Some(100),
+                    release_lease: true,
+                },
+            )
+            .await?;
+        assert!(recorded);
+
+        // Verify trigger projection and lease release on raw row.
+        let mut proj_rows = db
+            .conn
+            .query(
+                "SELECT security_score_tenths, security_class, cvss_vector, security_eval_requested, locked_by
+                   FROM bugs WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let proj = proj_rows.next().await?.unwrap();
+        assert_eq!(proj.get::<i64>(0)?, i64::from(eval.score_tenths));
+        assert_eq!(proj.get::<String>(1)?, "vulnerability");
+        assert_eq!(proj.get::<Option<String>>(2)?, eval.cvss_vector.clone());
+        assert_eq!(proj.get::<i64>(3)?, 0);
+        assert_eq!(proj.get::<Option<String>>(4)?, None);
+
+        // Verify Bug accessors and bug_evidence projection.
+        let hydrated = db.get_bug(id).await?.unwrap();
+        assert_eq!(hydrated.security_score_tenths(), Some(eval.score_tenths));
+        assert_eq!(hydrated.security_rating(), Some(SecurityRating::Critical));
+        assert_eq!(
+            hydrated.security_class(),
+            Some(SecurityClass::Vulnerability)
+        );
+        assert_eq!(hydrated.cvss_vector(), eval.cvss_vector);
+        assert!(!hydrated.security_eval_requested());
+
+        let evidence = db.bug_evidence(&db.bug_family(id, false).await?).await?;
+        let activity = evidence["activity"].as_array().unwrap();
+        let sec_event = activity
+            .iter()
+            .find(|ev| ev["kind"] == "security_evaluation")
+            .expect("security_evaluation event present in activity");
+        assert_eq!(sec_event["security_class"], "vulnerability");
+        assert_eq!(sec_event["security_rating"], "Critical");
+        assert_eq!(sec_event["has_logs"], true);
+        assert!(sec_event.get("logs").is_none());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_security_eval_claim_priority_and_list_filters() -> Result<()> {
+        use crate::security_eval::{
+            RawSecurityEvaluationOutput, SecurityClass, SecurityEvaluation,
+        };
+
+        let db = setup_db().await;
+        let mk_bug = |bugid: &str, status: &str, state: &str, dup: Option<i64>| -> NewBug {
+            serde_json::from_value(json!({
+                "bugid": bugid,
+                "title": format!("Bug {bugid}"),
+                "lifecycle_status": status,
+                "pipeline_state": state,
+                "duplicate_of_id": dup
+            }))
+            .unwrap()
+        };
+
+        let closed_id = db
+            .create_bug(&mk_bug("linux-closed", "closed", "succeeded", None))
+            .await?;
+        let fixed_id = db
+            .create_bug(&mk_bug("linux-fixed", "fixed", "succeeded", None))
+            .await?;
+        let open_low = db
+            .create_bug(&mk_bug("linux-open-low", "open", "succeeded", None))
+            .await?;
+        let open_high = db
+            .create_bug(&mk_bug("linux-open-high", "open", "succeeded", None))
+            .await?;
+        db.add_bug_enrichment(
+            open_high,
+            &NewBugEnrichment {
+                kind: "severity_calibration".to_string(),
+                tool: "test".to_string(),
+                data_json: Some(json!({"severity": "High", "severity_int": 3})),
+                ..Default::default()
+            },
+        )
+        .await?;
+        // Dismissed and duplicate bugs must never be claimed for security evaluation.
+        let _dismissed = db
+            .create_bug(&mk_bug("linux-dismissed", "dismissed", "succeeded", None))
+            .await?;
+        let _dup = db
+            .create_bug(&mk_bug(
+                "linux-dup",
+                "duplicate",
+                "succeeded",
+                Some(open_high),
+            ))
+            .await?;
+
+        // Manual request on closed_id jumps ahead of unrequested open bugs.
+        assert!(db.request_bug_security_eval(closed_id, None).await?);
+
+        let non_sec = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "not_security".to_string(),
+                summary: "Dead code cleanup only.".to_string(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+        let hardening = SecurityEvaluation::from_raw_output(
+            RawSecurityEvaluationOutput {
+                security_class: "hardening".to_string(),
+                trust_boundary: Some("Kernel stack".to_string()),
+                summary: "Missing defense-in-depth bounds assertion.".to_string(),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .unwrap();
+
+        let mut claim_order = Vec::new();
+        for (idx, eval_to_write) in [(0, &non_sec), (1, &hardening), (2, &non_sec), (3, &non_sec)] {
+            let worker = format!("w-{idx}");
+            let b = db
+                .claim_bug_for_security_eval(&worker, 300, 3)
+                .await?
+                .expect("expected claimable bug");
+            claim_order.push(b.id);
+            db.with_bug_claim(b.id, &worker)
+                .record_bug_security_evaluation(
+                    b.id,
+                    SecurityEvaluationRecordParams {
+                        evaluation: eval_to_write,
+                        logs: None,
+                        tokens_in: None,
+                        tokens_out: None,
+                        tokens_cached: None,
+                        release_lease: true,
+                    },
+                )
+                .await?;
+        }
+        assert_eq!(claim_order, vec![closed_id, open_high, open_low, fixed_id]);
+        assert!(
+            db.claim_bug_for_security_eval("w-none", 300, 3)
+                .await?
+                .is_none()
+        );
+
+        // Verify security_classes filter and security_score sort on list_bugs.
+        let (hardening_bugs, hardening_total) = db
+            .list_bugs(ListBugsParams {
+                security_classes: Some(&[SecurityClass::Hardening]),
+                visibility: BugVisibility::Unrestricted,
+                ..Default::default()
+            })
+            .await?;
+        assert_eq!(hardening_total, 1);
+        assert_eq!(hardening_bugs[0].id, open_high);
+
+        // Queueing re-evaluation re-enables claiming already-evaluated canonical bugs.
+        let queued = db.queue_bugs_for_security_reeval(Some(2)).await?;
+        assert_eq!(queued, 2);
+        let reclaimed = db
+            .claim_bug_for_security_eval("w-reeval", 300, 3)
+            .await?
+            .expect("re-queued bug should be claimable");
+        assert_eq!(reclaimed.id, open_high);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_file_backed_read_pool_pragmas_and_snapshot_isolation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("pool.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().into_owned(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+
+        assert_eq!(db.read_pool.len(), READ_POOL_SIZE);
+
+        async fn pragma_int(conn: &libsql::Connection, name: &str) -> Result<i64> {
+            let mut rows = conn.query(&format!("PRAGMA {name};"), ()).await?;
+            Ok(rows.next().await?.expect("pragma row").get(0)?)
+        }
+
+        // synchronous = 1 (NORMAL), temp_store = 2 (MEMORY)
+        assert_eq!(pragma_int(&db.conn, "synchronous").await?, 1);
+        assert_eq!(pragma_int(&db.conn, "temp_store").await?, 2);
+        assert_eq!(pragma_int(&db.conn, "cache_size").await?, -32_768);
+        assert_eq!(pragma_int(&db.conn, "query_only").await?, 0);
+
+        assert_eq!(pragma_int(&db.read_pool[1], "synchronous").await?, 1);
+        assert_eq!(pragma_int(&db.read_pool[1], "query_only").await?, 1);
+
+        assert_eq!(pragma_int(&db.tx_conn, "synchronous").await?, 1);
+        assert_eq!(pragma_int(&db.tx_conn, "cache_size").await?, -65_536);
+        assert_eq!(pragma_int(&db.tx_conn, "query_only").await?, 0);
+
+        // Seed rows and pin read_pool[0] (`db.conn`) with an unfinalized cursor.
+        db.ensure_mailing_list("lkml", "org.kernel.vger.linux-kernel")
+            .await?;
+        db.ensure_mailing_list("netdev", "org.kernel.vger.netdev")
+            .await?;
+        let mut pinned = db
+            .conn
+            .query("SELECT id FROM mailing_lists ORDER BY id ASC", ())
+            .await?;
+        assert!(pinned.next().await?.is_some());
+
+        // Commit a watermark update on tx_conn while read_pool[0] is pinned.
+        db.update_last_article_num("org.kernel.vger.linux-kernel", 42)
+            .await?;
+
+        // Advance read_cursor to read_pool[1] and verify it observes the new WAL frame.
+        db.read_cursor.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.get_last_article_num("org.kernel.vger.linux-kernel")
+                .await?,
+            42
+        );
+        drop(pinned);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_conn_inside_transaction_sees_uncommitted_writes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let db_path = dir.path().join("tx_visibility.db");
+        let settings = DatabaseSettings {
+            url: db_path.to_string_lossy().into_owned(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await?;
+        db.migrate().await?;
+        db.ensure_mailing_list("lkml", "org.kernel.vger.linux-kernel")
+            .await?;
+
+        let tx = db.begin_immediate_transaction().await?;
+        let tx_db = db.with_connection((*tx).clone());
+        tx_db
+            .update_last_article_num("org.kernel.vger.linux-kernel", 99)
+            .await?;
+
+        // Transaction-bound handle sees its uncommitted write via read_conn(),
+        // while external pooled readers still see 0 before commit.
+        assert_eq!(
+            tx_db
+                .get_last_article_num("org.kernel.vger.linux-kernel")
+                .await?,
+            99
+        );
+        db.read_cursor.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            db.get_last_article_num("org.kernel.vger.linux-kernel")
+                .await?,
+            0
+        );
+
+        tx.commit().await?;
+        assert_eq!(
+            db.get_last_article_num("org.kernel.vger.linux-kernel")
+                .await?,
+            99
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_with_baseline_metadata_requeues_failed_to_apply_once() -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover.1794584066.git.ralf@mandelbit.com";
+        let p1_id = "p1.1794584066.git.ralf@mandelbit.com";
+        let p2_id = "p2.1794584066.git.ralf@mandelbit.com";
+        let author = "Ralf Lici <ralf@mandelbit.com>";
+
+        // Patches arrive before cover letter, creating a placeholder cover message.
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] ovpn: part 1",
+            1001,
+            "patch 1 body",
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] ovpn: part 1",
+                author,
+                1001,
+                2,
+                1,
+                "openvpn-devel@lists.sourceforge.net",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] ovpn: part 2",
+            1002,
+            "patch 2 body",
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(p2_id),
+            p2_id,
+            "[PATCH 2/2] ovpn: part 2",
+            author,
+            1002,
+            2,
+            1,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            2,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+
+        // Worker runs before cover arrives and marks Failed To Apply with stale logs.
+        let claim_gen = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+        claimed_db
+            .update_patchset_baseline_info(
+                ps_id,
+                None,
+                Some("model"),
+                Some("hash"),
+                Some("[{\"baseline\":\"net-next\",\"status\":\"Failed\"}]"),
+                Some("gemini"),
+            )
+            .await?;
+        assert!(
+            claimed_db
+                .complete_patchset_review_status(ps_id, ReviewStatus::FailedToApply.as_str())
+                .await?
+        );
+
+        // Late cover letter arrives carrying base-commit and prerequisite trailers.
+        let cover_body = "Hi,\n\nbase-commit: 7b6ab4dbc156e2f96419715130b3d5738a306c93\n\
+            prerequisite-message-id: cover.1794244231.git.ralf@mandelbit.com\n\
+            prerequisite-patch-id: 0cc7597aca91a5984596d971b1b066ad6616c329\n";
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] ovpn: cover",
+            1000,
+            cover_body,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let matched = db
+            .create_patchset(
+                tid,
+                Some(cover_id),
+                cover_id,
+                "[PATCH 0/2] ovpn: cover",
+                author,
+                1000,
+                2,
+                1,
+                "openvpn-devel@lists.sourceforge.net",
+                "",
+                None,
+                0,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?;
+        assert_eq!(matched, Some(ps_id));
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, cover_letter_message_id, subject_index, baseline_logs
+                   FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await?;
+        let row = rows.next().await?.unwrap();
+        assert_eq!(row.get::<String>(0)?, "Pending");
+        assert_eq!(row.get::<Option<String>>(1)?.as_deref(), Some(cover_id));
+        assert_eq!(row.get::<u32>(2)?, 0);
+        assert_eq!(row.get::<Option<String>>(3)?, None);
+
+        // If the retry still fails to apply, redelivering the same cover must not loop.
+        let claim_gen2 = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db2 = db.with_patchset_claim(ps_id, claim_gen2);
+        assert!(
+            claimed_db2
+                .complete_patchset_review_status(ps_id, ReviewStatus::FailedToApply.as_str())
+                .await?
+        );
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] ovpn: cover",
+            author,
+            1000,
+            2,
+            1,
+            "openvpn-devel@lists.sourceforge.net",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_cover_without_baseline_metadata_does_not_requeue() -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover-plain@example.org";
+        let p1_id = "p1-plain@example.org";
+        let p2_id = "p2-plain@example.org";
+        let author = "Dev <dev@example.org>";
+
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] net: p1",
+            1001,
+            "p1",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] net: p1",
+                author,
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] net: p2",
+            1002,
+            "p2",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+        db.execute(
+            "UPDATE patchsets SET received_parts = 2, status = 'Failed To Apply' WHERE id = ?",
+            libsql::params![ps_id],
+        )
+        .await?;
+
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] net: plain cover",
+            1000,
+            "Just a prose overview with no trailers.",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] net: plain cover",
+            author,
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_complete_failed_to_apply_requeues_when_late_cover_arrived_during_review()
+    -> Result<()> {
+        let db = setup_db().await;
+        let cover_id = "cover-race@example.org";
+        let p1_id = "p1-race@example.org";
+        let p2_id = "p2-race@example.org";
+        let author = "Dev <dev@example.org>";
+
+        let tid = db.ensure_thread_for_message(cover_id, 1000).await?;
+        db.create_message(
+            p1_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 1/2] ovpn: p1",
+            1001,
+            "p1 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                tid,
+                Some(p1_id),
+                p1_id,
+                "[PATCH 1/2] ovpn: p1",
+                author,
+                1001,
+                2,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await?
+            .unwrap();
+        db.create_patch(ps_id, p1_id, 1, "diff 1").await?;
+        db.create_message(
+            p2_id,
+            tid,
+            Some(cover_id),
+            author,
+            "[PATCH 2/2] ovpn: p2",
+            1002,
+            "p2 body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patch(ps_id, p2_id, 2, "diff 2").await?;
+        db.execute(
+            "UPDATE patchsets SET received_parts = 2, status = 'Pending' WHERE id = ?",
+            libsql::params![ps_id],
+        )
+        .await?;
+
+        // Worker starts reviewing with patch 1's identity before cover arrives.
+        let claim_gen = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+
+        // Late cover letter arrives while patchset is In Review.
+        db.create_message(
+            cover_id,
+            tid,
+            None,
+            author,
+            "[PATCH 0/2] ovpn: cover",
+            1000,
+            "Cover\nbase-commit: 7b6ab4dbc156e2f96419715130b3d5738a306c93\n",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        db.create_patchset(
+            tid,
+            Some(cover_id),
+            cover_id,
+            "[PATCH 0/2] ovpn: cover",
+            author,
+            1000,
+            2,
+            1,
+            "",
+            "",
+            None,
+            0,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await?;
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("In Review")
+        );
+
+        // Worker finishes failing baselines and tries to mark Failed To Apply -> requeued!
+        let outcome = claimed_db
+            .complete_failed_to_apply_or_requeue(ps_id, Some(p1_id), "[PATCH 1/2] ovpn: p1", true)
+            .await?;
+        assert_eq!(outcome, FailedToApplyOutcome::RequeuedForLateCover);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Pending")
+        );
+
+        // Next run starts with the cover letter; if it still fails, it marks Failed To Apply.
+        let claim_gen2 = db.enter_patchset_review_with_gen(ps_id).await?.unwrap();
+        let claimed_db2 = db.with_patchset_claim(ps_id, claim_gen2);
+        let outcome2 = claimed_db2
+            .complete_failed_to_apply_or_requeue(
+                ps_id,
+                Some(cover_id),
+                "[PATCH 0/2] ovpn: cover",
+                true,
+            )
+            .await?;
+        assert_eq!(outcome2, FailedToApplyOutcome::MarkedFailedToApply);
+        assert_eq!(
+            db.get_patchset_status(ps_id).await?.as_deref(),
+            Some("Failed To Apply")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_patchset_email_outbox_dedup_claim_and_cancel() -> Result<()> {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("cover@example.org", "[PATCH 0/2] test", 100)
+            .await?;
+        db.create_message(
+            "cover@example.org",
+            thread_id,
+            None,
+            "Author <author@example.org>",
+            "[PATCH 0/2] test",
+            100,
+            "Cover body",
+            "list@vger.kernel.org",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("cover@example.org"),
+                "cover@example.org",
+                "[PATCH 0/2] test",
+                "Author <author@example.org>",
+                100,
+                2,
+                0,
+                "list@vger.kernel.org",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await?
+            .expect("patchset created");
+
+        // Claim the patchset, transition to Failed To Apply, and verify the claim
+        // still allows queueing a PatchsetFailure email.
+        db.update_patchset_status(ps_id, "Pending").await?;
+        let claim_gen = db
+            .enter_patchset_review_with_gen(ps_id)
+            .await?
+            .expect("claimed");
+        let claimed_db = db.with_patchset_claim(ps_id, claim_gen);
+        assert!(
+            claimed_db
+                .complete_patchset_review_status(ps_id, "Failed To Apply")
+                .await?
+        );
+
+        let inserted = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Failed to apply v1",
+            )
+            .await?;
+        assert!(inserted);
+
+        // Second insert for same (patchset_id, kind) refreshes the unsent row in place.
+        let refreshed = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Failed to apply v2",
+            )
+            .await?;
+        assert!(refreshed);
+
+        let count: i64 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM email_outbox WHERE patchset_id = ? AND kind = 'patchset_failure'",
+                libsql::params![ps_id],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(count, 1);
+
+        // Lock and mark Sent; subsequent insert must not overwrite a Sent row.
+        let claimed_row = db.lock_pending_email().await?.expect("locked email");
+        assert_eq!(claimed_row.kind, EmailKind::PatchsetFailure);
+        assert_eq!(claimed_row.body, "Failed to apply v2");
+        db.mark_email_sent(claimed_row.id).await?;
+
+        let overwritten = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetFailure,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Duplicate",
+            )
+            .await?;
+        assert!(!overwritten);
+
+        // A different kind (PatchsetSummary) on the same patchset can still be queued,
+        // and cancelling the patchset cancels the pending patchset-level outbox row.
+        let summary_inserted = claimed_db
+            .insert_patchset_email_outbox(
+                ps_id,
+                EmailKind::PatchsetSummary,
+                "Pending",
+                "[\"author@example.org\"]",
+                "[]",
+                "Re: [PATCH 0/2] test",
+                "cover@example.org",
+                "cover@example.org",
+                "Series summary",
+            )
+            .await?;
+        assert!(summary_inserted);
+
+        db.update_patchset_status(ps_id, "Cancelled").await?;
+        assert!(db.lock_pending_email().await?.is_none());
+
+        let summary_status: String = db
+            .conn
+            .query(
+                "SELECT status FROM email_outbox WHERE patchset_id = ? AND kind = 'patchset_summary'",
+                libsql::params![ps_id],
+            )
+            .await?
+            .next()
+            .await?
+            .unwrap()
+            .get(0)?;
+        assert_eq!(summary_status, "Cancelled");
+        Ok(())
     }
 }

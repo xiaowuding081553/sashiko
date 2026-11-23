@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct GitSyncWorker {
     repo_path: PathBuf,
@@ -32,7 +32,7 @@ impl GitSyncWorker {
     }
 
     async fn sync_all_remotes(&self) -> Result<()> {
-        info!("GitSyncWorker: Starting sync cycle.");
+        debug!("GitSyncWorker: Starting sync cycle.");
 
         // Enumerate all configured remotes
         let output = crate::git_cmd::in_dir_async(&self.repo_path)
@@ -53,7 +53,7 @@ impl GitSyncWorker {
             .filter(|l| !l.is_empty() && !l.starts_with("fetcher-"))
             .collect();
 
-        info!("GitSyncWorker: Found {} remotes to check.", remotes.len());
+        debug!("GitSyncWorker: Found {} remotes to check.", remotes.len());
 
         let mut fetched = 0usize;
         let mut skipped = 0usize;
@@ -106,7 +106,7 @@ impl GitSyncWorker {
                     record_failure(&message);
                 }
                 Err(e) if e.downcast_ref::<BackoffError>().is_some() => {
-                    info!("GitSyncWorker: {}", e);
+                    debug!("GitSyncWorker: {}", e);
                     backed_off += 1;
                 }
                 Err(e) => {
@@ -132,6 +132,15 @@ impl GitSyncWorker {
         // That cycle has no failure to quote and the network may have
         // recovered since, so it logs at warn.
         let tried = fetched + stale + failed;
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Fetched, fetched as u64);
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Skipped, skipped as u64);
+        crate::metrics::add_git_sync_runs(
+            crate::metrics::GitSyncOutcome::BackedOff,
+            backed_off as u64,
+        );
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Stale, stale as u64);
+        crate::metrics::add_git_sync_runs(crate::metrics::GitSyncOutcome::Failed, failed as u64);
+        crate::git_ops::refresh_remote_freshness_metrics(&self.repo_path).await;
         if fetched == 0 && tried > 0 {
             error!(
                 "GitSyncWorker: Sync cycle fetched nothing: {} skipped, {} backing off, {} stale, {} failed. First failure: {}",
@@ -142,8 +151,13 @@ impl GitSyncWorker {
                 "GitSyncWorker: Sync cycle fetched nothing: {} skipped, {} backing off.",
                 skipped, backed_off
             );
-        } else {
+        } else if tried > 0 {
             info!(
+                "GitSyncWorker: Sync cycle complete: {} fetched, {} skipped, {} backing off, {} stale, {} failed.",
+                fetched, skipped, backed_off, stale, failed
+            );
+        } else {
+            debug!(
                 "GitSyncWorker: Sync cycle complete: {} fetched, {} skipped, {} backing off, {} stale, {} failed.",
                 fetched, skipped, backed_off, stale, failed
             );

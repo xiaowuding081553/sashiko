@@ -1,0 +1,109 @@
+# Example per-mailing-list policy (tracking, embargo, email delivery and
+# Patchwork). Sashiko reads projects/<project>/mailing_lists.toml, or the
+# file named by [review] email_policy_path in Settings.toml.
+#
+# Each section key is a mailing list address; omitted fields inherit from
+# the defaults table. Every key is described in docs/configuration.md.
+
+[defaults]
+# Whether listed mailing lists are tracked via NNTP by default.
+track = true
+
+# Hours to wait before publishing a review with findings.
+embargo_hours = 2
+
+# Who receives review emails when findings are present:
+# - "author": patch author
+# - "list": the mailing list itself
+# - "recipients": individual non-mailing-list recipients from To/Cc
+reply_to = ["author"]
+
+# Who receives a review email when 0 issues are found:
+# - "none": do not send email on clean reviews
+# - "author": send positive review only to the patch author
+# - "all": send positive review to normal reply_to + cc recipients
+positive_review = "none"
+
+# Opt-in notification when a patchset fails to apply or fails review
+# after all retries ("none", "author", or "all").
+failed_review = "none"
+
+# If true, completely mutes email notifications for this scope.
+mute_all = true
+
+# Static email addresses that should always receive a copy (CC'd).
+cc = []
+
+# Author addresses (substring match) whose patches are skipped at
+# ingestion and never reviewed. Entries in any list section apply to
+# every list, not only to that section.
+ignored_emails = []
+
+# Mention 1-2 closely related, non-security-sensitive pre-existing bugs on
+# the first non-RFC posting of a series (each bug at most once). Accepts
+# true, false ("none"), or a severity floor ("low".."critical"; true uses
+# "high").
+report_preexisting_bugs = true
+
+# --- Author-only delivery (inherits defaults when mute_all = false) ---
+# ["intel-xe@lists.freedesktop.org"]
+# mute_all = false
+
+# --- Public list + author + CC'd individuals ---
+# ["bpf@vger.kernel.org"]
+# mute_all = false
+# embargo_hours = 0
+# subject_prefixes = ["bpf", "bpf-next"]
+# reply_to = ["author", "list", "recipients"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git"
+# subject_prefixes = ["bpf-next"]
+#
+# [["bpf@vger.kernel.org".baselines]]
+# url = "https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf.git"
+# subject_prefixes = ["bpf"]
+
+# --- Opt out of related pre-existing bug mentions ---
+# ["linux-mm@kvack.org"]
+# mute_all = false
+# reply_to = ["author", "list", "recipients"]
+# report_preexisting_bugs = false
+
+# --- Custom NNTP group override ---
+# Needed only when the group is not the reversed domain followed by the
+# list name (dev@lists.example.org -> org.example.lists.dev).
+# ["dev@lists.example.org"]
+# nntp_group = "org.example.lists.dev-archive"
+
+# --- Patchwork integration examples ---
+#
+# API mode: direct REST API calls with retry-queuing (3 attempts).
+# Requires a maintainer API token (or SASHIKO_PATCHWORK_TOKEN env var).
+#
+# ["netdev@vger.kernel.org".patchwork]
+# enabled = true
+# api_url = "https://patchwork.kernel.org/api/1.3"
+# token = "your-api-token"
+# min_severity = "Medium"
+# fail_severity = "High"
+#
+# Email mode: sends a structured notification email that a local script
+# (e.g. pw_tools) can parse and use to post the check.
+#
+# ["linux-media@vger.kernel.org".patchwork]
+# enabled = true
+# email = "pw-bot@lists.example.org"
+#
+# The same keys in a [defaults.patchwork] table apply to patches that
+# match no list section above.
+
+# --- Shared mailing-list ingestion filter ---
+# Useful when a single list carries patches for several repositories
+# (for example linux-ext4@vger.kernel.org carrying kernel ext4, xfstests,
+# and e2fsprogs patches).
+# ["linux-ext4@vger.kernel.org".ingest_filter]
+# allowed_subject_prefixes = ["e2fsprogs"]
+# ignored_subject_prefixes = ["fstests", "xfstests"]
+# allowed_paths = ["e2fsck/", "lib/ext2fs/", "misc/"]
+# ignored_paths = ["fs/", "tests/ext4/"]

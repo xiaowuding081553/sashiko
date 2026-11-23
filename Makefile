@@ -1,7 +1,7 @@
 # Sashiko Development and CI Tasks
 
 .PHONY: help build fmt lint lint-local lint-local-cache test clean
-.PHONY: check-pr check-all sob check-db-invariants
+.PHONY: check-pr check-all sob check-db-invariants repo dist
 
 # Default target
 .DEFAULT_GOAL := help
@@ -12,6 +12,7 @@ help:
 	@echo ""
 	@echo "  Development:"
 	@echo "    build               - Build release binary"
+	@echo "    dist                - Build and package release tarballs"
 	@echo "    fmt                 - Auto-format Rust code"
 	@echo "    lint                - Run all linters (clippy, fmt --check, yamllint)"
 	@echo "    lint-local          - Run clippy on local-review profile (no cache)"
@@ -26,12 +27,17 @@ help:
 	@echo ""
 	@echo "  Utilities:"
 	@echo "    sob                 - Check Signed-off-by tags (RANGE=HEAD~1..HEAD)"
+	@echo "    repo                - Clone or update the reviewed tree (PROJECT=linux)"
 
 # ── Development ──────────────────────────────────────────
 
 # Build release binary
 build:
 	@cargo build --all-features --release
+
+# Build and package release tarballs
+dist:
+	@./scripts/package-release.sh
 
 # Auto-format Rust code
 fmt:
@@ -58,6 +64,7 @@ test:
 # Remove build artifacts
 clean:
 	@cargo clean
+	@rm -rf dist
 
 # ── CI Suites ────────────────────────────────────────────
 
@@ -98,6 +105,13 @@ check-all: sob lint lint-local lint-local-cache test check-db-invariants
 # Check Signed-off-by tags (default: HEAD~1..HEAD)
 sob:
 	@./scripts/check-sob.sh "$(RANGE)"
+
+# Clone or update the upstream tree a project reviews (default: linux).
+# The explicit path keeps each project's tree in its own directory, whatever
+# repository_path the local Settings.toml names.
+PROJECT ?= linux
+repo:
+	@cargo run -q --bin sashiko -- --project "$(PROJECT)" repo sync --path "third_party/$(PROJECT)"
 
 # Run lightweight database invariant checks
 check-db-invariants:

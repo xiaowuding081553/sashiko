@@ -33,7 +33,8 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::claude_cli::log_and_redact_stderr;
+use super::cli_common::{build_prompt, parse_inner_response};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, token_budget::TokenBudget,
 };
@@ -55,6 +56,7 @@ pub fn build_devin_args(
 ) -> Vec<String> {
     let mut args = vec![
         "--print".to_string(),
+        "--sandbox".to_string(),
         "--prompt-file".to_string(),
         prompt_file.to_string(),
     ];
@@ -148,7 +150,7 @@ impl AiProvider for DevinCliProvider {
             cached_tokens: None,
         });
 
-        parse_inner_response(&raw, usage)
+        parse_inner_response("devin-cli", &raw, usage)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -198,7 +200,10 @@ mod tests {
     #[test]
     fn test_build_args_minimal() {
         let args = build_devin_args("/tmp/p.txt", None, None, None);
-        assert_eq!(args, vec!["--print", "--prompt-file", "/tmp/p.txt",]);
+        assert_eq!(
+            args,
+            vec!["--print", "--sandbox", "--prompt-file", "/tmp/p.txt",]
+        );
     }
 
     #[test]

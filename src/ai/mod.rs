@@ -156,8 +156,8 @@ impl ReasoningEffort {
     }
 }
 
-/// Configurable reasoning effort mode for models that support effort levels
-/// (currently Argon 4).
+/// Configurable reasoning effort mode for Gemini models that support
+/// per-stage `thinkingConfig.thinkingLevel`.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum EffortMode {
@@ -236,11 +236,79 @@ impl std::fmt::Display for EffortMode {
     }
 }
 
-/// Returns whether `model` supports configurable reasoning effort levels.
+fn normalize_gemini_model_id(model: &str) -> String {
+    let lower = model.trim().to_ascii_lowercase();
+    lower
+        .strip_prefix("publishers/google/models/")
+        .or_else(|| lower.strip_prefix("models/"))
+        .unwrap_or(&lower)
+        .to_string()
+}
+
+/// Returns whether `model` names a Gemini family model (`gemini` or `gemini-*`).
+pub fn is_gemini_model_name(model: &str) -> bool {
+    let id = normalize_gemini_model_id(model);
+    id == "gemini" || id.starts_with("gemini-")
+}
+
+/// Returns whether `model` names a pre-Gemini-4 release (such as `gemini-1.5-*`,
+/// `gemini-2.5-*`, `gemini-3.1-*`, or `gemini-pro`).
 ///
-/// Currently only Argon 4 (`gemini-4-argon`) supports this setting.
+/// Legacy Gemini models reject 128K `maxOutputTokens` without Long Decodes v2
+/// continuation and do not enable per-stage `EffortMode` unless explicitly
+/// configured.
+pub fn is_legacy_gemini_model(model: &str) -> bool {
+    let id = normalize_gemini_model_id(model);
+    if id == "gemini" {
+        return true;
+    }
+    let Some(rest) = id.strip_prefix("gemini-") else {
+        return false;
+    };
+    for legacy in ["pro", "ultra", "nano", "flash", "exp", "latest"] {
+        if rest == legacy || rest.starts_with(&format!("{legacy}-")) {
+            return true;
+        }
+    }
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 {
+        return rest[..digits].parse::<u32>().is_ok_and(|major| major < 4);
+    }
+    false
+}
+
+/// Returns whether `model` enables configurable per-stage reasoning effort and
+/// Long Decodes v2 continuation by default.
+///
+/// Matches Gemini 4+ models (`gemini-4-argon`, `gemini-4-carbon`, `gemini-5-*`,
+/// and codename releases such as `gemini-argon-preview`) while excluding
+/// pre-Gemini-4 (`gemini-1*`, `gemini-2*`, `gemini-3*`) and non-Gemini models.
 pub fn model_supports_effort(model: &str) -> bool {
-    model.to_ascii_lowercase().contains("argon")
+    is_gemini_model_name(model) && !is_legacy_gemini_model(model)
+}
+
+/// Returns whether `(provider, model)` accepts per-stage `AiRequest::reasoning_effort`
+/// when `[review] effort` or `--effort` is explicitly configured.
+///
+/// Note: `stdio-gemini` is the daemon's generic worker IPC transport shared by
+/// OpenAI, Bedrock, Vertex, Ollama, vLLM, and Gemini, so it gates on
+/// [`is_gemini_model_name`] just like `vertex`.
+pub fn provider_accepts_per_stage_effort(provider: &str, model: &str) -> bool {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => !model.trim().is_empty(),
+        "vertex" | "stdio-gemini" => is_gemini_model_name(model),
+        _ => false,
+    }
+}
+
+/// Returns whether `(provider, model)` enables default per-stage `EffortMode`
+/// when `[review] effort` is left unset.
+pub fn provider_defaults_to_effort(provider: &str, model: &str) -> bool {
+    match provider.trim().to_ascii_lowercase().as_str() {
+        "gemini" => !model.trim().is_empty() && !is_legacy_gemini_model(model),
+        "vertex" | "stdio-gemini" => model_supports_effort(model),
+        _ => false,
+    }
 }
 
 /// A generic AI request containing conversation history and configuration.
@@ -267,6 +335,11 @@ pub struct AiRequest {
     /// Optional per-request reasoning / thinking effort override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Random ID shared by every request of one stage conversation. It is
+    /// never part of the prompt; a provider may send it as routing
+    /// metadata so the conversation reaches a replica with a warm cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<uuid::Uuid>,
 }
 
 tokio::task_local! {
@@ -364,6 +437,13 @@ pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub trait ClassifyAiError {
     fn ai_error_class(&self) -> AiErrorClass;
+
+    /// What the provider itself said about the failure, when the status code
+    /// alone cannot tell one cause from another. Already redacted and
+    /// shortened, so it is safe to put in a log line.
+    fn ai_error_detail(&self) -> Option<&str> {
+        None
+    }
 }
 
 impl ClassifyAiError for RemoteAiError {
@@ -394,33 +474,169 @@ pub(crate) fn is_permanent_transport_error(e: &reqwest::Error) -> bool {
     e.is_builder() || e.is_redirect()
 }
 
-/// Classifies AI errors through typed provider and stdio error downcasts.
-pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+/// Resolves the typed provider or stdio error inside an [`anyhow::Error`].
+///
+/// Both the class and the detail are read through this, so the list of types
+/// that can be classified exists once.
+fn typed_ai_error(error: &anyhow::Error) -> Option<&dyn ClassifyAiError> {
     if let Some(e) = error.downcast_ref::<RemoteAiError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
-    if let Some(e) = error.downcast_ref::<openai::OpenAiCompatError>() {
-        return e.ai_error_class();
+    if let Some(e) = error.downcast_ref::<openai_common::OpenAiCompatError>() {
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<claude::ClaudeError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<claude_cli::ClaudeCliError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<gemini::GeminiError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
     if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
-        return e.ai_error_class();
+        return Some(e);
     }
-    AiErrorClass::Fatal
+    None
+}
+
+/// Classifies AI errors through typed provider and stdio error downcasts.
+pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
+    typed_ai_error(error)
+        .map(ClassifyAiError::ai_error_class)
+        .unwrap_or(AiErrorClass::Fatal)
+}
+
+/// The provider's own explanation of an AI error, when it gave one.
+pub fn classify_ai_error_detail(error: &anyhow::Error) -> Option<&str> {
+    typed_ai_error(error).and_then(ClassifyAiError::ai_error_detail)
+}
+
+/// Returns true when a failed patch review attempt cannot recover by re-running
+/// the workflow from the start (for example, fatal provider authentication or
+/// request errors, or an exhausted review deadline/budget). Session-level model
+/// output failures (`ReviewError::LimitExceeded`, `FormatRejection`,
+/// `OutputTruncated`) remain retryable so the next attempt can ask the model
+/// for a fresh completion after forgetting the rejected turn.
+pub fn is_non_retryable_review_error(error: &anyhow::Error) -> bool {
+    if let Some(re) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return matches!(
+            re,
+            crate::worker::prompts::ReviewError::BudgetExceeded(_)
+                | crate::worker::prompts::ReviewError::Cancelled
+        );
+    }
+    // Standalone SessionFailure values (built by SessionRunner::run via
+    // anyhow::Error::new(SessionFailure { .. }) for output truncation, format
+    // validation exhaustion, turn limits, or transient retry exhaustion) have
+    // SessionFailure as their root cause and remain retryable across patch
+    // attempts after cache eviction. Fatal provider and deadline errors attach
+    // SessionFailure via e.context(SessionFailure { .. }), leaving the underlying
+    // error as root_cause().
+    if error.root_cause().is::<session::SessionFailure>() {
+        return false;
+    }
+    matches!(classify_ai_error(error), AiErrorClass::Fatal)
+}
+
+fn non_empty_opt(val: Option<&str>) -> bool {
+    val.is_some_and(|s| !s.trim().is_empty())
+}
+
+fn non_empty_env<F: Fn(&str) -> Option<String>>(env: &F, key: &str) -> bool {
+    env(key).is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Validates that the configured AI provider has credentials or a proxy/custom
+/// endpoint configured before starting expensive repository prefetch or review
+/// work.
+pub fn validate_provider_credentials(ai: &AiSettings) -> Result<()> {
+    validate_provider_credentials_with(
+        ai,
+        |key| std::env::var(key).ok(),
+        gemini::GeminiClient::has_auto_proxy_helper(),
+    )
+}
+
+pub(crate) fn validate_provider_credentials_with<F>(
+    ai: &AiSettings,
+    env: F,
+    has_gemini_auto_proxy: bool,
+) -> Result<()>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if ai.no_ai {
+        return Ok(());
+    }
+    match ai.provider.to_lowercase().as_str() {
+        "gemini" => {
+            let gemini_cfg = ai.gemini.as_ref();
+            let has_key =
+                non_empty_env(&env, "GEMINI_API_KEY") || non_empty_env(&env, "LLM_API_KEY");
+            let base_url = env("GOOGLE_GEMINI_BASE_URL")
+                .or_else(|| env("GEMINI_BASE_URL"))
+                .or_else(|| gemini_cfg.and_then(|s| s.base_url.clone()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let has_custom_base_url = base_url
+                .as_deref()
+                .is_some_and(|u| u != "https://generativelanguage.googleapis.com");
+            let has_proxy = non_empty_env(&env, "GEMINI_PROXY_COMMAND")
+                || non_empty_opt(gemini_cfg.and_then(|s| s.proxy_command.as_deref()))
+                || has_gemini_auto_proxy;
+            let has_bearer = non_empty_env(&env, "GEMINI_AUTH_TOKEN")
+                || non_empty_env(&env, "GEMINI_AUTH_TOKEN_COMMAND")
+                || non_empty_opt(gemini_cfg.and_then(|s| s.auth_token_command.as_deref()));
+            if !has_key && !has_custom_base_url && !has_proxy && !has_bearer {
+                return Err(gemini::GeminiError::PermissionDenied(
+                    gemini::MISSING_GEMINI_CREDENTIALS_MSG.to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "claude" => {
+            let claude_cfg = ai.claude.as_ref();
+            let has_key = non_empty_env(&env, "ANTHROPIC_API_KEY")
+                || non_empty_env(&env, "ANTHROPIC_AUTH_TOKEN")
+                || non_empty_env(&env, "LLM_API_KEY")
+                || non_empty_env(&env, "ANTHROPIC_CUSTOM_HEADERS");
+            let has_custom_base_url = non_empty_env(&env, "ANTHROPIC_BASE_URL")
+                || claude_cfg
+                    .and_then(|s| s.base_url.as_deref())
+                    .map(str::trim)
+                    .is_some_and(|u| !u.is_empty() && u != "https://api.anthropic.com/v1/messages");
+            if !has_key && !has_custom_base_url {
+                return Err(claude::ClaudeError::AuthenticationError(
+                    "Anthropic API key is not set. Set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN or LLM_API_KEY), or configure [ai.claude] base_url.".to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        "openai" => {
+            let compat_cfg = ai.openai_compat.as_ref();
+            let has_key =
+                non_empty_env(&env, "OPENAI_API_KEY") || non_empty_env(&env, "LLM_API_KEY");
+            let has_custom_base_url = non_empty_opt(compat_cfg.and_then(|s| s.base_url.as_deref()));
+            let has_extra_headers = compat_cfg.is_some_and(|s| !s.extra_headers.is_empty());
+            if !has_key && !has_custom_base_url && !has_extra_headers {
+                return Err(openai_common::OpenAiCompatError::AuthenticationError(
+                    "OpenAI API key is not set. Set OPENAI_API_KEY (or LLM_API_KEY), or configure [ai.openai_compat] base_url or extra_headers.".to_string(),
+                )
+                .into());
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Token usage statistics for an AI interaction.
@@ -450,6 +666,18 @@ impl AiUsage {
             *self.cached_tokens.get_or_insert(0) += other_cached;
         }
     }
+
+    /// Returns uncached input plus completion tokens, falling back to
+    /// `total_tokens` when neither breakdown is populated.
+    pub fn uncached_tokens(&self) -> usize {
+        let cached = self.cached_tokens.unwrap_or(0);
+        let from_parts = self
+            .prompt_tokens
+            .saturating_sub(cached)
+            .saturating_add(self.completion_tokens);
+        let from_total = self.total_tokens.saturating_sub(cached);
+        from_parts.max(from_total)
+    }
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -470,11 +698,43 @@ pub struct CacheStats {
     pub tokens_saved_prev_session: u64,
 }
 
+/// A boxed closure that wraps an [`AiProvider`] inside another decorator.
+pub type AiProviderDecorator = Box<dyn FnOnce(Arc<dyn AiProvider>) -> Arc<dyn AiProvider> + Send>;
+
 /// Trait defining the standard interface for all AI providers in Sashiko.
 #[async_trait]
 pub trait AiProvider: Send + Sync {
     /// Generates content based on the provided request.
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse>;
+
+    /// If this provider is a `CachingAiProvider`, wraps its inner provider with
+    /// `decorator` while keeping `CachingAiProvider` on the outside.
+    fn map_cached_inner(
+        &self,
+        _decorator: &mut Option<AiProviderDecorator>,
+    ) -> Option<Arc<dyn AiProvider>> {
+        None
+    }
+
+    /// Returns true if this provider or any inner provider manages
+    /// tracking active requests against a retry budget.
+    fn handles_active_budget(&self) -> bool {
+        false
+    }
+
+    /// Returns true if this provider or any inner provider manages
+    /// pacing through a dispatch gate.
+    fn handles_dispatch_gate(&self) -> bool {
+        false
+    }
+
+    /// Returns true if this provider or any inner provider records active AI
+    /// request latency and provider error telemetry at the dispatch boundary
+    /// (after semaphore and quota waits), so outer retry wrappers do not
+    /// double-count or include queueing wait time.
+    fn handles_request_telemetry(&self) -> bool {
+        false
+    }
 
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
@@ -499,6 +759,23 @@ pub trait AiProvider: Send + Sync {
     /// response cache holds anything to drop; a provider that wraps another
     /// must pass the call on, as it does `cache_stats`.
     async fn forget(&self, _request: &AiRequest) {}
+}
+
+/// Applies a decorator to the provider, wrapping inside any outer
+/// `CachingAiProvider` so local cache hits short-circuit before reaching
+/// rate-limit or concurrency decorators.
+pub fn decorate_uncached(
+    provider: Arc<dyn AiProvider>,
+    decorator: impl FnOnce(Arc<dyn AiProvider>) -> Arc<dyn AiProvider> + Send + 'static,
+) -> Arc<dyn AiProvider> {
+    let mut opt: Option<AiProviderDecorator> = Some(Box::new(decorator));
+    if let Some(rewrapped) = provider.map_cached_inner(&mut opt) {
+        rewrapped
+    } else if let Some(f) = opt {
+        f(provider)
+    } else {
+        provider
+    }
 }
 
 /// Appends the knobs a provider applies outside the request to its model name,
@@ -548,40 +825,60 @@ fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> s
     }
 }
 
-/// Creates an AI provider, wrapping it with a response cache when
-/// `ai.response_cache` is set.
+/// Creates an AI provider, wrapped with the response cache where it is used.
 ///
 /// `database` is the caller's database, which decides where the cache lives.
 /// A local review passes None: it holds `AiSettings` alone, with no database
-/// for the cache to sit beside.
+/// for the cache to sit beside. A local review also records every answer
+/// whatever the settings say, so that an interrupted one can be resumed, and
+/// replays them only with `response_cache` or `--resume`.
 pub async fn create_provider_cached(
     ai: &AiSettings,
-    #[cfg_attr(not(feature = "cache"), allow(unused_variables))] database: Option<&str>,
+    database: Option<&str>,
 ) -> Result<Arc<dyn AiProvider>> {
     let provider = create_provider_from_ai(ai)?;
+    let replay = ai.response_cache || ai.resume;
     // A daemon-spawned worker reaches the model through a stdio provider, and
     // the daemon holds a cache on the far side of it. Caching here as well
     // would give one run two of them, filled from the same responses.
-    if !ai.response_cache || ai.provider.starts_with("stdio-") {
+    if (!replay && database.is_some()) || ai.provider.starts_with("stdio-") {
         return Ok(provider);
     }
     #[cfg(feature = "cache")]
     {
         let cache_path = response_cache_path(database, &crate::utils::data_home()?);
-        if let Some(parent) = cache_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        let opened = async {
+            if let Some(parent) = cache_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            cache::CachingAiProvider::new(
+                provider.clone(),
+                &cache_path.to_string_lossy(),
+                ai.response_cache_ttl_days,
+            )
+            .await
         }
-        let cached = cache::CachingAiProvider::new(
-            provider,
-            &cache_path.to_string_lossy(),
-            ai.response_cache_ttl_days,
-        )
-        .await?;
-        Ok(Arc::new(cached))
+        .await;
+        match opened {
+            Ok(cached) if replay => Ok(Arc::new(cached.with_resume(ai.resume))),
+            Ok(cached) => Ok(Arc::new(cached.record_only())),
+            // Recording is only for a later --resume, so it never fails a review.
+            Err(e) if !replay => {
+                tracing::warn!(
+                    "Not recording responses, {} is unavailable: {e:#}",
+                    cache_path.display()
+                );
+                Ok(provider)
+            }
+            Err(e) => Err(e),
+        }
     }
     #[cfg(not(feature = "cache"))]
     {
-        bail!("ai.response_cache requires the 'cache' feature")
+        if !replay {
+            return Ok(provider);
+        }
+        bail!("ai.response_cache and --resume require the 'cache' feature")
     }
 }
 
@@ -593,7 +890,7 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
 #[cfg(feature = "vertex")]
 fn resolve_vertex_max_tokens(ai: &AiSettings) -> u32 {
     let model = &ai.model;
-    let is_gemini = model.starts_with("gemini");
+    let is_gemini = is_gemini_model_name(model);
     ai.vertex
         .as_ref()
         .and_then(|v| v.max_tokens)
@@ -608,6 +905,10 @@ fn resolve_vertex_max_tokens(ai: &AiSettings) -> u32 {
             }
         })
 }
+
+/// The shortest api_timeout_secs that service_tier = "flex" runs under
+/// without a warning; a flex response can take this long.
+const FLEX_MIN_TIMEOUT_SECS: u64 = 900;
 
 /// Creates an AI provider based on AI settings only.
 pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
@@ -632,6 +933,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .unwrap_or_else(claude::ClaudeClient::default_base_url);
             let thinking = claude.and_then(|c| c.thinking.clone());
             let effort = claude.and_then(|c| c.effort.clone());
+            let client_cert = claude.and_then(|c| c.client_cert.as_deref());
             Ok(Arc::new(claude::ClaudeClient::new(
                 model,
                 enable_caching,
@@ -639,7 +941,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 base_url,
                 thinking,
                 effort,
-            )))
+                client_cert,
+            )?))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]
@@ -651,6 +954,41 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
             let max_tokens = bedrock.map(|b| b.max_tokens).unwrap_or(8192);
             let thinking = bedrock.and_then(|b| b.thinking.clone());
             let effort = bedrock.and_then(|b| b.effort.clone());
+            let openai_api = bedrock.map(|b| b.openai_api).unwrap_or_default();
+            let use_mantle = openai_api == crate::settings::BedrockOpenAiApi::Mantle;
+            if use_mantle
+                && bedrock::is_openai_model(&model)
+                && !bedrock_mantle::accepts_model(&model)
+            {
+                tracing::info!(
+                    "[ai.bedrock] {model} is an inference profile, which bedrock-mantle \
+                     does not accept; using the Converse API"
+                );
+            }
+            if use_mantle && bedrock_mantle::accepts_model(&model) {
+                if thinking.is_some() {
+                    tracing::warn!(
+                        "[ai.bedrock] thinking is Anthropic-only; ignoring it for {model}"
+                    );
+                }
+                let api_key = std::env::var(bedrock_mantle::BEARER_TOKEN_ENV)
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty());
+                return Ok(Arc::new(bedrock_mantle::MantleClient::new(
+                    bedrock_mantle::MantleOptions {
+                        model,
+                        region,
+                        base_url: bedrock.and_then(|b| b.mantle_base_url.clone()),
+                        max_tokens,
+                        effort,
+                        api_timeout_secs: ai.api_timeout_secs,
+                        api_key,
+                        prompt_caching: enable_caching,
+                        prompt_cache_ttl: bedrock.and_then(|b| b.prompt_cache_ttl.clone()),
+                    },
+                )?));
+            }
             Ok(Arc::new(bedrock::BedrockClient::new(
                 model,
                 region,
@@ -663,46 +1001,121 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
         #[cfg(not(feature = "bedrock"))]
         "bedrock" => bail!("bedrock provider requires the 'bedrock' feature"),
         "openai" | "openai-compatible" => {
-            let provider_type = match ai.provider.to_lowercase().as_str() {
-                "openai" => openai::OpenAiProviderType::OpenAi,
-                _ => openai::OpenAiProviderType::OpenAiCompatible,
-            };
+            let compat = ai.openai_compat.as_ref();
 
-            let base_url = ai
-                .openai_compat
-                .as_ref()
-                .and_then(|c| c.base_url.clone())
-                .unwrap_or_else(|| {
-                    openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
-                });
-
-            let context_window = ai
-                .openai_compat
-                .as_ref()
+            let context_window = compat
                 .and_then(|c| c.context_window_size)
                 .unwrap_or_else(|| {
                     openai::OpenAiCompatClient::default_context_window_for_model(&ai.model)
                 });
 
-            let max_tokens = ai
-                .openai_compat
-                .as_ref()
-                .and_then(|c| c.max_tokens)
-                .unwrap_or(4096);
+            let max_tokens = compat.and_then(|c| c.max_tokens).unwrap_or(4096);
 
-            let effort = ai.openai_compat.as_ref().and_then(|c| c.effort.clone());
+            let effort = compat.and_then(|c| c.effort.clone());
+            let service_tier = compat.and_then(|c| c.service_tier);
+            // Only OpenAI's own API accepts the field, on either endpoint.
+            // Refusing here beats sending it to an endpoint that may reject
+            // the request, and beats dropping it, which would bill the
+            // standard tier while the config promises flex.
+            if service_tier.is_some() && !ai.provider.eq_ignore_ascii_case("openai") {
+                bail!("service_tier requires provider = \"openai\"");
+            }
+            if service_tier == Some(crate::settings::ServiceTier::Flex)
+                && ai.api_timeout_secs < FLEX_MIN_TIMEOUT_SECS
+            {
+                tracing::warn!(
+                    "service_tier = \"flex\" with api_timeout_secs = {}: a flex response can outlast it, and a request that times out is resent and billed again; raise it to at least {FLEX_MIN_TIMEOUT_SECS}",
+                    ai.api_timeout_secs
+                );
+            }
 
-            let provider = openai::OpenAiCompatClient::new(
-                base_url,
-                provider_type,
-                ai.model.clone(),
-                context_window,
-                max_tokens,
-                ai.api_timeout_secs,
-                effort,
-            )?;
+            // The endpoint the settings name, rather than the provider name,
+            // decides the transport: both provider values reach the same
+            // vendor and read the same settings block.
+            let api = compat
+                .and_then(|c| c.api.as_deref())
+                .unwrap_or("chat")
+                .to_lowercase();
 
-            Ok(Arc::new(provider))
+            match api.as_str() {
+                "chat" => {
+                    let provider_type = match ai.provider.to_lowercase().as_str() {
+                        "openai" => openai::OpenAiProviderType::OpenAi,
+                        _ => openai::OpenAiProviderType::OpenAiCompatible,
+                    };
+                    let base_url = compat.and_then(|c| c.base_url.clone()).unwrap_or_else(|| {
+                        openai::OpenAiCompatClient::default_base_url_for_model(&ai.model)
+                    });
+
+                    let provider = openai::OpenAiCompatClient::new(
+                        base_url,
+                        provider_type,
+                        ai.model.clone(),
+                        context_window,
+                        max_tokens,
+                        ai.api_timeout_secs,
+                        effort,
+                        service_tier,
+                    )?
+                    .with_reasoning_content(compat.is_some_and(|c| c.send_reasoning_content))
+                    .with_empty_tool_call_content(
+                        compat.is_some_and(|c| c.send_empty_tool_call_content),
+                    );
+                    let provider = match compat {
+                        Some(c) => provider
+                            .with_extra_headers(&openai::extra_headers_from_env(
+                                &c.extra_headers,
+                                |var| std::env::var(var).ok(),
+                            )?)?
+                            .with_session_affinity_header(c.session_affinity_header.as_deref())?
+                            .with_extra_body(c.extra_body.clone())?,
+                        None => provider,
+                    };
+
+                    Ok(Arc::new(provider))
+                }
+                "responses" => {
+                    // These shape a chat completion only. Refusing them beats
+                    // dropping them: a configured Authorization override that
+                    // never went out would leave the bearer token in use with
+                    // nothing in the log to say so.
+                    if let Some(c) = compat {
+                        let ignored = [
+                            ("send_reasoning_content", c.send_reasoning_content),
+                            (
+                                "send_empty_tool_call_content",
+                                c.send_empty_tool_call_content,
+                            ),
+                            ("extra_headers", !c.extra_headers.is_empty()),
+                            (
+                                "session_affinity_header",
+                                c.session_affinity_header.is_some(),
+                            ),
+                            ("extra_body", !c.extra_body.is_empty()),
+                        ];
+                        if let Some((name, _)) = ignored.iter().find(|(_, set)| *set) {
+                            bail!(
+                                "{name} applies to the chat endpoint only; unset it or set api = \"chat\""
+                            );
+                        }
+                    }
+
+                    let base_url = compat
+                        .and_then(|c| c.base_url.clone())
+                        .unwrap_or_else(openai_responses::OpenAiResponsesClient::default_base_url);
+
+                    Ok(Arc::new(openai_responses::OpenAiResponsesClient::new(
+                        base_url,
+                        ai.model.clone(),
+                        context_window,
+                        max_tokens,
+                        ai.api_timeout_secs,
+                        effort,
+                        service_tier,
+                    )?))
+                }
+                other => bail!("Unsupported openai api: {}", other),
+            }
         }
         "ollama" => {
             let model = ai.model.clone();
@@ -829,7 +1242,9 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 .or_else(|| std::env::var("GOOGLE_CLOUD_LOCATION").ok())
                 .unwrap_or_else(|| "us-east5".to_string());
             let enable_caching = vertex.map(|v| v.prompt_caching).unwrap_or(true);
-            let is_gemini = model.starts_with("gemini");
+            let is_gemini = is_gemini_model_name(&model);
+            let max_tokens_explicit = vertex.and_then(|v| v.max_tokens).is_some()
+                || (is_gemini && ai.gemini.as_ref().and_then(|g| g.max_tokens).is_some());
             let max_tokens = resolve_vertex_max_tokens(ai);
             let thinking = vertex.and_then(|v| v.thinking.clone()).or_else(|| {
                 if is_gemini {
@@ -839,15 +1254,18 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 }
             });
             let effort = vertex.and_then(|v| v.effort.clone());
-            Ok(Arc::new(vertex::VertexClient::new(
-                model,
-                project_id,
-                region,
-                enable_caching,
-                max_tokens,
-                thinking,
-                effort,
-            )?))
+            Ok(Arc::new(
+                vertex::VertexClient::new(
+                    model,
+                    project_id,
+                    region,
+                    enable_caching,
+                    max_tokens,
+                    thinking,
+                    effort,
+                )?
+                .with_max_tokens_explicit(max_tokens_explicit),
+            ))
         }
         #[cfg(not(feature = "vertex"))]
         "vertex" => bail!("vertex provider requires the 'vertex' feature"),
@@ -858,10 +1276,15 @@ pub mod acp;
 pub mod backoff_provider;
 #[cfg(feature = "bedrock")]
 pub mod bedrock;
+#[cfg(feature = "bedrock")]
+pub mod bedrock_mantle;
+#[cfg(feature = "bedrock")]
+pub(crate) mod bedrock_token;
 #[cfg(feature = "cache")]
 pub mod cache;
 pub mod claude;
 pub mod claude_cli;
+pub mod cli_common;
 pub mod codex_cli;
 pub mod concurrency_limited_provider;
 pub mod copilot_cli;
@@ -872,6 +1295,8 @@ pub mod kiro_cli;
 pub mod logging_provider;
 pub mod ollama;
 pub mod openai;
+pub mod openai_common;
+pub mod openai_responses;
 #[cfg(feature = "server")]
 pub mod proxy;
 pub mod quota;
@@ -1158,6 +1583,51 @@ mod tests {
     use anyhow::anyhow;
     use serde_json::json;
 
+    #[test]
+    fn test_ai_usage_uncached_tokens() {
+        let usage = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(40),
+        };
+        assert_eq!(usage.uncached_tokens(), 110);
+
+        let uncached = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: None,
+        };
+        assert_eq!(uncached.uncached_tokens(), 150);
+
+        let fallback_only = AiUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 42,
+            cached_tokens: None,
+        };
+        assert_eq!(fallback_only.uncached_tokens(), 42);
+    }
+
+    #[cfg(feature = "bedrock")]
+    #[test]
+    fn bedrock_routes_openai_models_to_mantle_unless_opted_out() {
+        let identity = |model: &str, extra: &str| {
+            let ai: crate::settings::AiSettings = toml::from_str(&format!(
+                "provider = \"bedrock\"\nmodel = \"{model}\"\n\
+                 [bedrock]\nregion = \"us-east-1\"\n{extra}"
+            ))
+            .unwrap();
+            create_provider_from_ai(&ai).unwrap().cache_identity()
+        };
+
+        assert!(identity("openai.gpt-5.6-sol", "").contains("|api=mantle"));
+        assert!(!identity("openai.gpt-5.6-sol", "openai_api = \"converse\"").contains("api="));
+        assert!(!identity("global.openai.gpt-6-astra", "").contains("api="));
+        assert!(!identity("us.anthropic.claude-sonnet-4", "").contains("api="));
+    }
+
     #[tokio::test]
     async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {
         let mut settings = Settings::new().expect("Failed to load settings");
@@ -1231,6 +1701,30 @@ mod tests {
     }
 
     #[test]
+    fn test_ai_request_conversation_id_wire_format() -> Result<()> {
+        let id = uuid::Uuid::new_v4();
+        let request = AiRequest {
+            conversation_id: Some(id),
+            ..Default::default()
+        };
+        let payload = serde_json::to_value(&request)?;
+        assert_eq!(payload["conversation_id"], id.to_string());
+        let parsed: AiRequest = serde_json::from_value(payload)?;
+        assert_eq!(parsed.conversation_id, Some(id));
+
+        let unset = serde_json::to_value(AiRequest::default())?;
+        assert!(unset.get("conversation_id").is_none());
+        let parsed: AiRequest = serde_json::from_value(json!({"messages": []}))?;
+        assert_eq!(parsed.conversation_id, None);
+
+        // The parent reads this from the review child: only a UUID may
+        // pass, since the value ends up in an HTTP header.
+        let malformed = json!({"messages": [], "conversation_id": "x\r\nInjected: 1"});
+        assert!(serde_json::from_value::<AiRequest>(malformed).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_ai_request_contract() -> Result<()> {
         let request = AiRequest {
             system: None,
@@ -1247,6 +1741,7 @@ mod tests {
             response_format: Some(AiResponseFormat::Text),
             context_tag: None,
             reasoning_effort: None,
+            conversation_id: None,
         };
 
         // This matches the format used in StdioGeminiClient and expected by the Worker
@@ -1418,13 +1913,16 @@ mod tests {
         }
 
         assert_ai_error_class(
-            openai::OpenAiCompatError::RateLimitExceeded(Duration::from_secs(7)),
+            openai_common::OpenAiCompatError::RateLimitExceeded(Duration::from_secs(7)),
             AiErrorClass::RateLimit {
                 retry_after: Duration::from_secs(7),
             },
         );
         assert_ai_error_class(
-            claude::ClaudeError::OverloadedError(Duration::from_secs(9)),
+            claude::ClaudeError::OverloadedError {
+                retry_after: Duration::from_secs(9),
+                detail: "busy".to_string(),
+            },
             AiErrorClass::Transient {
                 retry_after: Duration::from_secs(9),
             },
@@ -1443,6 +1941,33 @@ mod tests {
         assert_ai_error_class(
             anyhow!("Remote AI Error: rate limit exceeded"),
             AiErrorClass::Fatal,
+        );
+    }
+
+    /// Only a provider that answered with something more than a status code
+    /// contributes a detail, and an empty body contributes nothing.
+    #[test]
+    fn test_classify_ai_error_detail() {
+        let rate_limited: anyhow::Error = claude::ClaudeError::RateLimitExceeded {
+            retry_after: Duration::from_secs(1),
+            detail: "per-minute tokens".to_string(),
+        }
+        .into();
+        assert_eq!(
+            classify_ai_error_detail(&rate_limited),
+            Some("per-minute tokens")
+        );
+
+        let silent: anyhow::Error = claude::ClaudeError::OverloadedError {
+            retry_after: Duration::ZERO,
+            detail: String::new(),
+        }
+        .into();
+        assert_eq!(classify_ai_error_detail(&silent), None);
+
+        assert_eq!(
+            classify_ai_error_detail(&anyhow!("totally unrelated error")),
+            None
         );
     }
 
@@ -1469,6 +1994,148 @@ mod tests {
         assert!(result.is_err());
 
         Ok(())
+    }
+
+    /// Both transports report the model they were configured with, so the
+    /// cache identity is what says which one the settings selected.
+    #[test]
+    fn test_openai_api_selects_the_transport() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "openai".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+
+        let compat = |api: Option<&str>| crate::settings::OpenAiCompatSettings {
+            base_url: None,
+            context_window_size: None,
+            max_tokens: None,
+            effort: None,
+            send_reasoning_content: false,
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            send_empty_tool_call_content: false,
+            api: api.map(str::to_string),
+            service_tier: None,
+            session_affinity_header: None,
+        };
+
+        settings.ai.openai_compat = Some(compat(None));
+        let chat = create_provider(&settings)?.cache_identity();
+        assert!(!chat.contains("api="));
+
+        settings.ai.openai_compat = Some(compat(Some("responses")));
+        let responses = create_provider(&settings)?.cache_identity();
+        assert!(responses.contains("api=responses"));
+
+        settings.ai.openai_compat = Some(compat(Some("assistants")));
+        assert!(create_provider(&settings).is_err());
+
+        Ok(())
+    }
+
+    /// Both transports send service_tier for OpenAI itself and refuse it
+    /// for a compatible endpoint rather than dropping it on the floor.
+    #[test]
+    fn test_service_tier_requires_openai() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.model = "gpt-5.4".to_string();
+        for api in ["chat", "responses"] {
+            settings.ai.openai_compat = Some(crate::settings::OpenAiCompatSettings {
+                base_url: None,
+                context_window_size: None,
+                max_tokens: None,
+                effort: None,
+                send_reasoning_content: false,
+                extra_headers: Default::default(),
+                extra_body: Default::default(),
+                send_empty_tool_call_content: false,
+                api: Some(api.to_string()),
+                service_tier: Some(crate::settings::ServiceTier::Flex),
+                session_affinity_header: None,
+            });
+
+            settings.ai.provider = "openai".to_string();
+            assert!(create_provider(&settings).is_ok(), "api = {api}");
+
+            settings.ai.provider = "openai-compatible".to_string();
+            let err = create_provider(&settings)
+                .err()
+                .unwrap_or_else(|| panic!("api = {api} accepted service_tier"));
+            assert!(
+                err.to_string().contains("service_tier requires provider"),
+                "api = {api}: {err}"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A chat-only setting on the responses endpoint is refused rather
+    /// than ignored, since a dropped Authorization override would leave the
+    /// bearer token in use with nothing in the log to say so.
+    #[test]
+    fn test_responses_api_refuses_chat_only_settings() -> Result<()> {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "openai".to_string();
+        settings.ai.model = "gpt-5.4".to_string();
+
+        let compat = crate::settings::OpenAiCompatSettings {
+            base_url: None,
+            context_window_size: None,
+            max_tokens: None,
+            effort: None,
+            send_reasoning_content: false,
+            extra_headers: Default::default(),
+            extra_body: Default::default(),
+            send_empty_tool_call_content: false,
+            api: Some("responses".to_string()),
+            service_tier: None,
+            session_affinity_header: None,
+        };
+
+        let mut with_headers = compat.clone();
+        with_headers
+            .extra_headers
+            .insert("Authorization".to_string(), "GATEWAY_TOKEN".to_string());
+        let error = create_provider(&settings.with_compat(with_headers))
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(error.contains("extra_headers"), "{error}");
+
+        let mut with_affinity = compat.clone();
+        with_affinity.session_affinity_header = Some("x-session-affinity".to_string());
+        let error = match create_provider(&settings.with_compat(with_affinity)) {
+            Ok(_) => panic!("api = \"responses\" must refuse session_affinity_header"),
+            Err(e) => e.to_string(),
+        };
+        assert!(error.contains("session_affinity_header"), "{error}");
+
+        let mut with_body = compat.clone();
+        with_body
+            .extra_body
+            .insert("extraData".to_string(), serde_json::json!({}));
+        assert!(create_provider(&settings.with_compat(with_body)).is_err());
+
+        let mut with_empty = compat.clone();
+        with_empty.send_empty_tool_call_content = true;
+        assert!(create_provider(&settings.with_compat(with_empty)).is_err());
+
+        let mut with_reasoning = compat.clone();
+        with_reasoning.send_reasoning_content = true;
+        assert!(create_provider(&settings.with_compat(with_reasoning)).is_err());
+
+        assert!(create_provider(&settings.with_compat(compat)).is_ok());
+        Ok(())
+    }
+
+    impl Settings {
+        /// A copy with the given openai_compat section, for tests that
+        /// vary one field at a time.
+        fn with_compat(&self, compat: crate::settings::OpenAiCompatSettings) -> Settings {
+            let mut settings = self.clone();
+            settings.ai.openai_compat = Some(compat);
+            settings
+        }
     }
 
     // Providers built for concurrent reviews share one tx_id namespace.
@@ -1560,6 +2227,27 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn test_resume_replays_through_the_cache_where_the_settings_do_not() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = temp.path().join("sashiko.db");
+        let db = db.to_string_lossy();
+
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.model = "gemini-1.5-flash".to_string();
+        settings.ai.response_cache = false;
+
+        let provider = create_provider_cached(&settings.ai, Some(&db)).await?;
+        assert!(provider.cache_stats().is_none());
+
+        settings.ai.resume = true;
+        let provider = create_provider_cached(&settings.ai, Some(&db)).await?;
+        assert!(provider.cache_stats().is_some());
+        Ok(())
+    }
+
     #[cfg(feature = "vertex")]
     #[test]
     fn test_resolve_vertex_max_tokens() {
@@ -1590,5 +2278,90 @@ mod tests {
             effort: None,
         });
         assert_eq!(resolve_vertex_max_tokens(&settings.ai), 32_768);
+    }
+
+    #[test]
+    fn test_validate_provider_credentials_reports_missing_keys() {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.provider = "gemini".to_string();
+        settings.ai.gemini = None;
+
+        let err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("gemini without key, proxy, or custom base_url must fail");
+        assert!(err.to_string().contains("GEMINI_API_KEY"));
+
+        // Passing GEMINI_API_KEY or auto-proxy or --no-ai satisfies validation.
+        assert!(
+            validate_provider_credentials_with(
+                &settings.ai,
+                |k| (k == "GEMINI_API_KEY").then(|| "secret".to_string()),
+                false
+            )
+            .is_ok()
+        );
+        assert!(validate_provider_credentials_with(&settings.ai, |_| None, true).is_ok());
+
+        settings.ai.no_ai = true;
+        assert!(validate_provider_credentials_with(&settings.ai, |_| None, false).is_ok());
+        settings.ai.no_ai = false;
+
+        settings.ai.provider = "claude".to_string();
+        settings.ai.claude = None;
+        let claude_err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("claude without key must fail");
+        assert!(claude_err.to_string().contains("ANTHROPIC_API_KEY"));
+
+        settings.ai.provider = "openai".to_string();
+        settings.ai.openai_compat = None;
+        let openai_err = validate_provider_credentials_with(&settings.ai, |_| None, false)
+            .expect_err("openai without key must fail");
+        assert!(openai_err.to_string().contains("OPENAI_API_KEY"));
+        assert!(openai_err.to_string().contains("[ai.openai_compat]"));
+    }
+
+    #[test]
+    fn test_is_non_retryable_review_error_distinguishes_provider_fatal_from_session_errors() {
+        let perm_err: anyhow::Error =
+            gemini::GeminiError::PermissionDenied("missing key".to_string()).into();
+        let wrapped_perm = perm_err.context("Stage 'pre-screen' failed after 1 turns");
+        assert!(is_non_retryable_review_error(&wrapped_perm));
+
+        let untyped_deadline = anyhow::anyhow!("Review tool timed out (active time exceeded)")
+            .context(session::SessionFailure {
+                message: "Review tool timed out (active time exceeded)".to_string(),
+                history: Vec::new(),
+                usage: AiUsage::default(),
+            })
+            .context("WorkflowFailure wrapper");
+        assert!(is_non_retryable_review_error(&untyped_deadline));
+
+        let standalone_session_failure = anyhow::Error::new(session::SessionFailure {
+            message: "LLM output was truncated by provider (e.g. hit max tokens)".to_string(),
+            history: Vec::new(),
+            usage: AiUsage::default(),
+        })
+        .context("WorkflowFailure wrapper");
+        assert!(!is_non_retryable_review_error(&standalone_session_failure));
+
+        let transient_err: anyhow::Error = RemoteAiError {
+            message: "connection reset".to_string(),
+            class: AiErrorClass::Transient {
+                retry_after: DEFAULT_RETRY_AFTER,
+            },
+        }
+        .into();
+        assert!(!is_non_retryable_review_error(&transient_err));
+
+        let format_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::FormatRejection("bad json".to_string()).into();
+        assert!(!is_non_retryable_review_error(&format_err));
+
+        let truncated_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::OutputTruncated.into();
+        assert!(!is_non_retryable_review_error(&truncated_err));
+
+        let budget_err: anyhow::Error =
+            crate::worker::prompts::ReviewError::BudgetExceeded("timeout".to_string()).into();
+        assert!(is_non_retryable_review_error(&budget_err));
     }
 }

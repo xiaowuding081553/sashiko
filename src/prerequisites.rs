@@ -18,15 +18,15 @@ use crate::patch::{Patch, PatchsetMetadata, authors_match, parse_email};
 use crate::utils::redact_secret;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::StreamExt;
-use futures::future::BoxFuture;
+use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 const MAX_MBOX_MESSAGES: usize = 500;
 const MAX_PREREQUISITE_PATCH_IDS: usize = 128;
@@ -145,6 +145,13 @@ fn parse_prerequisite_metadata(body: &str) -> Result<Option<PrerequisiteMetadata
         return Ok(Some(PrerequisiteMetadata::MessageIds(message_ids)));
     }
     Ok(parse_based_on_message_id(body)?.map(PrerequisiteMetadata::BasedOn))
+}
+
+/// Returns true when `body` declares valid prerequisite metadata recognized by
+/// the prerequisite resolver (`prerequisite-patch-id`,
+/// `prerequisite-message-id`, or `Based-on`).
+pub(crate) fn has_prerequisite_metadata(body: &str) -> bool {
+    parse_prerequisite_metadata(body).is_ok_and(|meta| meta.is_some())
 }
 
 fn parse_prerequisite_series_ids(body: &str) -> Result<Vec<String>> {
@@ -294,7 +301,7 @@ async fn calculate_optional_git_patch_id(diff: Option<&str>) -> Result<Option<St
 /// At most eight subprocesses run at once across the process.
 pub async fn calculate_git_patch_id_batch(diffs: Vec<Option<&str>>) -> Vec<Result<Option<String>>> {
     let calculations = diffs.into_iter().map(calculate_optional_git_patch_id);
-    futures::stream::iter(calculations)
+    futures_util::stream::iter(calculations)
         .buffered(MAX_CONCURRENT_GIT_PATCH_IDS)
         .collect()
         .await
@@ -646,13 +653,13 @@ struct LorePrerequisiteRemote;
 #[async_trait]
 impl PrerequisiteRemote for LorePrerequisiteRemote {
     async fn fetch_series(&self, message_id: &str) -> Result<PrerequisiteSeries> {
-        info!("Fetching prerequisite series {} from lore", message_id);
+        debug!("Fetching prerequisite series {} from lore", message_id);
         let raw = LoreMboxClient::new()?.fetch_thread(message_id).await?;
         series_from_mbox(raw, message_id).await
     }
 
     async fn fetch_thread_patches(&self, message_id: &str) -> Result<Vec<PrerequisitePatch>> {
-        info!(
+        debug!(
             "Fetching prerequisite thread {} from lore",
             redact_secret(message_id)
         );
@@ -661,7 +668,7 @@ impl PrerequisiteRemote for LorePrerequisiteRemote {
     }
 
     async fn search_patch_id(&self, patch_id: &str) -> Result<Vec<PrerequisitePatch>> {
-        info!("Fetching prerequisite patch {} from lore", patch_id);
+        debug!("Fetching prerequisite patch {} from lore", patch_id);
         let raw = LoreMboxClient::new()?.search_patch_id(patch_id).await?;
         patches_from_mbox(raw).await
     }
@@ -720,7 +727,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             .get_stored_prerequisite_series(message_id, MAX_PREREQUISITE_PATCH_IDS)
             .await?
         {
-            info!(
+            debug!(
                 "Resolved prerequisite series {} from local patchset {}",
                 stored.message_id, stored.patchset_id
             );
@@ -754,7 +761,7 @@ impl<'a, R: PrerequisiteRemote + ?Sized> PrerequisiteResolver<'a, R> {
             if let Some((message_id, diff, subject, author, date)) =
                 self.db.get_patch_by_git_patch_id(patch_id).await?
             {
-                info!(
+                debug!(
                     "Resolved prerequisite patch {} from local message {}",
                     patch_id, message_id
                 );
@@ -1293,7 +1300,14 @@ mod tests {
         let db = Database::new(&settings).await?;
         db.conn
             .execute_batch(
-                "CREATE TABLE patches (
+                "CREATE TABLE patchsets (id INTEGER PRIMARY KEY, author TEXT, date INTEGER, status TEXT);
+                CREATE TABLE reviews (
+                    id INTEGER PRIMARY KEY,
+                    patchset_id INTEGER,
+                    patch_id INTEGER,
+                    status TEXT
+                );
+                CREATE TABLE patches (
                     id INTEGER PRIMARY KEY,
                     patchset_id INTEGER NOT NULL,
                     message_id TEXT NOT NULL UNIQUE,
@@ -1326,7 +1340,7 @@ mod tests {
 
         let mut version = db.conn.query("PRAGMA user_version", ()).await?;
         let version: u32 = version.next().await?.expect("user version row").get(0)?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 24);
         Ok(())
     }
 

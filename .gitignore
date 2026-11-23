@@ -6,10 +6,13 @@
 *.db.bak
 .cargo/config.toml
 target/
+dist/
 archives/
 third_party/linux/
 third_party/sashiko/
-benchmarks/smoke-repo/
+third_party/gcc/
+third_party/qemu/
+third_party/e2fsprogs/
 benchmarks/runs/
 review_trees/
 sashiko.log
@@ -20,6 +23,7 @@ email_policy.toml
 .gemini/
 .claude/
 benchmark_results*.json
+*.facts.json
 .sashiko-local-token
 .sashiko/
 

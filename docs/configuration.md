@@ -1,11 +1,25 @@
 # Configuration Reference
 
-Sashiko is configured through two files:
+Sashiko is configured through three files:
 
 - **Settings.toml** -- application settings (AI, server, git, review)
 - **projects/\<project\>/mailing_lists.toml** -- per-mailing-list tracking, embargo, email delivery, and Patchwork policy
+- **[projects/\<project\>/bugs_access.toml](#projectsprojectbugs_accesstoml)** -- optional bug and embargo access grants and `MAINTAINERS` access overrides
 
-Both can be bootstrapped from the examples in [docs/examples/](examples/).
+This page is the complete reference. The files in the repository are
+starting points, each with one job:
+
+- `Settings.toml` at the repository root is the daemon configuration
+  shipped in the container image.
+- [docs/examples/Settings.example.toml](examples/Settings.example.toml) is
+  the minimal local-review configuration that `sashiko init` writes.
+- The other `docs/examples/Settings.<provider>.toml` files are complete
+  local-review configurations for each LLM provider.
+- `docs/examples/Settings.forge-*.toml` are fragments to merge into a full
+  `Settings.toml`.
+- [docs/examples/mailing_lists.example.toml](examples/mailing_lists.example.toml)
+  illustrates the mailing list policy file.
+
 All settings can also be overridden via environment variables using the
 `SASHIKO` prefix with `__` (double underscore) as the separator (e.g.
 `SASHIKO__AI__PROVIDER=gemini`).
@@ -28,7 +42,7 @@ the [LLM Provider Configuration Guide](llm-providers.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`). `RUST_LOG` overrides it when set, `--debug` forces `"info"`, and `sashiko review` defaults to `"warn"` regardless of this value. |
+| `log_level` | string | `"info"` | Default log filter for the daemon (e.g. `"warn"`, `"info"`, `"debug"`, or a full `EnvFilter` directive such as `"info,hyper=debug"`). Bare levels (`"info"`, `"debug"`, `"trace"`) apply to `sashiko` while clamping noisy third-party crates to `"warn"`. `RUST_LOG` overrides everything when set, `--debug` forces `"warn,sashiko=debug"`, and `sashiko review` / `sashiko scan` default to `"warn"` unless `--debug` or `RUST_LOG` is passed. |
 
 ### `[project]`
 
@@ -36,23 +50,31 @@ Optional. Describes the project this configuration is for.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `kind` | string | -- | Project this file is for: `"linux"` or `"sashiko"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
+| `kind` | string | -- | Project this file is for: `"linux"`, `"sashiko"`, `"gcc"`, `"qemu"`, or `"zephyr"`. When set, it is checked against the project selected by `--project` / `SASHIKO_PROJECT`, and a mismatch is an error. When absent, the file is accepted for any project. |
 | `name` | string | `""` | Display name shown in the web UI. |
-| `description` | string | `""` | Short description shown in the web UI. |
+| `description` | string | `""` | Optional instance note shown in the web UI About dialog (in addition to the standard Sashiko overview). |
 | `domain` | string | `""` | Public hostname used to build links to the web UI in forge comments (`https://<domain>/#/patchset/...`). Falls back to `sashiko.sashiko.dev` when empty. |
 | `attribution` | string | -- | Actor name recorded on bug discoveries. Defaults to `domain`, or `"sashiko"` when neither is set. |
 
 ### `[forge]`
 
-Optional. Controls forge (GitHub/GitLab) webhook integration.
+Optional. Controls forge (GitHub/GitLab) webhook integration, GitHub App comment posting, and periodic GitHub Pulls REST API reconciliation.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable forge webhook endpoint. |
+| `enabled` | bool | `false` | Enable forge webhook endpoint, outbox worker, and periodic PR poller. |
 | `disable_nntp` | bool | `true` | Disable NNTP ingestion when forge is enabled. |
 | `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
 | `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, requests are authenticated via signature verification, which is the only way a forge can authenticate. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
-| `api_token` | string | -- | Forge API token (for future API-based features). |
+| `api_token` | string | -- | Forge API token. Posts reviews to GitHub and authenticates pull request polling when no GitHub App is configured, and authenticates HTTPS fetches of branches from gitlab.com. Prefer `SASHIKO__FORGE__API_TOKEN` over writing it to disk. |
+| `post_mode` | string | `"off"` | Whether reviews are posted back to the pull request: `"off"` (not posted), `"dry_run"` (recorded in the outbox as Dry-Run, never sent), or `"live"` (posted, after any embargo). Posting is implemented for GitHub only. |
+| `app_id` | integer | -- | GitHub App ID. Together with `installation_id` and a private key, posting and pull request polling authenticate as the App instead of with `api_token`. |
+| `installation_id` | integer | -- | GitHub App installation ID. |
+| `app_private_key` | string | -- | GitHub App private key (PEM). Takes precedence over `app_private_key_path`. |
+| `app_private_key_path` | string | -- | Path to the GitHub App private key (PEM). |
+| `repos` | string or list | `[]` | GitHub `"owner/repo"` repositories to reconcile periodically via the Pulls REST API (accepts a TOML array or a comma-separated string via `SASHIKO__FORGE__REPOS`). When empty and `forge.enabled = true`, auto-detects the GitHub repository from the `origin` remote of `git.repository_path`. |
+| `poll_interval_secs` | integer | `120` | Interval in seconds between periodic GitHub Pulls REST API reconciliation passes (`0` disables polling while keeping webhook ingestion active). |
+| `bot_login` | string | unset | Forge login Sashiko posts reviews as. Fetched PR comments that start with the Sashiko review header are ignored as Sashiko's own output only when posted by this login; when unset, only when posted by a GitHub App account (login ending in `[bot]`). |
 
 > **Security:** When `Settings.toml` contains secrets, restrict file
 > permissions: `chmod 600 Settings.toml`.
@@ -61,8 +83,8 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `url` | string | `"sashiko.db"` | Path to the SQLite database file. |
-| `token` | string | `""` | Database token (unused for SQLite). |
+| `url` | string | `""` | Path to the local SQLite database file (or `":memory:"` for in-memory testing). Required by the daemon, which refuses to start without it; the shipped `Settings.toml` uses `"sashiko.db"`. The daemon writes its local operator token (`.sashiko-local-token`) beside a local database file. |
+| `token` | string | `""` | Deprecated setting retained for configuration compatibility; ignored because remote database URLs are not supported. |
 
 ### `[mailing_lists]`
 
@@ -74,9 +96,10 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `server` | string | `"nntp.lore.kernel.org"` | NNTP server hostname. |
+| `server` | string | `""` | NNTP server hostname. Empty disables NNTP ingestion; the shipped `Settings.toml` uses `"nntp.lore.kernel.org"`. |
 | `port` | integer | `119` | NNTP server port. |
 | `tls` | bool | `false` | Wrap the session in TLS (implicit NNTPS). |
+| `concurrency` | integer | `4` | Maximum number of concurrent NNTP worker connections polling tracked mailing lists in parallel (must be at least `1`). |
 
 Setting `tls` does not change `port`; set it to `563` as well when
 enabling NNTPS. The certificate is verified against the host trust
@@ -122,15 +145,17 @@ Core AI settings that apply to all providers.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `bedrock`, `vertex`, `kiro-cli`, `goose`, `openai`, `openai-compatible`. |
+| `provider` | string | -- | LLM provider: `gemini`, `claude`, `claude-cli`, `codex-cli`, `copilot-cli`, `devin-cli`, `kiro-cli`, `goose` (alias `goose-cli`), `openai`, `openai-compatible`, `ollama`, `vllm`, `bedrock`, `vertex`. `bedrock` and `vertex` need a build with `--features bedrock` / `--features vertex`; without it their `[ai.bedrock]` / `[ai.vertex]` table is rejected as an unknown field. |
 | `model` | string | -- | Model identifier (provider-specific). |
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
-| `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. |
+| `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. A local review records its responses whatever this is set to, and replays them only with this set or under `sashiko review --resume`. |
 | `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
+| `max_rps` | float | -- | Maximum outgoing AI review requests per second across the review pipeline (e.g. `1.0`, or `0.2` for one request every 5 seconds). Unset or `0` disables RPS pacing. |
+| `max_tpm` | integer | -- | Maximum tokens per minute (trailing 60-second sliding-window limit on completed uncached input + completion tokens) across the review pipeline. Unset or `0` disables client-side TPM throttling. |
 
 #### `[ai.claude]`
 
@@ -140,7 +165,8 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 |-----|------|---------|-------------|
 | `prompt_caching` | bool | `true` | Enable Anthropic prompt caching (5-minute TTL). |
 | `max_tokens` | integer | `32768` | Max output tokens per response, thinking included. |
-| `base_url` | string | -- | Override the API base URL (optional, for proxies like Portkey). |
+| `base_url` | string | -- | Full Messages endpoint URL, e.g. `https://proxy.example.com/v1/messages`, for proxies like Portkey. Defaults to `$ANTHROPIC_BASE_URL/v1/messages`, or the Anthropic API. |
+| `client_cert` | path | -- | PEM file holding a certificate and its private key, presented as the TLS client identity to endpoints that authenticate callers with mutual TLS. |
 | `thinking` | string | -- | Thinking mode, sent as `thinking.type`: `"adaptive"` (Opus 4.6, Sonnet 4.6, and later), or `"disabled"` where the model allows it. |
 | `effort` | string | -- | Effort level, sent as `output_config.effort`: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Which levels a model accepts, and its default, vary by model. |
 
@@ -166,9 +192,11 @@ Settings for the Gemini provider (`provider = "gemini"`).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `explicit_prompt_caching` | bool | `false` | Use explicit caching hints in requests. |
-| `max_tokens` | integer | model-derived | Max output tokens per response, thinking included (`generationConfig.maxOutputTokens`). Defaults to `131072` on models with Long Decodes v2 (`CONTINUATION` support, such as Argon) and is omitted otherwise (or when set to `0`) so the backend uses the model default. |
-| `thinking_level` | string | -- | Default thinking level sent as `thinkingConfig.thinkingLevel` (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a per-request reasoning effort. |
+| `max_tokens` | integer | model-derived | Max output tokens per response, thinking included (`generationConfig.maxOutputTokens`). Defaults to `131072` on Gemini 4+ models with Long Decodes v2 (`CONTINUATION` support) and is omitted on pre-Gemini-4 models (or when set to `0`) so the backend uses the model default. |
+| `thinking_level` | string | -- | Default thinking level sent as `thinkingConfig.thinkingLevel` (`"LOW"`, `"MEDIUM"`, `"HIGH"`) when a stage does not specify a per-request reasoning effort. On Gemini 4+ models every stage specifies one (see `[review] effort`), so only `"LOW"` has an effect there: it selects `effort = "low"` when `[review] effort` is unset. |
+| `base_url` | string | `https://generativelanguage.googleapis.com` | API base URL. `GOOGLE_GEMINI_BASE_URL` or `GEMINI_BASE_URL` take precedence when set. |
+| `proxy_command` | string | -- | Shell command that starts a local HTTP proxy on demand; `{port_file}` is replaced with a file the command writes its port to. `GEMINI_PROXY_COMMAND` takes precedence. |
+| `auth_token_command` | string | -- | Shell command whose output is sent as a Bearer token. `GEMINI_AUTH_TOKEN` (a literal token) and `GEMINI_AUTH_TOKEN_COMMAND` take precedence. |
 
 #### `[ai.openai_compat]`
 
@@ -179,7 +207,83 @@ Settings for the OpenAI providers (`provider = "openai"` or `provider = "openai-
 | `base_url` | string | model-derived | API endpoint URL. Derived from the model name, `https://api.openai.com/v1/chat/completions` for anything unrecognized. |
 | `context_window_size` | integer | model-derived | Context window size. `128000` for most models. |
 | `max_tokens` | integer | `4096` | Max output tokens per response. With `provider = "openai"` it is sent as `max_completion_tokens`, which bounds reasoning tokens as well as the reply. |
-| `effort` | string | -- | Reasoning effort, sent as the `reasoning_effort` request field and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
+| `effort` | string | -- | Reasoning effort, sent as `reasoning_effort` on `/v1/chat/completions` and as `reasoning.effort` on `/v1/responses`, and omitted entirely when unset. The valid set belongs to the model rather than to the API: `"none"` is legal, and is what a gpt-5.6 chat completion carrying function tools requires, while gpt-5.4-pro takes only `"medium"` and `"high"`. A level the model rejects comes back as a 400, which is fatal. Applies to both `provider = "openai"` and `provider = "openai-compatible"`; a compatible endpoint that does not implement the field may reject the request, so leave it unset there. |
+| `send_reasoning_content` | bool | `false` | Send the chain of thought a reasoning model returned (as `reasoning_content` or `reasoning`) back as `reasoning_content` on later assistant turns. Thinking models such as DeepSeek and Kimi reject a tool-call follow-up without it; an endpoint that does not know the field may reject the request. |
+| `send_empty_tool_call_content` | bool | `false` | Send `content: ""` in messages that carry only tool calls instead of omitting the field. Enable it for endpoints that reject such messages or whose chat templates render the missing field as `None`. |
+| `extra_headers` | table | empty | HTTP headers added to every request, as `"Header-Name" = "ENV_VAR"` pairs: each value is read from the named environment variable, never from the settings file, since these can be extra authorization headers. A header named here replaces the one Sashiko would send, `Authorization` included. An unset or empty variable, an invalid name or value, or the same header named twice in different case fails at startup. Header names, never values, join the response cache identity, so a header must not change the reply. |
+| `session_affinity_header` | string | -- | HTTP header that carries a conversation ID, `sashiko-conversation-<uuid>`, on every request. Each review stage conversation gets its own random ID, and all of its turns and retries share it. Set it to the header your provider documents for routing one conversation's requests to the same replica, which keeps that replica's prompt cache warm. Unset sends no header. The ID never enters the prompt or the response cache key. An invalid header name, or one also set in `extra_headers`, fails at startup. Chat endpoint only. |
+| `extra_body` | table | empty | Top-level JSON fields added to every request body. Fields Sashiko sets itself (`model`, `messages`, `tools`, `temperature`, `max_tokens`, `max_completion_tokens`, `response_format`, `reasoning_effort`, `service_tier`) are rejected at startup; set reasoning effort with `effort` instead. |
+| `api` | string | `"chat"` | Which OpenAI endpoint to speak: `"chat"` for `/v1/chat/completions`, or `"responses"` for `/v1/responses`. Only OpenAI's own API serves the latter, and it is the only endpoint that accepts function tools and a reasoning effort in the same request. |
+| `service_tier` | string | -- | Processing tier, one of `"auto"`, `"default"`, `"flex"`, `"priority"`, or `"scale"`, sent as `service_tier` on both endpoints and omitted when unset. `"flex"` runs at half the standard per-token price with higher latency and more 429s, which the usual retry absorbs; raise `api_timeout_secs` to at least `900` with it, since a flex response can take longer than the default timeout and a timed-out request is retried and billed again. `"priority"` pays more for lower latency. Only OpenAI's own API accepts the field, so it is an error with `provider = "openai-compatible"`. |
+
+#### `[ai.ollama]`
+
+Settings for the Ollama provider (`provider = "ollama"`).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `"http://localhost:11434"` | Server URL; `/api/chat` is appended unless present. |
+| `context_window_size` | integer | `128000` | Sent as `num_ctx`. Keep `max_input_tokens` below it, leaving room for `max_tokens`. |
+| `max_tokens` | integer | `4096` | Max output tokens, sent as `num_predict`. |
+| `think` | string | -- | Requested thinking level for reasoning models. Sashiko currently sends it inside `options`, where Ollama does not read it, so it has no effect. |
+
+#### `[ai.vllm]`
+
+Settings for the vLLM provider (`provider = "vllm"`). An API key, if the
+server needs one, comes from `VLLM_API_KEY` or `LLM_API_KEY`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_url` | string | `"http://localhost:8000"` | Server URL. |
+| `context_window_size` | integer | `32768` | Should match the server's `--max-model-len`. |
+| `max_tokens` | integer | -- | Completion token limit. Unset lets vLLM generate up to the remaining context. |
+| `enable_thinking` | bool | -- | Enable or disable thinking for reasoning models (e.g. Qwen3) via `chat_template_kwargs`. Unset keeps the model default. |
+| `guided_json` | bool | `false` | Enforce JSON responses with guided decoding. Only for backends that support it. |
+| `enable_tools` | bool | `false` | Forward tool definitions. Requires a server started with `--enable-auto-tool-choice` and `--tool-call-parser`, which otherwise rejects the request. |
+
+#### `[ai.devin_cli]`
+
+Settings for the Devin CLI provider (`provider = "devin-cli"`). An empty
+`[ai] model` uses the Devin default.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `agent_config` | string | -- | Declarative agent config (JSON or YAML) passed as `--agent-config`, e.g. one that disables all tools. |
+| `config` | string | -- | Devin config file passed as `--config`, e.g. with deny-all permission rules. |
+
+#### `[ai.bedrock]`
+
+Settings for AWS Bedrock (`provider = "bedrock"`). Only exists in a build
+with `--features bedrock`. OpenAI foundation model IDs (`openai.*`) use the
+OpenAI Responses API on bedrock-mantle, see
+[LLM providers](llm-providers.md#openai-models-bedrock-mantle); all other
+models use the Converse API.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `region` | string | AWS SDK default chain | AWS region, e.g. `"us-east-1"`. |
+| `prompt_caching` | bool | `true` | Anthropic prompt caching on the Converse API; set `false` for non-Anthropic models there. On bedrock-mantle it sends `prompt_cache_options` with breakpoints on the system prompt and last user message. |
+| `max_tokens` | integer | `8192` | Max output tokens per call. On bedrock-mantle this is `max_output_tokens`, which includes reasoning tokens, so raise it for high effort levels. |
+| `thinking` | string | -- | `"adaptive"` for Anthropic models; unset disables thinking. Ignored on bedrock-mantle. |
+| `effort` | string | -- | `"low"`, `"medium"`, `"high"`, `"xhigh"` (Opus 4.7 only), `"max"`. Sent as `output_config.effort`, or as `reasoning.effort` for model IDs containing `openai.`. |
+| `openai_api` | string | `"mantle"` | API for OpenAI foundation model IDs (`openai.*`): `"mantle"` sends them to the OpenAI Responses API on bedrock-mantle, `"converse"` keeps them on the Converse API. Inference profile IDs (`global.openai.*`) and ARNs always use Converse. |
+| `mantle_base_url` | string | `https://bedrock-mantle.<region>.api.aws/v1` | bedrock-mantle API root, ending in `/v1` or `/responses`. Needed for models served under `/openai/v1`. A region in the URL also selects the signing region. |
+| `prompt_cache_ttl` | string | -- | bedrock-mantle prompt cache TTL, sent as `prompt_cache_options.ttl` (e.g. `"30m"`). Unset uses the service default. |
+
+#### `[ai.vertex]`
+
+Settings for Google Cloud Vertex AI (`provider = "vertex"`). Only exists in
+a build with `--features vertex`. A `claude-` model uses Anthropic's API, a
+`gemini-` model Google's.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `project_id` | string | env | GCP project. Falls back to `ANTHROPIC_VERTEX_PROJECT_ID`, then `GOOGLE_CLOUD_PROJECT`; one of them is required. |
+| `region` | string | `"us-east5"` | GCP region, e.g. `"global"`. Falls back to `CLOUD_ML_REGION`, then `GOOGLE_CLOUD_LOCATION`. |
+| `prompt_caching` | bool | `true` | Claude only. |
+| `max_tokens` | integer | model-derived | Max output tokens. Claude: `8192`. Gemini: `[ai.gemini] max_tokens`, else the Gemini default above. |
+| `thinking` | string | -- | Claude: `"adaptive"`, or `"disabled"` where the model allows it. Gemini: fallback thinking level (`"LOW"`, `"MEDIUM"`, `"HIGH"`), defaulting to `[ai.gemini] thinking_level`. |
+| `effort` | string | -- | Claude: `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`. Gemini: thinking level, taking precedence over `thinking`. |
 
 #### `[ai.kiro_cli]`
 
@@ -211,7 +315,16 @@ Settings for the goose provider (`provider = "goose"`).
 | `read_only` | bool | `false` | When true, disables write API endpoints. Set automatically by `--no-api`. |
 | `public_base_url` | string | -- | The URL the service is reachable at from outside, with no trailing slash. Required whenever `[smtp]` is configured: sign-in links and bug links are mailed, and the bind address names no host a recipient can open. The server refuses to start without it. |
 | `jwt_secret` | string | -- | Signs sign-in links and session tokens. Without it, sign-in returns `501` and no identity can be established. Keep it stable: replacing it invalidates every session and every unopened link. Prefer `SASHIKO__SERVER__JWT_SECRET` over writing it to disk. |
+| `metrics_token` | string | -- | Optional bearer token required on `GET /metrics` (`Authorization: Bearer <token>`). Prefer `SASHIKO__SERVER__METRICS_TOKEN` over writing it to disk. When unset, `GET /metrics` is readable without authentication (and never includes restricted per-subsystem bug counts). Accepted exclusively on `/metrics`; never grants API or bug access. |
 | `log_sign_in_links` | bool | `false` | Writes sign-in links to the log. For a developer machine with no real users; a link in a log is a credential anyone reading the log can spend. |
+| `testing_mode` | bool | `false` | **Never enable on a reachable server.** Grants every caller operator capabilities and full bug access without signing in. For automated tests only. |
+
+Local tooling (`sashiko-cli`, the benchmark) authenticates with a token
+rather than an address. On every start the server writes a random one to
+`.sashiko-local-token` beside the database, readable only by its own user,
+and the tools present it automatically. Nothing is inferred from where a
+request comes from, since a reverse proxy in front of a loopback bind makes
+an internet request look local.
 
 ### `[server.acl]`
 
@@ -243,7 +356,7 @@ SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
+| `repository_path` | string | -- | Path to the git repository of the project under review, used for patch application and context. The daemon refuses to start unless it is a git repository; `sashiko repo sync` clones or refreshes it. |
 
 #### `[[git.custom_remotes]]`
 
@@ -254,7 +367,8 @@ Optional array of additional git remotes to track.
 | `name` | string | -- | Remote name. Required. |
 | `url` | string | -- | Remote URL. Required. |
 | `check_all_branches` | bool | -- | Try all branches as baselines. Required -- omitting it is a parse error, not a default of `false`. |
-| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` is also true, these are appended to the full branch list rather than replacing it. |
+| `only_branches` | list | -- | Additional specific branches to try (optional). Additive: when `check_all_branches` or `branch_patterns` is also configured, these are appended to candidate branches rather than replacing them. |
+| `branch_patterns` | list | -- | Optional wildcard glob patterns for selective refspec fetching and candidate matching (e.g. `["linux-*.y", "net-*"]`). Each pattern must contain exactly one `*` wildcard; exact branch names without wildcards (which cause `git fetch` to abort if absent on the remote) should be placed in `only_branches`. Refspecs with `?`, spaces, or multiple `*` wildcards are rejected. |
 
 Baselines are tried in order and the first one the series applies to wins.
 A tree taken from a MAINTAINERS `T:` entry without a branch resolves to the
@@ -280,6 +394,18 @@ check_all_branches = false
 only_branches = ["nfsd-next", "nfsd-testing"]
 ```
 
+To selectively fetch only matching branches from large remotes without downloading
+the entire remote tree, specify `branch_patterns`:
+
+```toml
+[[git.custom_remotes]]
+name = "net-next"
+url = "https://git.kernel.org/pub/scm/linux/kernel/git/netdev/net-next.git"
+check_all_branches = true
+branch_patterns = ["linux-*.y", "net-*"]
+only_branches = ["main"]
+```
+
 Match `name` and `url` to a remote already in the repository when one exists.
 `ensure_remote` rewrites the URL whenever the configured one differs, so an
 `https://` URL here against a `git://` remote flips it back and forth on every
@@ -289,21 +415,36 @@ pass.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `concurrency` | integer | -- | Number of concurrent reviews. |
+| `concurrency` | integer | -- | Number of concurrent reviews. Required: a file without it fails to load. |
+| `auto_review` | bool | `true` | Queue completed patchsets for review automatically. When `false`, a fully ingested patchset waits in the `Awaiting Review` status until an operator starts the review with `sashiko-cli rerun <ID>` (or `POST /api/patchset/rerun`). |
 | `worktree_dir` | string | -- | Directory for git worktrees used during daemon reviews. The daemon empties it on startup, so it must hold nothing else. |
-| `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
+| `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). Idle wait time spent parked on shared rate limits (RPS/TPM pacing or 429 backoff) while no requests of this review are in flight is credited back to the deadline. |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |
-| `email_policy_path` | string | `"projects/linux/mailing_lists.toml"` | Path to the per-project mailing list and email delivery policy file (`projects/<project>/mailing_lists.toml`). |
+| `email_policy_path` | string | `projects/<project>/mailing_lists.toml` | Path to the mailing list and email delivery policy file. The default, and the legacy values `"email_policy.toml"` and `"/app/email_policy.toml"`, resolve to the file of the project selected by `--project`; any other path is used as given. |
 | `max_total_tokens` | integer | `10000000` | Maximum cumulative uncached tokens (input + output, including thinking tokens) per review. Cached tokens are excluded. Set to 0 to disable. |
+| `use_code_notes` | bool | `true` | Load code notes (`notes/<set>/` in the project's prompt directory, built with `sashiko notes build`) into reviews. |
+| `code_notes_scope` | string | `"unit"` | `"unit"` inlines the whole note of every unit the patch touches; `"touched"` keeps only the rules that name an identifier the patch's diff touches. |
 | `max_total_output_tokens` | integer | `1000000` | Maximum cumulative output tokens (including thinking tokens) per review. Set to 0 to disable. |
-| `effort` | string | `"mid"` (Argon 4) | Reasoning effort mode for models that support configurable effort levels (currently Argon 4; ignored for other models). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
+| `skip_unchanged_clean` | bool | `false` | Skip the model run for a patch whose diff matches, modulo rebase noise (mail headers and footers, `index` lines, and the line ranges on `@@` hunk headers), a patch already reviewed to completion with no findings. The patch gets a `Skipped` review that names the review it inherits from. Reviews that had findings are never reused, and neither is a review that ran less of the pipeline than this one would: a `cheap` or `--stages` review is reused only by a review narrowed the same way. A review whose patch mail drew a reply from anyone but Sashiko is not reused either. An inherited verdict posts a Patchwork check and sends no mail. |
+| `skip_unchanged_clean_max_age_days` | integer | `90` | Only a clean review completed within this many days is reused. |
+| `skip_unchanged_clean_any_model` | bool | `false` | Reuse a clean review produced by a different model or prompt set. Off by default so a model or prompt change re-reviews everything. Does not extend to a `cheap` or `--stages` review. |
+| `skip_unchanged_clean_require_same_baseline` | bool | `false` | Reuse a clean review only when it ran against the same tree: the same baseline commit, with the patches ahead of it in the series unchanged as well. Off by default because a reposted series nearly always lands on a newer tip. |
+| `effort` | string | `"mid"` (Gemini 4+) | Reasoning effort mode for Gemini models (defaults to `"mid"` on Gemini 4+ when unset, always honored on Gemini when explicitly set, and ignored on non-Gemini providers). Options: `"low"` (uniform `Low` effort across all stages), `"mid"` (alias `"medium"`; uniform `Medium` effort across all stages, default), `"high"` (`High` effort across screening, planning, analysis, and verification stages; `Medium` for report formatting), or `"dynamic"` (`Low` for screening/planning/summary, planned `Medium` or `High` per analysis stage, `High` for verification stages, `Medium` for report formatting). Can also be set via `--effort`. |
+| `cheap` | bool | `false` | Combine all exploratory analysis stages into a single `"analysis"` pass (skipping `planning`) while keeping consolidation and ground-truth verification intact. Reduces prompt-prefix token usage at some cost in deep specialist recall. Can also be enabled per run via `--cheap`. |
+| `design` | bool | `false` | Experimental (`sashiko review` only; ignored by the daemon). Run the four-stage series design assessment alongside bug review and append a separate Design Assessment section / `design_assessment` JSON field. Can also be enabled per run via `--design`. |
+| `default_priority` | integer | `500` | Default queue dispatch priority for patchsets without matching priority rules. |
+| `batch_window_secs` | integer | `30` | Sliding window duration in seconds for author batch submission deprioritization. Set to 0 to disable sliding-window deprioritization. |
+| `batch_tiers` | list | `[]` | Sliding-window batch thresholds (`[[review.batch_tiers]]`) that demote queue priority for bulk submissions. Fields: `min_size` (integer), `priority` (integer). |
+| `priority_rules` | list | `[]` | Regex rules matching subject prefixes (`[[review.priority_rules]]`) to assign elevated queue priority tiers. Fields: `regex` (string), `priority` (integer). |
 
 ### `[linux_bug]`
 
-Controls pre-existing Linux kernel bug tracking and background analysis.
+Controls pre-existing bug tracking and background analysis for the configured project (`linux`, `gcc`, `sashiko`, `qemu`, or `zephyr`).
+The section is also accepted as `[bugs]` (preferred for non-Linux configurations), and `fix_check_enabled` as
+`verify_fixes`.
 By default (`enabled = false`), pre-existing issues discovered during patch
 reviews are ignored and the background bug worker is not started.
 
@@ -311,11 +452,14 @@ reviews are ignored and the background bug worker is not started.
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable pre-existing bug tracking, the `/api/bug/analyze` endpoint, and the background `BugWorker`. |
 | `concurrency` | integer | `4` | Maximum number of concurrent bug analyses run by the background `BugWorker`. |
-| `fix_check_enabled` | bool | `false` | Enable periodic verification of whether open bugs have been fixed in the upstream mainline branch (`master` for Linux, `main` for Sashiko). |
+| `fix_check_enabled` | bool | `false` | Enable periodic verification of whether open bugs have been fixed in the project's upstream mainline branch (`master` for Linux, GCC, and QEMU; `main` for Sashiko and Zephyr). |
 | `lease_ttl_seconds` | integer | `300` | How long a worker's claim on a bug stays valid without renewal. If the worker dies, the bug becomes claimable again once this elapses. |
 | `max_attempts` | integer | `3` | How many analysis attempts a bug gets before it is abandoned. Abandoned bugs are never retried automatically. |
 | `fix_check_interval_seconds` | integer | `21600` | Interval in seconds between periodic upstream fix checks against the mainline tree. Set to `0` to disable periodic checks. |
 | `fix_check_batch_size` | integer | `50` | Maximum number of open bugs evaluated per upstream fix check cycle. |
+| `security_eval_enabled` | bool | `true` | Automatically evaluate canonical verified bugs for security importance (CVSS v4.0 + project threat model) upon discovery and during periodic background backfill sweeps when `BugWorker` is active. |
+| `security_eval_interval_seconds` | integer | `60` | Interval in seconds between periodic background security evaluation sweeps over unevaluated or manually queued canonical bugs. Set to `0` to disable periodic sweeps. |
+| `security_eval_batch_size` | integer | `25` | Maximum number of canonical bugs evaluated per periodic security evaluation sweep. |
 
 ### `[subsystems]`
 
@@ -349,37 +493,47 @@ mapping = [
 
 ## `projects/<project>/mailing_lists.toml`
 
-Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashiko routes or suppresses review emails, and Patchwork check delivery. See [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml) and [docs/examples/email_policy.toml](examples/email_policy.toml).
+Controls which mailing lists Sashiko tracks via NNTP, embargo delays, how Sashiko routes or suppresses review emails, and Patchwork check delivery. See [projects/linux/mailing_lists.toml](../projects/linux/mailing_lists.toml), [docs/examples/mailing_lists.example.toml](examples/mailing_lists.example.toml), and the [Guide for Kernel Maintainers](../projects/linux/MAINTAINERS_GUIDE.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `defaults.track` | bool | `true` | Whether listed mailing lists are tracked via NNTP by default. |
 | `defaults.embargo_hours` | integer | `0` | Hours to wait before publishing a review with findings. Clean reviews are released immediately after the complete patchset review succeeds. |
 | `defaults.reply_to` | list | `[]` | Recipient targets when findings are present: `"author"`, `"list"`, `"recipients"`. |
-| `defaults.positive_review` | string | `"none"` | Who receives a review email when 0 issues are found: `"none"`, `"author"`, or `"all"`. |
+| `defaults.positive_review` | string | `"none"` | Who receives a review email when patches review clean: `"none"`, `"author"`, or `"all"`. Single-patch submissions receive a reply on the patch; multi-patch series receive a single consolidated summary email replying to the cover letter (or patch 1) whenever at least one patch is clean, while patches with findings still receive individual inline replies. |
+| `defaults.failed_review` | string | `"none"` | Opt-in notification when a patchset fails to apply or fails review after exhausting all retries: `"none"` (default), `"author"`, or `"all"`. |
 | `defaults.mute_all` | bool | `false` | Suppress all email sending for this scope. |
 | `defaults.cc` | list | `[]` | Static CC addresses always included on review emails. |
-| `defaults.ignored_emails` | list | `[]` | Author addresses to mute entirely. |
+| `defaults.ignored_emails` | list | `[]` | Author addresses whose patches are skipped at ingestion, so they are never reviewed or mailed. Matched as case-insensitive substrings of the author address. |
+| `defaults.patchwork` | table | disabled | Patchwork settings (same keys as `patchwork.*` below) for patches that match no list section. |
+| `defaults.report_preexisting_bugs` | bool or string | `true` (`"high"`) | Whether reviews of the first non-RFC posting of a series (an RFC never reports, and neither does a later round) mention a pre-existing bug that sits in the code the patch touches or repeats the defect it fixes. Accepts `true`, `false` (or `"none"`), or a severity floor (`"low"`, `"medium"`, `"high"`, `"critical"`, case-insensitive; `true` uses `"high"`). Only Linux reviews do this. At most one such bug is mentioned for small patches and two for larger ones, only after a check that it is not security-sensitive and is still present with the patch applied, and each bug is mentioned at most once across all reviews. Also accepted as `[defaults.related_preexisting]` (`enabled`, `min_severity`). See [designs/DESIGN_RELATED_PREEXISTING_BUGS.md](../designs/DESIGN_RELATED_PREEXISTING_BUGS.md). |
 
 Each mailing list is configured as a `["<list-email>"]` table (e.g. `["bpf@vger.kernel.org"]`). Omitted fields inherit from `[defaults]`. Each mailing list section accepts:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `track` | bool | `defaults.track` | Whether Sashiko ingests patches from this mailing list via NNTP. |
-| `nntp_group` | string | derived from email | Explicit Lore NNTP group override when the group name cannot be derived by reversing the email domain and appending the list's local part. |
-| `embargo_hours` | integer | `defaults.embargo_hours` | Hours to wait before publishing a review with findings. |
-| `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. |
+| `nntp_group` | string | derived from email | Explicit Lore NNTP group override when the group name cannot be derived by reversing the email domain and appending the list's local part. The groups of `devicetree@vger.kernel.org`, `b.a.t.m.a.n@lists.open-mesh.org` and `intel-wired-lan@lists.osuosl.org` are built in. |
+| `embargo_hours` | integer | `defaults.embargo_hours` | Hours to wait before publishing a review with findings. For a series sent to several lists, the lowest value set explicitly on a matched list wins, preferring lists whose `subject_prefixes` match the subject; `defaults.embargo_hours` applies only when no matched list sets one. Setting `0` on a list is therefore not redundant. |
+| `subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["net", "net-next"]`) used to disambiguate `embargo_hours` on cross-posted series. Only considered on a list that sets `embargo_hours` itself. |
 | `reply_to` | list | `defaults.reply_to` | Recipient targets for this list (`"author"`, `"list"`, `"recipients"`). |
 | `positive_review` | string | `defaults.positive_review` | Positive review delivery mode (`"none"`, `"author"`, `"all"`). |
+| `failed_review` | string | `defaults.failed_review` | Opt-in failure notification mode (`"none"`, `"author"`, `"all"`) for patchsets that fail to apply or fail review after retries. Cross-posted lists that do not opt in never receive failure emails. |
 | `mute_all` | bool | `defaults.mute_all` | Suppress all email sending for patches matching this list. |
 | `cc` | list | `[]` | Additional static CC addresses for this list (merged with `defaults.cc`). |
-| `ignored_emails` | list | `[]` | Additional author addresses to mute for this list. |
+| `ignored_emails` | list | `[]` | Additional ignored author addresses, with the same meaning as `defaults.ignored_emails`. They apply to patches on every list, not only this one. |
 | `patchwork.enabled` | bool | `false` | Enable Patchwork integration for this mailing list. |
 | `patchwork.api_url` | string | -- | Patchwork REST API URL (e.g. `https://patchwork.kernel.org/api/1.3`). Trailing slashes are stripped automatically. Invalid schemes are rejected with a warning. |
 | `patchwork.token` | string | -- | Patchwork API token. Can also be set via `SASHIKO_PATCHWORK_TOKEN` env var (fills in where token is omitted in TOML). |
 | `patchwork.email` | string | -- | Email address for email-based Patchwork notifications. |
 | `patchwork.min_severity` | string | -- | Minimum finding severity to include in patchwork checks. Findings below this threshold are excluded. Accepts: `Low`, `Medium`, `High`, `Critical` (case-insensitive). Default: all findings included. |
 | `patchwork.fail_severity` | string | `High` | Minimum severity of NEW findings that triggers the `fail` check state instead of `warning`. New findings at or above this threshold produce `fail`; below it produce `warning`. Pre-existing findings never affect the check state. |
+| `report_preexisting_bugs` | bool or string | `defaults.report_preexisting_bugs` | Turns related pre-existing bug mentions off (`false` or `"none"`), on (`true`), or sets the minimum severity floor (`"low"`, `"medium"`, `"high"`, `"critical"`) for patches sent to this list. For a patch sent to several lists, any matched list that sets `false` (or `"none"`) turns them off; otherwise the strictest matched floor wins. Also accepted as `related_preexisting.enabled` and `related_preexisting.min_severity`. |
+| `ingest_filter.allowed_subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["e2fsprogs"]`, case-insensitive) that explicitly mark an NNTP patch or cover letter on a shared mailing list as belonging to this project unless `ignored_paths` matches. |
+| `ingest_filter.ignored_subject_prefixes` | list | `[]` | Subject prefix tags (e.g. `["fstests", "xfstests"]`, case-insensitive) whose NNTP patches and cover letters are skipped at ingestion on this list. |
+| `ingest_filter.allowed_paths` | list | `[]` | Repository path patterns (directory prefixes ending in `/`, narrow prefix globs ending in `*`, or exact file paths) used on shared NNTP lists. When non-empty and no `allowed_subject_prefixes` tag matched, only patches or cover-letter diffstats touching at least one matching path (and no `ignored_paths`) create patchsets. |
+| `ingest_filter.ignored_paths` | list | `[]` | Repository path patterns whose NNTP patches or cover-letter diffstats are skipped at ingestion on this list. |
+| `baselines` | list of tables | `[]` | Ordered list of per-subsystem baseline tree rules (`[["<list>".baselines]]`) tried ahead of the `MAINTAINERS` heuristic, `[[git.custom_remotes]]`, `linux-next`, and mainline (after explicit `base-commit:` and version/stable tags). Each entry accepts `url` (required git URL), `branches` (optional ordered branch list; defaults to remote `HEAD`), `subject_prefixes` (optional case-insensitive bracketed tags such as `["bpf-next"]`), and `paths` (optional repository path patterns; rules with non-empty `paths` apply only when at least one touched file matches). Matched rules run by specificity (prefix+path > prefix > path > unconditional > sibling fallback), preserving declaration order on ties. |
 
 ### Author-only delivery
 
@@ -471,20 +625,89 @@ context: sashiko
 
 Downstream tools can parse this format with simple line splitting.
 
+## `projects/<project>/bugs_access.toml`
+
+Extends or overrides `MAINTAINERS` strictly for Sashiko access control (bugs,
+embargoed review results, review transcripts, and sign-in eligibility) across
+all projects. Mail routing, `T:` baseline trees, contributor authority, and the
+subsystem names displayed for a bug or patchset still follow `MAINTAINERS` (or
+directory prefixes on projects without `MAINTAINERS`). A missing file means no
+grants; on Linux, a legacy `projects/linux/upstream_maintainers.toml` is still
+loaded with a deprecation warning when `projects/linux/bugs_access.toml` is
+absent.
+
+```toml
+# 1. Upstream pull-request receivers: widen paths for an existing MAINTAINERS
+#    section's M:/R: maintainers.
+[[grant]]
+section = "ARM AND ARM64 SoC SUB-ARCHITECTURES (COMMON PARTS)"
+paths = ["arch/*/boot/dts/", "drivers/soc/", "drivers/firmware/"]
+
+# 2. Subsystem developer group: grant separate read-only (`read`) and
+#    read-write (`read_write` / `"read-write"`) access on an existing section.
+[[grant]]
+section = "BTRFS FILE SYSTEM"
+read = ["dev1@example.org", "Developer Two <dev2@example.org>"]
+read_write = ["co-maintainer@example.org"]
+
+# 3. Custom or standalone path grant (works on Linux and non-Linux projects):
+[[grant]]
+section = "BTRFS ZONED" # optional when `paths` + (`read` or `read_write`) are set
+paths = ["fs/btrfs/zoned.*"]
+exclude_paths = ["fs/btrfs/tests/"]
+read = ["zoned-reader@example.org"]
+read_write = ["zoned-lead@example.org"]
+
+# 4. Override an existing MAINTAINERS section's emails or paths:
+[[grant]]
+section = "LEGACY SUBSYSTEM"
+replace_emails = true
+read_write = ["active-maintainer@example.org"]
+exclude_paths = ["drivers/legacy/unmaintained/"]
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `section` | string | optional | Existing `MAINTAINERS` section title (matched case- and whitespace-insensitively) or a custom section title. Optional when `paths` and at least one of `read` / `read_write` are non-empty. |
+| `paths` | list | `[]` | `MAINTAINERS` `F:`-style file patterns to include. A trailing slash covers the whole subtree. Whole-tree patterns (`*`, `*/`, `**`) are rejected. |
+| `exclude_paths` | list | `[]` | `MAINTAINERS` `X:`-style file patterns to exclude (takes precedence over `paths` and inherited `F:`/`N:` patterns). |
+| `replace_paths` | bool | `false` | Discard inherited `MAINTAINERS` `F:`/`X:`/`N:` patterns for `section` and match only `paths` minus `exclude_paths`. Requires non-empty `paths`. |
+| `read` | list | `[]` | Bare addresses (`user@domain`) or `Name <user@domain>` entries granted read-only access: may sign in, list and read bugs in the **Bugs** tab (including reproducers), and view embargoed reviews and transcripts, without commenting or changing state. |
+| `read_write` | list | `[]` | Addresses granted full maintainer read-write access (also accepted as `"read-write"`): may comment, attach fixes/reproducers, close, dismiss, assign, deduplicate, re-evaluate security, and release embargoes. |
+| `exclude_emails` | list | `[]` | Addresses removed from `section` before `read` and `read_write` apply. |
+| `replace_emails` | bool | `false` | Discard inherited `MAINTAINERS` `M:`/`R:` addresses for `section` before applying `read` and `read_write`. |
+| `access` | string | `"read_write"` | Optional `"read"` or `"read_write"` (`"read-write"`) for path-only grants on an existing `MAINTAINERS` section when `read` and `read_write` are omitted. |
+
+The file is read at startup. Malformed entries, catch-all sections (`THE REST`),
+missing `MAINTAINERS` sections without both `paths` and `read`/`read_write`, and
+entries combining `paths` and `read`/`read_write` on an existing `MAINTAINERS`
+section without `replace_paths` or `replace_emails` are dropped with an error.
+Email-only edits (`read`, `read_write`, `exclude_emails`, `replace_emails`)
+take effect immediately in memory with no database walk; when path rules change,
+startup reconciles stored access rows across existing bugs and patchsets.
+
 ## Environment variables
 
 | Variable | Description |
 |----------|-------------|
 | `LLM_API_KEY` | API key for the configured LLM provider (universal fallback). |
 | `GEMINI_API_KEY` | API key for Gemini (takes precedence over `LLM_API_KEY`). |
-| `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `LLM_API_KEY`). |
+| `ANTHROPIC_API_KEY` | API key for Claude (takes precedence over `ANTHROPIC_AUTH_TOKEN` and `LLM_API_KEY`). |
+| `ANTHROPIC_CUSTOM_HEADERS` | Extra HTTP headers for the Claude API, one `Name: value` per line. |
 | `OPENAI_API_KEY` | API key for OpenAI-compatible providers (takes precedence over `LLM_API_KEY`). |
+| `VLLM_API_KEY` | API key for a vLLM server started with `--api-key` (takes precedence over `LLM_API_KEY`). |
+| `AWS_BEARER_TOKEN_BEDROCK` | Long-term Amazon Bedrock API key for OpenAI models on bedrock-mantle. Unset derives short-term keys from the AWS credential chain. |
 | `ANTHROPIC_BASE_URL` | Override the Claude API base URL (for proxies). |
-| `ANTHROPIC_VERTEX_PROJECT_ID` | GCP project ID for Vertex AI provider. |
-| `CLOUD_ML_REGION` | GCP region for Vertex AI provider. |
+| `GOOGLE_GEMINI_BASE_URL`, `GEMINI_BASE_URL` | Gemini API base URL; outranks `[ai.gemini] base_url`. |
+| `GEMINI_PROXY_COMMAND`, `GEMINI_AUTH_TOKEN_COMMAND`, `GEMINI_AUTH_TOKEN` | Outrank `[ai.gemini] proxy_command` / `auth_token_command`; `GEMINI_AUTH_TOKEN` is a literal Bearer token. |
+| `ANTHROPIC_VERTEX_PROJECT_ID`, `GOOGLE_CLOUD_PROJECT` | GCP project ID for the Vertex AI provider, in that order. |
+| `CLOUD_ML_REGION`, `GOOGLE_CLOUD_LOCATION` | GCP region for the Vertex AI provider, in that order. |
+| `SASHIKO_CONFIG` | Settings file to read when `--settings` is not given. |
+| `SASHIKO_PROJECT` | Project to review (`linux`, `sashiko`, `gcc`, `qemu` or `zephyr`), like `--project`. |
 | `SASHIKO_SERVER` | Override daemon URL for CLI commands. |
 | `SASHIKO__*` | Override any Settings.toml value (e.g. `SASHIKO__AI__PROVIDER`). |
 | `SASHIKO__FORGE__WEBHOOK_SECRET` | Override webhook secret from Settings.toml. Avoids storing the secret on disk. |
+| `SASHIKO__SERVER__JWT_SECRET` | Sign-in signing secret, kept out of the file for the same reason. |
 | `SASHIKO_PATCHWORK_TOKEN` | Patchwork API token. Fills in `patchwork.token` for enabled subsystems that have `api_url` set but no explicit token in TOML. |
 | `NO_COLOR` | Disable ANSI color output. |
 | `SASHIKO_LOG_PLAIN` | Use plain log format (no level/target/timestamp). |

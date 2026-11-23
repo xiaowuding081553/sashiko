@@ -1,0 +1,22 @@
+# Linux Review Prompts
+
+First-party prompts for Sashiko's Linux kernel patch review, used by the
+`linux` project profile. `build.rs` compiles this directory into the
+prompt bundle under the `kernel/` namespace.
+
+## Layout
+
+| Path | Loaded by |
+|---|---|
+| `severity.md` | The verification stages |
+| `false-positive-guide.md` | The verification stages |
+| `inline-template.md` | The inline report stage |
+| `callstack.md` | The execution-flow stage |
+| `locking.md` | The locking stage |
+| `performance.md` | The performance stage |
+| `maintainers/*.md` | Maintainer notes: the subjective preferences, policies and conventions of a subsystem's maintainers, selected per patch by their `paths` and `symbols` (see `src/notes/maintainer_notes.rs`) |
+| `notes/` | Code notes: the profile, the agenda, and notes sets built from the code by `sashiko notes build` |
+
+These prompts carry review procedures and judgment, not knowledge about the
+code: what the code does and must preserve comes from the code notes, which
+are generated from the source and verified against it.

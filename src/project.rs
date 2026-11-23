@@ -39,6 +39,10 @@ pub enum ProjectId {
     #[default]
     Linux,
     Sashiko,
+    Gcc,
+    Qemu,
+    Zephyr,
+    E2fsprogs,
 }
 
 impl ProjectId {
@@ -48,6 +52,10 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "linux",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Gcc => "gcc",
+            ProjectId::Qemu => "qemu",
+            ProjectId::Zephyr => "zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
         }
     }
 
@@ -56,6 +64,43 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "Linux",
             ProjectId::Sashiko => "Sashiko",
+            ProjectId::Gcc => "GCC",
+            ProjectId::Qemu => "QEMU",
+            ProjectId::Zephyr => "Zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
+        }
+    }
+
+    /// The upstream development branch, independent of a fork's URL.
+    pub fn mainline_branch(self) -> &'static str {
+        match self {
+            ProjectId::Linux | ProjectId::Gcc | ProjectId::Qemu | ProjectId::E2fsprogs => "master",
+            ProjectId::Sashiko | ProjectId::Zephyr => "main",
+        }
+    }
+
+    /// URL hints for selecting this project's upstream and known mirrors.
+    pub fn matches_upstream_url(self, url: &str) -> bool {
+        let url = url.to_ascii_lowercase();
+        match self {
+            ProjectId::Linux => url.contains("torvalds/linux"),
+            ProjectId::Sashiko => url.contains("sashiko-dev/sashiko"),
+            ProjectId::Gcc => {
+                url.contains("gcc.gnu.org/git/gcc")
+                    || url.contains("gnutools/gcc")
+                    || url.contains("gcc-mirror/gcc")
+            }
+            ProjectId::Qemu => {
+                url.contains("qemu-project/qemu")
+                    || url.contains("qemu.org")
+                    || url.contains("qemu/qemu")
+            }
+            ProjectId::Zephyr => url.contains("zephyrproject-rtos/zephyr"),
+            ProjectId::E2fsprogs => {
+                url.contains("fs/ext2/e2fsprogs")
+                    || url.contains("tytso/e2fsprogs")
+                    || url.contains("e2fsprogs.git.sourceforge.net")
+            }
         }
     }
 
@@ -65,11 +110,17 @@ impl ProjectId {
     /// This is not [`ProjectId::as_str`]. The kernel prompts are vendored from
     /// an upstream tree that calls the directory `kernel`, and renaming it
     /// would fork that tree for no reason. Keeping the two names apart is what
-    /// lets a project's selector and its prompt directory disagree.
+    /// lets a project's selector and its prompt directory disagree. First-party
+    /// prompts under `projects/<selector>/prompts/` are bundled into this
+    /// directory through [`crate::prompt_namespaces::PROJECT_PROMPT_NAMESPACES`].
     pub fn prompt_dir(self) -> &'static str {
         match self {
             ProjectId::Linux => "kernel",
             ProjectId::Sashiko => "sashiko",
+            ProjectId::Gcc => "gcc",
+            ProjectId::Qemu => "qemu",
+            ProjectId::Zephyr => "zephyr",
+            ProjectId::E2fsprogs => "e2fsprogs",
         }
     }
 
@@ -80,7 +131,30 @@ impl ProjectId {
     pub fn uses_maintainers(self) -> bool {
         match self {
             ProjectId::Linux => true,
-            ProjectId::Sashiko => false,
+            ProjectId::Sashiko
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => false,
+        }
+    }
+
+    /// Automated bots whose reports are trusted in prior-version feedback.
+    ///
+    /// Build and fuzzing bots report mechanically observed failures (compiler
+    /// errors, sanitizer splats with reproducers), so their claims are
+    /// almost always right. Only addresses listed here earn that trust;
+    /// every other bot-like identity stays low trust.
+    pub fn trusted_bots(self) -> crate::authority::TrustedBots {
+        match self {
+            ProjectId::Linux => {
+                crate::authority::TrustedBots(&["lkp@intel.com", "*@syzkaller.appspotmail.com"])
+            }
+            ProjectId::Sashiko
+            | ProjectId::Gcc
+            | ProjectId::Qemu
+            | ProjectId::Zephyr
+            | ProjectId::E2fsprogs => crate::authority::TrustedBots(&[]),
         }
     }
 
@@ -90,8 +164,86 @@ impl ProjectId {
         match self {
             ProjectId::Linux => "projects/linux/mailing_lists.toml",
             ProjectId::Sashiko => "projects/sashiko/mailing_lists.toml",
+            ProjectId::Gcc => "projects/gcc/mailing_lists.toml",
+            ProjectId::Qemu => "projects/qemu/mailing_lists.toml",
+            ProjectId::Zephyr => "projects/zephyr/mailing_lists.toml",
+            ProjectId::E2fsprogs => "projects/e2fsprogs/mailing_lists.toml",
         }
     }
+
+    /// The path to this project's bug and embargo access grants
+    /// ([`crate::bugs_access`]). A missing file means no grants.
+    pub fn bugs_access_path(self) -> &'static str {
+        match self {
+            ProjectId::Linux => "projects/linux/bugs_access.toml",
+            ProjectId::Sashiko => "projects/sashiko/bugs_access.toml",
+            ProjectId::Gcc => "projects/gcc/bugs_access.toml",
+            ProjectId::Qemu => "projects/qemu/bugs_access.toml",
+            ProjectId::Zephyr => "projects/zephyr/bugs_access.toml",
+            ProjectId::E2fsprogs => "projects/e2fsprogs/bugs_access.toml",
+        }
+    }
+
+    /// Where this project's code comes from: the tree `sashiko repo sync`
+    /// clones and the daemon reviews patches against.
+    pub fn upstream(self) -> Upstream {
+        match self {
+            ProjectId::Linux => Upstream {
+                url: "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+                // Several GB, served from a CDN: a clone that starts from it
+                // takes only the last few days of history from the git server.
+                seed: Seed::Bundle(
+                    "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/clone.bundle",
+                ),
+            },
+            ProjectId::Sashiko => Upstream {
+                url: "https://github.com/sashiko-dev/sashiko.git",
+                seed: Seed::None,
+            },
+            ProjectId::Gcc => Upstream {
+                url: "git://gcc.gnu.org/git/gcc.git",
+                seed: Seed::Mirror("https://github.com/gnutools/gcc.git"),
+            },
+            ProjectId::Qemu => Upstream {
+                url: "https://gitlab.com/qemu-project/qemu.git",
+                seed: Seed::None,
+            },
+            ProjectId::Zephyr => Upstream {
+                url: "https://github.com/zephyrproject-rtos/zephyr.git",
+                seed: Seed::None,
+            },
+            ProjectId::E2fsprogs => Upstream {
+                url: "https://git.kernel.org/pub/scm/fs/ext2/e2fsprogs.git",
+                seed: Seed::Mirror("https://github.com/tytso/e2fsprogs.git"),
+            },
+        }
+    }
+}
+
+/// The repository a project's tree is cloned from and kept up to date with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Upstream {
+    /// Where `origin` points and every fetch comes from.
+    pub url: &'static str,
+    /// A faster source for the initial clone.
+    pub seed: Seed,
+}
+
+/// A faster source for a project's initial clone than its upstream.
+///
+/// A seed only ever saves time: a clone whose seed fails is retried from the
+/// upstream alone, so a seed going stale or away degrades a first clone to a
+/// slow one rather than to a failed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seed {
+    /// The upstream alone.
+    None,
+    /// A git bundle downloaded before the clone talks to the upstream, which
+    /// then sends only what the bundle lacks.
+    Bundle(&'static str),
+    /// A mirror cloned first. `origin` is then pointed at the upstream and
+    /// fetched, so only the difference comes from it.
+    Mirror(&'static str),
 }
 
 impl fmt::Display for ProjectId {
@@ -107,6 +259,10 @@ impl FromStr for ProjectId {
         match s.trim().to_ascii_lowercase().as_str() {
             "linux" => Ok(ProjectId::Linux),
             "sashiko" => Ok(ProjectId::Sashiko),
+            "gcc" => Ok(ProjectId::Gcc),
+            "qemu" => Ok(ProjectId::Qemu),
+            "zephyr" => Ok(ProjectId::Zephyr),
+            "e2fsprogs" => Ok(ProjectId::E2fsprogs),
             _ => Err(UnknownProject(s.to_string())),
         }
     }
@@ -140,12 +296,36 @@ impl ProjectId {
     /// Every project, for error messages and for tests that must cover them
     /// all. Adding a variant without adding it here fails the exhaustiveness
     /// test below.
-    pub const ALL: &'static [ProjectId] = &[ProjectId::Linux, ProjectId::Sashiko];
+    pub const ALL: &'static [ProjectId] = &[
+        ProjectId::Linux,
+        ProjectId::Sashiko,
+        ProjectId::Gcc,
+        ProjectId::Qemu,
+        ProjectId::Zephyr,
+        ProjectId::E2fsprogs,
+    ];
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_prompt_namespaces_match_prompt_dirs() {
+        // build.rs bundles projects/<dir>/prompts/ under the namespace in
+        // this table; a project must read its prompts from the same place.
+        for project in ProjectId::ALL {
+            let namespace = crate::prompt_namespaces::PROJECT_PROMPT_NAMESPACES
+                .iter()
+                .find(|(dir, _)| *dir == project.as_str())
+                .map(|(_, namespace)| *namespace);
+            assert_eq!(
+                namespace,
+                Some(project.prompt_dir()),
+                "PROJECT_PROMPT_NAMESPACES disagrees with prompt_dir() for {project}"
+            );
+        }
+    }
 
     #[test]
     fn test_all_lists_every_project() {
@@ -154,10 +334,15 @@ mod tests {
         // checked against a match the compiler forces to stay exhaustive.
         for project in ProjectId::ALL {
             match project {
-                ProjectId::Linux | ProjectId::Sashiko => {}
+                ProjectId::Linux
+                | ProjectId::Sashiko
+                | ProjectId::Gcc
+                | ProjectId::Qemu
+                | ProjectId::Zephyr
+                | ProjectId::E2fsprogs => {}
             }
         }
-        assert_eq!(ProjectId::ALL.len(), 2);
+        assert_eq!(ProjectId::ALL.len(), 6);
     }
 
     #[test]
@@ -172,12 +357,40 @@ mod tests {
     fn test_display_name() {
         assert_eq!(ProjectId::Linux.display_name(), "Linux");
         assert_eq!(ProjectId::Sashiko.display_name(), "Sashiko");
+        assert_eq!(ProjectId::Gcc.display_name(), "GCC");
+        assert_eq!(ProjectId::Qemu.display_name(), "QEMU");
+        assert_eq!(ProjectId::Zephyr.display_name(), "Zephyr");
+        assert_eq!(ProjectId::E2fsprogs.display_name(), "e2fsprogs");
+    }
+
+    #[test]
+    fn test_upstreams_use_network_protocols_git_allows() {
+        // repo sync clones and fetches under GIT_PROTOCOL_RESTRICTIONS, and
+        // a seed is fetched over the network too; anything but these schemes
+        // would be refused there rather than here.
+        let allowed = |url: &str| url.starts_with("https://") || url.starts_with("git://");
+        for project in ProjectId::ALL {
+            let upstream = project.upstream();
+            assert!(allowed(upstream.url), "{project}: {}", upstream.url);
+            match upstream.seed {
+                Seed::None => {}
+                Seed::Bundle(url) | Seed::Mirror(url) => {
+                    assert!(allowed(url), "{project} seed: {url}");
+                    assert_ne!(
+                        url, upstream.url,
+                        "{project}: a seed must not be the upstream"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn test_parsing_is_forgiving_about_case_and_padding() {
         assert_eq!(ProjectId::from_str("Linux"), Ok(ProjectId::Linux));
         assert_eq!(ProjectId::from_str("  SASHIKO "), Ok(ProjectId::Sashiko));
+        assert_eq!(ProjectId::from_str("QEMU"), Ok(ProjectId::Qemu));
+        assert_eq!(ProjectId::from_str("Zephyr"), Ok(ProjectId::Zephyr));
     }
 
     #[test]
@@ -205,6 +418,8 @@ mod tests {
         // "simplification" to as_str() from silently pointing at nothing.
         assert_eq!(ProjectId::Linux.prompt_dir(), "kernel");
         assert_eq!(ProjectId::Sashiko.prompt_dir(), "sashiko");
+        assert_eq!(ProjectId::Qemu.prompt_dir(), "qemu");
+        assert_eq!(ProjectId::Zephyr.prompt_dir(), "zephyr");
     }
 
     #[test]

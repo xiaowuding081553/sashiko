@@ -27,17 +27,24 @@ order, `needless_borrow`, missing `#[derive]`, redundant clones, or anything
 else clippy emits on Rust source files.
 
 Note: `make lint` does NOT check commit messages. Commit message defects —
-such as missing or cryptic/nickname `Signed-off-by` trailers, missing
+such as missing or cryptic/nickname `Signed-off-by` trailers, forbidden
+`Assisted-by:` / LLM attribution or AI `Co-authored-by:` trailers, missing or
+malformed `Fixes: <12-char sha> ("<subject>")` trailers on commits that fix an
+identifiable bug introduced prior to `Baseline SHA`, missing
 explanation of *what* and *why* on non-trivial code changes, genuinely
 unwrapped prose lines exceeding ~85 characters, backticks quoting code/symbols
 in the commit message, or internal metadata tags (`TAG=`, `CONV=`) — are valid
 findings and must NOT be dismissed as linter issues. However, do NOT nitpick
 commit message lines that are 73-80 characters long or lines that exceed the
 margin for reasonable reasons (quoting code, compiler/log output, URLs, or file
-paths), and do NOT demand additional rationale for trivial or self-explanatory
+paths), do NOT demand additional rationale for trivial or self-explanatory
 commits (such as adding a mailing list to track, adding an email policy entry
 or subsystem git remote, simple configuration/deployment updates, or typo fixes)
-where a brief one-sentence description is already self-sufficient.
+where a brief one-sentence description is already self-sufficient, and do NOT
+demand a `Fixes:` trailer on new features, refactorings, documentation/prompt/config
+updates, or commits where `git_blame`/`git_log` does not identify a specific
+bug-introducing commit prior to `Baseline SHA` (and never ask for `Fixes:`
+pointing to another commit in the same unmerged series).
 
 - Bad: "Consider using `iter()` instead of `into_iter()` here."
 - Bad: "This `clone()` looks unnecessary."
@@ -121,9 +128,9 @@ specific call site. Say why you believe the error can occur.
 ### 7. Prompt and instruction text
 
 Prompt wording is a legitimate review target — an ambiguous field name or a
-missing escape hatch in an enum is a real defect, and `llm-stages.md` explains
-why. But do not report stylistic preferences about prompt prose, and do not
-report that a prompt "could be clearer" without naming the specific
+missing escape hatch in an enum is a real defect, and `maintainers/workflows.md`
+explains why. But do not report stylistic preferences about prompt prose, and do
+not report that a prompt "could be clearer" without naming the specific
 misinterpretation it permits and what the model would do instead.
 
 ### 8. Pre-existing issues
@@ -155,28 +162,35 @@ Sashiko exclusively targets Linux/Unix operating systems. Never report Windows
 or non-Unix portability issues (such as `tokio::signal::unix`, `rustix`,
 `/dev/ptmx`, `libc`, POSIX paths, or Unix signals) as findings.
 
-### 11. Unnecessary demands for validation or `benchmarks/` file diffs
+### 11. Unnecessary demands for validation or benchmark corpus file diffs
 
 Do not ask authors to add manual test procedures, validation logs, or benchmark
 numbers to commit messages for ordinary code, CLI, UI, or bug-fix commits, nor
 for changes to Sashiko's own self-review prompts (`projects/sashiko/prompts/`,
-`sashiko_patch_review.rs`), nor for post-triage maintenance tasks (such as
-periodic upstream fix checks on already-triaged open bugs) or filtering
-pre-existing issues out of patch review reports that are not exercised by the
-patch-review or initial bug-discovery benchmark suites (`benchmarks/`).
+`sashiko_patch_review.rs`), nor for subsystem maintainer notes
+(`projects/*/prompts/maintainers/*.md`) that record a subsystem's subjective
+coding preferences, conventions, or narrowly-scoped policies, nor for generated
+code-notes snapshots (`projects/*/prompts/notes/<set>/`), nor for post-triage
+maintenance tasks (such as periodic upstream fix checks on already-triaged open
+bugs) or filtering pre-existing issues out of patch review reports that are not
+exercised by the patch-review or initial bug-discovery benchmark suites
+(`projects/*/benchmarks/`).
 Furthermore, **never** report that a prompt or workflow commit failed to add or
-modify test cases in the `benchmarks/` directory: `benchmarks/*.json` are static
+modify test cases in `projects/*/benchmarks/`: `projects/*/benchmarks/*.json` are static
 ground-truth datasets of known positive kernel bugs (`BenchmarkEntry` in
 `src/benchmark.rs`) and do not support negative/false-positive test cases or
 per-commit test additions. For targeted false-positive refinements in
-`third_party/prompts/`, local re-review results on the affected Linux
+`projects/linux/prompts/`, local re-review results on the affected Linux
 patches/series reported in the commit message are sufficient validation. Only
 flag missing validation (as **High** severity) when a change that can
 meaningfully affect overall Linux AI patch-review or initial bug-discovery
-quality across the board (`third_party/prompts/`, `linux_patch_review.rs`,
-`linux_bug.rs`, generic workflow graph, model parameters, or shared
-verification/deduplication logic) provides neither benchmark results nor targeted
-patch re-review validation in its commit message.
+quality across the board (`projects/linux/prompts/*.md`, `general.md`,
+`linux_patch_review.rs`, `linux_bug.rs`, generic workflow graph, model
+parameters, or shared verification/deduplication logic) provides neither
+benchmark results nor targeted patch re-review validation in its commit message.
+(Note: over-broad suppression rules, volatile code facts hardcoded as policy, or
+overly generic `paths`/`symbols` triggers in `projects/*/prompts/maintainers/*.md`
+*are* valid defects and should be flagged directly per `maintainers/notes.md`.)
 
 ### 12. Patch series false positive removal and design documents
 

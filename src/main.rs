@@ -23,10 +23,12 @@ use sashiko::events::{Event, MessageSource, ParsedArticle};
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
     ProgressEvent, ReviewOptions, WorkerOptions, format_agent_review_output, print_worker_json,
-    result_has_error, result_has_high_or_critical_findings, run_git_review, run_worker_from_stdin,
+    result_failed_stages, result_has_high_or_critical_findings, result_is_incomplete,
+    run_git_review, run_worker_from_stdin,
 };
 use sashiko::project::ProjectId;
 use sashiko::prompt_bundle;
+use sashiko::related_preexisting::RelatedPreexistingMode;
 #[cfg(feature = "server")]
 use sashiko::reviewer::Reviewer;
 use sashiko::settings::{EffortMode, Overrides, Settings};
@@ -42,8 +44,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Semaphore, mpsc};
 #[cfg(feature = "server")]
 use tracing::error;
-use tracing::{info, warn};
-use tracing_subscriber::{EnvFilter, fmt};
+use tracing::{debug, info, warn};
 
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
 
@@ -70,8 +71,8 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Enable debug logging (overrides settings)
-    #[arg(long)]
+    /// Enable Sashiko debug logging (overrides settings)
+    #[arg(long, global = true)]
     debug: bool,
 
     /// Allow non-localhost POST requests (unsafe)
@@ -117,6 +118,18 @@ enum Commands {
         prompts: bool,
     },
 
+    /// Build and inspect code notes (deep, verified notes about the
+    /// project's source that reviews load)
+    Notes {
+        #[command(subcommand)]
+        command: sashiko::notes::cli::NotesCommand,
+
+        /// Prompt directory holding the project's notes profile (default:
+        /// the installed prompt bundle)
+        #[arg(long, global = true)]
+        prompts: Option<PathBuf>,
+    },
+
     /// Review a local commit or commit range without starting the daemon
     Review {
         /// Git commit or range, for example HEAD or HEAD~3..HEAD
@@ -136,9 +149,36 @@ enum Commands {
         #[arg(long)]
         no_ai: bool,
 
+        /// Continue an interrupted review: replay the answers it recorded
+        #[arg(long)]
+        resume: bool,
+
+        /// Combine exploratory analysis stages into a single stage to reduce cost and latency
+        #[arg(long)]
+        cheap: bool,
+
+        /// Run an experimental series-level design assessment alongside bug review
+        #[arg(long)]
+        design: bool,
+
         /// Verify and report pre-existing bugs in the touched code
         #[arg(long)]
         report_preexisting: bool,
+
+        /// Report only the few pre-existing bugs closely related to the
+        /// change, after checking they are not security-sensitive and survive it
+        #[arg(long, conflicts_with = "report_preexisting")]
+        report_related_preexisting: bool,
+
+        /// Lowest severity of a related pre-existing bug to report
+        /// (low, medium, high, critical)
+        #[arg(
+            long,
+            value_name = "SEVERITY",
+            default_value = "high",
+            requires = "report_related_preexisting"
+        )]
+        related_preexisting_min_severity: sashiko::db::SeverityFloor,
 
         /// Custom prompt to append to the review task
         #[arg(long)]
@@ -236,6 +276,10 @@ enum Commands {
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<String>>,
 
+        /// Combine exploratory analysis stages into a single stage
+        #[arg(long, hide = true)]
+        cheap: bool,
+
         /// Agent mode: skip plain-text report generation
         #[arg(long, hide = true)]
         agent: bool,
@@ -243,6 +287,16 @@ enum Commands {
         /// Include pre-existing bugs in verification and report generation
         #[arg(long, hide = true)]
         report_preexisting: bool,
+
+        /// Look for related pre-existing bugs at or above this severity
+        #[arg(long, hide = true, conflicts_with = "report_preexisting")]
+        related_preexisting_min_severity: Option<sashiko::db::SeverityFloor>,
+    },
+
+    /// Clone or refresh the tree the daemon reviews
+    Repo {
+        #[command(subcommand)]
+        command: RepoCommand,
     },
 
     /// Run a benchmark suite against an isolated per-run database
@@ -309,6 +363,152 @@ enum Commands {
         #[arg(long, default_value = "auto")]
         color: ColorMode,
     },
+
+    /// Actively scan Linux kernel source files or directories for serious defects
+    Scan {
+        /// Repository-relative file or directory paths to scan
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Git revision to scan (defaults to mainline or HEAD)
+        #[arg(long = "ref", alias = "rev")]
+        git_ref: Option<String>,
+
+        /// Path to the git repository (defaults to current git toplevel or Settings.toml)
+        #[arg(short, long)]
+        repo: Option<PathBuf>,
+
+        /// Path to settings file
+        #[arg(long)]
+        settings: Option<PathBuf>,
+
+        /// Maximum number of chunks to scan concurrently
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
+
+        /// Maximum number of source files to expand (safety cap)
+        #[arg(long, default_value_t = 200)]
+        max_files: usize,
+
+        /// Maximum number of source chunks to scan
+        #[arg(long)]
+        max_chunks: Option<usize>,
+
+        /// Exclude files matching substring/prefix pattern (may be repeated)
+        #[arg(long)]
+        exclude: Vec<String>,
+
+        /// Lowest severity of a verified bug to report (low, medium, high, critical)
+        #[arg(long, value_name = "SEVERITY", default_value = "medium")]
+        min_severity: sashiko::db::SeverityFloor,
+
+        /// Submit verified findings at or above --min-severity to the bug repository for deduplication
+        #[arg(long)]
+        submit_bugs: bool,
+
+        /// Custom prompt instructions appended to the scan workflow
+        #[arg(long)]
+        custom_prompt: Option<String>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// AI model override
+        #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
+        model: Option<String>,
+
+        /// Reasoning effort mode override (low, mid, high, or dynamic) for supported models
+        #[arg(long)]
+        effort: Option<EffortMode>,
+
+        /// Prompt directory
+        #[arg(long)]
+        prompts: Option<PathBuf>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+
+        /// When to use color
+        #[arg(long, default_value = "auto")]
+        color: ColorMode,
+
+        /// Run only these specialist analysis stages, by name
+        #[arg(long, hide = true, value_delimiter = ',')]
+        stages: Option<Vec<String>>,
+    },
+
+    /// Offline maintenance and security evaluation for the bugs database
+    Bugs {
+        #[command(subcommand)]
+        command: BugsMainCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum BugsMainCommand {
+    /// Evaluate canonical bugs for security importance and CVSS v4.0 scores
+    EvaluateSecurity {
+        /// Evaluate a single bug by public <project>-<uuid> identifier (or numeric ID)
+        #[arg(long)]
+        bug: Option<String>,
+
+        /// Maximum number of bugs to evaluate in batch mode
+        #[arg(long, default_value_t = 50, conflicts_with_all = ["bug", "all"])]
+        limit: usize,
+
+        /// Evaluate all eligible bugs in the database
+        #[arg(long, conflicts_with = "bug")]
+        all: bool,
+
+        /// Re-evaluate bugs that already have a security score
+        #[arg(long, conflicts_with = "bug")]
+        re_evaluate: bool,
+
+        /// Override concurrent security evaluation workers
+        #[arg(long)]
+        concurrency: Option<usize>,
+
+        /// Explicit database path override (defaults to [database] url in Settings.toml)
+        #[arg(long)]
+        db: Option<PathBuf>,
+
+        /// Override the target git repository path
+        #[arg(short = 'r', long)]
+        repo: Option<PathBuf>,
+
+        /// Path to settings file
+        #[arg(long)]
+        settings: Option<PathBuf>,
+
+        /// AI provider override
+        #[arg(long)]
+        ai_provider: Option<String>,
+
+        /// AI model override
+        #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
+        model: Option<String>,
+
+        /// Reasoning effort mode override (low, mid, high, or dynamic)
+        #[arg(long)]
+        effort: Option<EffortMode>,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: OutputFormat,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum RepoCommand {
+    /// Clone the project's tree if it is missing, otherwise fetch its upstream
+    Sync {
+        /// Directory of the tree (default: [git] repository_path, else
+        /// third_party/<project>)
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -337,6 +537,9 @@ fn cli_overrides(cli: &Cli) -> Overrides {
     match &cli.command {
         Some(Commands::Review {
             no_ai,
+            resume,
+            cheap,
+            design,
             ai_provider,
             model,
             effort,
@@ -344,6 +547,24 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             ..
         }) => Overrides {
             no_ai: *no_ai,
+            resume: *resume,
+            cheap: *cheap,
+            design: *design,
+            ai_provider: ai_provider.clone(),
+            ai_model: model.clone(),
+            effort: effort.or(cli.effort),
+            stages: stages.clone(),
+            ..Default::default()
+        },
+        Some(Commands::Scan {
+            repo,
+            ai_provider,
+            model,
+            effort,
+            stages,
+            ..
+        }) => Overrides {
+            repository_path: repo.as_deref().map(path_string),
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -354,6 +575,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             repo,
             worktree_dir,
             no_ai,
+            cheap,
             ai_provider,
             model,
             effort,
@@ -363,6 +585,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             repository_path: repo.as_deref().map(path_string),
             worktree_dir: worktree_dir.as_deref().map(path_string),
             no_ai: *no_ai,
+            cheap: *cheap,
             ai_provider: ai_provider.clone(),
             ai_model: model.clone(),
             effort: effort.or(cli.effort),
@@ -378,6 +601,22 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             effort: effort.or(cli.effort),
             ..Default::default()
         },
+        Some(Commands::Bugs {
+            command:
+                BugsMainCommand::EvaluateSecurity {
+                    repo,
+                    ai_provider,
+                    model,
+                    effort,
+                    ..
+                },
+        }) => Overrides {
+            repository_path: repo.as_deref().map(path_string),
+            ai_provider: ai_provider.clone(),
+            ai_model: model.clone(),
+            effort: effort.or(cli.effort),
+            ..Default::default()
+        },
         None => Overrides {
             no_ai: cli.no_ai,
             effort: cli.effort,
@@ -389,6 +628,10 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         // Reads no settings, so the top-level flags typed before it mean
         // nothing to it.
         Some(Commands::Init { .. }) => Overrides::default(),
+        // Planning reads no settings either.
+        Some(Commands::Notes { .. }) => Overrides::default(),
+        // Reads only the repository path, which no flag here shadows.
+        Some(Commands::Repo { .. }) => Overrides::default(),
     }
 }
 
@@ -402,8 +645,63 @@ fn exit_worker_with_error(error: String) -> ! {
     std::process::exit(1);
 }
 
+/// Formats a top-level CLI error chain using `Display` instead of `Debug`,
+/// avoiding quoted string literals and deduplicating nested causes.
+fn format_cli_error(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(cause) = current {
+        let msg = cause.to_string();
+        let trimmed = msg.trim();
+        if !trimmed.is_empty() && parts.last().is_none_or(|prev| !prev.contains(trimmed)) {
+            parts.push(trimmed.to_string());
+        }
+        current = cause.source();
+    }
+    parts.join(": ")
+}
+
+fn format_settings_load_error(settings_path: &Path, err: &config::ConfigError) -> String {
+    let err_str = err.to_string();
+    let base = format!(
+        "Failed to load settings from {}: {}",
+        settings_path.display(),
+        err_str
+    );
+    if settings_path == Settings::user_config_path() && err_str.contains("unknown field") {
+        format!(
+            "{base}\nHint: run 'sashiko init --force' to regenerate {} for this version of sashiko, or remove the unknown field.",
+            settings_path.display()
+        )
+    } else {
+        base
+    }
+}
+
+#[cfg(feature = "server")]
+fn format_daemon_startup_error(settings_path: &Path, reason: &str) -> String {
+    let base = format!(
+        "Refusing to start daemon (settings from {}): {reason}",
+        settings_path.display()
+    );
+    if reason.starts_with("[database] url must be set") {
+        format!(
+            "{base}\nHint: bare 'sashiko' starts the server daemon. To review commits in the current repository, run 'sashiko review' (or see 'sashiko --help')."
+        )
+    } else {
+        base
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(err) = try_main().await {
+        eprintln!("Error: {}", format_cli_error(err.as_ref()));
+        std::process::exit(1);
+    }
+}
+
+async fn try_main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let cli = Cli::parse();
 
@@ -413,60 +711,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // same file the command works from. A failure is not fatal yet, because most
     // commands only talk to a running server and need no settings file at all.
     let named_settings = match &cli.command {
-        Some(Commands::Review { settings, .. }) | Some(Commands::Benchmark { settings, .. }) => {
-            settings.clone()
-        }
+        Some(Commands::Review { settings, .. })
+        | Some(Commands::Benchmark { settings, .. })
+        | Some(Commands::Scan { settings, .. })
+        | Some(Commands::Bugs {
+            command: BugsMainCommand::EvaluateSecurity { settings, .. },
+        }) => settings.clone(),
         _ => None,
     };
     let settings_path = Settings::resolve_path(named_settings.as_deref());
     let mut settings_result = Settings::load(Some(&settings_path));
 
     // Determine log level
-    // 1. CLI --debug takes precedence (implies "info")
-    // 2. Review command defaults to "warn" (unless --debug)
-    // 3. Settings log_level
-    // 4. Worker command defaults to "info" (worker logs progress on stderr)
-    // 5. Fallback to "warn" (if settings failed)
-    let is_review = matches!(cli.command, Some(Commands::Review { .. }));
-    let is_worker = matches!(cli.command, Some(Commands::Worker { .. }));
-    let log_level = if cli.debug {
-        "info"
-    } else if is_review {
-        "warn"
-    } else if let Ok(s) = &settings_result {
-        &s.log_level
-    } else if is_worker {
-        "info"
-    } else {
-        "warn"
+    let log_kind = match &cli.command {
+        Some(
+            Commands::Review { .. }
+            | Commands::Notes { .. }
+            | Commands::Scan { .. }
+            | Commands::Bugs { .. },
+        ) => sashiko::logging::LogCommandKind::InteractiveCli,
+        Some(Commands::Repo { .. }) => sashiko::logging::LogCommandKind::RepoSync,
+        Some(Commands::Worker { .. }) => sashiko::logging::LogCommandKind::Worker,
+        _ => sashiko::logging::LogCommandKind::Daemon,
     };
-
-    // Initialize tracing with EnvFilter
-    // RUST_LOG env var still overrides everything if present
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    let configured_level = settings_result.as_ref().ok().map(|s| s.log_level.as_str());
+    let fallback_spec =
+        sashiko::logging::resolve_log_filter_spec(cli.debug, log_kind, configured_level);
+    let rust_log_env = std::env::var("RUST_LOG").ok();
+    let (env_filter, filter_warning) =
+        sashiko::logging::build_env_filter(rust_log_env.as_deref(), &fallback_spec);
 
     // Determine formatting features independently
     let plain_logs = std::env::var("SASHIKO_LOG_PLAIN").is_ok();
+    let level_only_logs = std::env::var("SASHIKO_LOG_LEVEL_ONLY").is_ok();
     let use_ansi = std::env::var("NO_COLOR").is_err() && std::io::stderr().is_terminal();
 
-    let builder = fmt()
-        .with_env_filter(env_filter)
-        .with_writer(sashiko::logging::IgnoreBrokenPipe(std::io::stderr))
-        .with_ansi(use_ansi);
+    sashiko::logging::init_subscriber(env_filter, plain_logs, level_only_logs, use_ansi);
 
-    if plain_logs {
-        builder
-            .with_level(false)
-            .with_target(false)
-            .without_time()
-            .init();
-    } else {
-        builder.init();
+    if let Some(warning) = filter_warning {
+        warn!("{warning}");
     }
 
     if cli.debug {
-        info!("Debug logging enabled");
+        debug!("Debug logging enabled");
     }
 
     // The command line's say over the file, merged once, here, where both are
@@ -474,7 +761,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // read. Nothing dispatched below sees two sources. Only the daemon reports
     // what changed, as it always has.
     let overridden = match settings_result.as_mut() {
-        Ok(settings) => settings.apply_overrides(cli_overrides(&cli)),
+        Ok(settings) => {
+            if !matches!(
+                cli.command,
+                Some(Commands::Init { .. } | Commands::Worker { .. })
+            ) {
+                for warning in settings.deprecated_setting_warnings() {
+                    tracing::warn!("{} (in {})", warning, settings_path.display());
+                }
+            }
+            settings.apply_overrides(cli_overrides(&cli))
+        }
         Err(_) => Vec::new(),
     };
 
@@ -497,6 +794,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 handle_init_command(path.clone(), *force, *print, *prompts)?;
                 return Ok(());
             }
+            Commands::Notes { command, prompts } => {
+                let repo = current_git_toplevel()?;
+                let prompts_dir = resolve_prompts_path(prompts.clone(), project)?;
+                sashiko::notes::cli::run(
+                    command,
+                    project,
+                    &repo,
+                    &prompts_dir,
+                    settings_result.as_ref().ok(),
+                )
+                .await?;
+                return Ok(());
+            }
             // What this arm passes down, and no more: --settings was read above,
             // before dispatch, and the flags that shadow the settings were
             // merged onto them there.
@@ -504,6 +814,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 input,
                 baseline,
                 report_preexisting,
+                report_related_preexisting,
+                related_preexisting_min_severity,
                 custom_prompt,
                 prompts,
                 format,
@@ -513,20 +825,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 // The settings themselves, not the path they came from: a review
                 // does not read them again.
-                let settings = anyhow::Context::with_context(settings_result, || {
-                    format!("Failed to load settings from {}", settings_path.display())
-                })?;
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
 
+                let related_preexisting = related_preexisting_mode(
+                    project,
+                    *report_related_preexisting,
+                    *related_preexisting_min_severity,
+                )?;
                 return handle_review_command(
                     project,
                     input.clone(),
                     baseline.clone(),
                     settings,
                     *report_preexisting,
+                    related_preexisting,
                     custom_prompt.clone(),
                     resolve_prompts_path(prompts.clone(), project)?,
                     *format,
                     *agent,
+                    *color,
+                )
+                .await;
+            }
+            Commands::Scan {
+                paths,
+                git_ref,
+                repo,
+                concurrency,
+                max_files,
+                max_chunks,
+                exclude,
+                min_severity,
+                submit_bugs,
+                custom_prompt,
+                prompts,
+                format,
+                color,
+                ..
+            } => {
+                if project != ProjectId::Linux {
+                    return Err(format!(
+                        "sashiko scan currently supports only --project linux (got --project {project})"
+                    )
+                    .into());
+                }
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
+
+                return handle_scan_command(
+                    project,
+                    paths.clone(),
+                    git_ref.clone(),
+                    repo.clone(),
+                    settings,
+                    *concurrency,
+                    *max_files,
+                    *max_chunks,
+                    exclude.clone(),
+                    *min_severity,
+                    *submit_bugs,
+                    custom_prompt.clone(),
+                    resolve_prompts_path(prompts.clone(), project)?,
+                    *format,
                     *color,
                 )
                 .await;
@@ -542,6 +903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 agent,
                 report_preexisting,
+                related_preexisting_min_severity,
                 ..
             } => {
                 std::panic::set_hook(Box::new(|info| {
@@ -550,10 +912,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let settings = match settings_result {
                     Ok(settings) => settings,
-                    Err(e) => exit_worker_with_error(format!(
-                        "Failed to load settings from {}: {e}",
-                        settings_path.display()
-                    )),
+                    Err(e) => {
+                        exit_worker_with_error(format_settings_load_error(&settings_path, &e))
+                    }
                 };
 
                 let result = run_worker_from_stdin(
@@ -569,18 +930,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current_tree: false,
                         agent: *agent,
                         report_preexisting: *report_preexisting,
+                        related_preexisting: RelatedPreexistingMode::from_min_severity(
+                            *related_preexisting_min_severity,
+                        ),
                     },
                     &settings,
                 )
                 .await;
 
                 match result {
-                    Ok(val) => {
+                    Ok(mut val) => {
+                        let fv = sashiko::metrics::get_ai_errors(
+                            sashiko::metrics::AiErrorKind::FormatViolation,
+                        );
+                        if fv > 0
+                            && let Some(obj) = val.as_object_mut()
+                        {
+                            obj.insert("format_violations".to_string(), serde_json::json!(fv));
+                        }
                         print_worker_json(&val).map_err(Box::<dyn std::error::Error>::from)?;
                         return Ok(());
                     }
                     Err(e) => exit_worker_with_error(e.to_string()),
                 }
+            }
+            Commands::Repo {
+                command: RepoCommand::Sync { path },
+            } => {
+                // A missing or unreadable settings file only means there is
+                // no configured path to prefer over the project's default.
+                let configured = settings_result
+                    .as_ref()
+                    .ok()
+                    .map(|settings| settings.git.repository_path.as_str());
+                let path = sashiko::repo_sync::resolve_path(path.as_deref(), configured, project);
+                let outcome = sashiko::repo_sync::sync(&path, project.upstream()).await?;
+                println!("{project} tree at {}: {outcome}", path.display());
+                return Ok(());
             }
             Commands::Benchmark {
                 file,
@@ -596,9 +982,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 color,
                 ..
             } => {
-                let settings = anyhow::Context::with_context(settings_result, || {
-                    format!("Failed to load settings from {}", settings_path.display())
-                })?;
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
                 let benchmark_file = file
                     .clone()
                     .or_else(|| file_flag.clone())
@@ -644,16 +1029,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
             }
+            Commands::Bugs {
+                command:
+                    BugsMainCommand::EvaluateSecurity {
+                        bug,
+                        limit,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        format,
+                        ..
+                    },
+            } => {
+                let settings =
+                    settings_result.map_err(|e| format_settings_load_error(&settings_path, &e))?;
+                #[cfg(feature = "server")]
+                {
+                    return handle_bugs_evaluate_security_command(
+                        project,
+                        bug.clone(),
+                        if *all { usize::MAX } else { *limit },
+                        *re_evaluate,
+                        *concurrency,
+                        db.clone(),
+                        settings,
+                        *format,
+                    )
+                    .await;
+                }
+                #[cfg(not(feature = "server"))]
+                {
+                    let _ = (
+                        project,
+                        bug,
+                        limit,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        settings,
+                        format,
+                    );
+                    return Err(
+                        "this build has no database bug evaluator; rebuild with --features server"
+                            .into(),
+                    );
+                }
+            }
         }
     }
 
     #[cfg(feature = "server")]
     {
-        run_daemon(cli, settings_result, overridden, project).await
+        run_daemon(cli, &settings_path, settings_result, overridden, project).await
     }
     #[cfg(not(feature = "server"))]
     {
-        let _ = (cli, settings_result, overridden, project);
+        let _ = (cli, settings_path, settings_result, overridden, project);
         Err("this build has no daemon; rebuild with --features server".into())
     }
 }
@@ -661,6 +1094,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(feature = "server")]
 async fn run_daemon(
     cli: Cli,
+    settings_path: &Path,
     settings_result: Result<Settings, config::ConfigError>,
     overridden: Vec<String>,
     project: ProjectId,
@@ -672,8 +1106,7 @@ async fn run_daemon(
             s
         }
         Err(e) => {
-            error!("Failed to load settings: {}", e);
-            return Err(e.into());
+            return Err(format_settings_load_error(settings_path, &e).into());
         }
     };
 
@@ -698,13 +1131,19 @@ async fn run_daemon(
     // reads the same file shape and has none of them. Asked for here, where a
     // missing one is reported as itself rather than as a failed connection.
     if let Err(reason) = settings.validate_for_daemon() {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
+    }
+
+    // The daemon never clones its tree. Without one, MAINTAINERS indexing
+    // only warns and the first sign of trouble is a patch that fails to
+    // apply, so a missing tree is refused here with the command that fixes it.
+    let repository_path = std::path::PathBuf::from(&settings.git.repository_path);
+    if let Err(reason) = sashiko::repo_sync::check_daemon_tree(&repository_path, project).await {
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     if let Err(reason) = settings.validate_sign_in_delivery() {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     if let Some(Err(reason)) = settings
@@ -712,8 +1151,7 @@ async fn run_daemon(
         .as_ref()
         .map(sashiko::worker::email::EmailWorker::check_sendmail_path)
     {
-        error!("Refusing to start: {}", reason);
-        return Err(reason.into());
+        return Err(format_daemon_startup_error(settings_path, &reason).into());
     }
 
     // Initialize Database
@@ -728,30 +1166,10 @@ async fn run_daemon(
         Err(e) => error!("Failed to clean up interrupted Fetching patchsets: {}", e),
     }
 
-    // Load and initialize authoritative immutable MAINTAINERS index when the
-    // reviewed project uses kernel MAINTAINERS.
-    let maintainers_index = if project.uses_maintainers() {
-        let linux_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
-        match sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&linux_repo_path) {
-            Ok(idx) => {
-                info!(
-                    "Successfully parsed and indexed {} MAINTAINERS sections from top-of-trunk of Linus's tree",
-                    idx.len()
-                );
-                Arc::new(idx)
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to load MAINTAINERS from top-of-trunk: {}. Using empty index.",
-                    e
-                );
-                Arc::new(sashiko::maintainers::MaintainersIndex::new())
-            }
-        }
-    } else {
-        info!("Project {project} does not use kernel MAINTAINERS; skipping index.");
-        Arc::new(sashiko::maintainers::MaintainersIndex::new())
-    };
+    // Load and initialize authoritative immutable MAINTAINERS + bugs_access index.
+    let index_repo_path = std::path::PathBuf::from(&settings.git.repository_path);
+    let maintainers_index =
+        sashiko::maintainers::MaintainersIndex::load_for_project(project, &index_repo_path);
     sashiko::maintainers::init_global_maintainers(maintainers_index);
 
     // Attributes series ingested before attribution existed. Best effort: a
@@ -760,6 +1178,13 @@ async fn run_daemon(
     // start over.
     if let Err(e) = sashiko::backfill::backfill_patchset_maintainer_sections(&db).await {
         warn!("Patchset MAINTAINERS attribution backfill failed: {e}");
+    }
+
+    // Brings stored upstream grant rows in line with the grants loaded now.
+    // A failure leaves the rows from the last complete walk in place, and the
+    // walk is retried on the next boot.
+    if let Err(e) = sashiko::backfill::reconcile_upstream_grant_sections(&db).await {
+        error!("Upstream grant reconciliation failed: {e:#}");
     }
 
     // Create internal task queues
@@ -774,10 +1199,14 @@ async fn run_daemon(
         raw_tx.clone(),
         settings.forge.api_token.clone(),
     );
+    let fetch_agent = Arc::new(fetch_agent.with_db(db.clone(), settings.review.max_retries));
 
-    // Spawn FetchAgent
-    let fetch_handle = tokio::spawn(async move {
-        fetch_agent.run().await;
+    // Spawn FetchAgent under supervision so unexpected panics recover and drain fetch_queue
+    let fetch_handle = spawn_supervised_worker("FetchAgent", move || {
+        let agent = Arc::clone(&fetch_agent);
+        async move {
+            agent.run().await;
+        }
     });
 
     // Parser Dispatcher
@@ -818,8 +1247,124 @@ async fn run_daemon(
     };
 
     let parser_handle = tokio::spawn(async move {
-        info!("Parser Dispatcher started");
+        debug!("Parser Dispatcher started");
         while let Some(event) = raw_rx.recv().await {
+            // Forward pre-parsed events inline without spawning a separate task
+            // so the patches of a multi-patch git-fetch series are delivered to
+            // parsed_rx in strict FIFO order.
+            match event {
+                Event::IngestionFailed {
+                    article_id,
+                    error,
+                    source,
+                } => {
+                    if let Err(e) = parsed_tx
+                        .send(ParsedArticle {
+                            group: "error".to_string(),
+                            article_id,
+                            source,
+                            metadata: None,
+                            patch: None,
+                            baseline: None,
+                            failed_error: Some(error),
+                            skip_filters: None,
+                            only_filters: None,
+                            mr_url: None,
+                            mr_title: None,
+                            mr_number: None,
+                            receipt: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to forward IngestionFailed event: {}", e);
+                    }
+                    continue;
+                }
+                Event::PatchSubmitted {
+                    group,
+                    article_id,
+                    message_id,
+                    subject,
+                    author,
+                    message,
+                    diff,
+                    base_commit,
+                    timestamp,
+                    index,
+                    total,
+                    mr_url,
+                    mr_title,
+                    mr_number,
+                } => {
+                    let root_msg_id = format!("{}@sashiko.local", article_id);
+
+                    // For single patches, we don't want a synthetic parent (the patch is the root)
+                    let in_reply_to = if total == 1 {
+                        None
+                    } else {
+                        Some(root_msg_id.clone())
+                    };
+
+                    let received_date = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .ok();
+
+                    let metadata = sashiko::patch::PatchsetMetadata {
+                        message_id: message_id.clone(),
+                        subject,
+                        author,
+                        date: timestamp,
+                        received_date,
+                        in_reply_to,
+                        references: vec![root_msg_id.clone()],
+                        index,
+                        total,
+                        to: "submitted".to_string(),
+                        cc: "".to_string(),
+                        is_patch_or_cover: true,
+                        version: None,
+                        body: message.clone(),
+                    };
+
+                    let patch = Some(sashiko::patch::Patch {
+                        message_id,
+                        body: message,
+                        diff,
+                        part_index: index,
+                    });
+
+                    let source = if group.starts_with("git-import") {
+                        MessageSource::GitImport
+                    } else {
+                        MessageSource::GitFetch
+                    };
+
+                    if let Err(e) = parsed_tx
+                        .send(ParsedArticle {
+                            group,
+                            article_id,
+                            source,
+                            metadata: Some(metadata),
+                            patch,
+                            baseline: base_commit,
+                            failed_error: None,
+                            skip_filters: None,
+                            only_filters: None,
+                            mr_url,
+                            mr_title,
+                            mr_number,
+                            receipt: None,
+                        })
+                        .await
+                    {
+                        error!("Failed to send pre-parsed article: {}", e);
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(e) => {
@@ -832,108 +1377,8 @@ async fn run_daemon(
                 let _permit = permit; // Hold permit until task completion
 
                 match event {
-                    Event::IngestionFailed {
-                        article_id,
-                        error,
-                        source,
-                    } => {
-                        if let Err(e) = tx
-                            .send(ParsedArticle {
-                                group: "error".to_string(),
-                                article_id,
-                                source,
-                                metadata: None,
-                                patch: None,
-                                baseline: None,
-                                failed_error: Some(error),
-                                skip_filters: None,
-                                only_filters: None,
-                                mr_url: None,
-                                mr_title: None,
-                                mr_number: None,
-                                receipt: None,
-                            })
-                            .await
-                        {
-                            error!("Failed to forward IngestionFailed event: {}", e);
-                        }
-                    }
-                    Event::PatchSubmitted {
-                        group,
-                        article_id,
-                        message_id,
-                        subject,
-                        author,
-                        message,
-                        diff,
-                        base_commit,
-                        timestamp,
-                        index,
-                        total,
-                        mr_url,
-                        mr_title,
-                        mr_number,
-                    } => {
-                        let root_msg_id = format!("{}@sashiko.local", article_id);
-
-                        // For single patches, we don't want a synthetic parent (the patch is the root)
-                        let in_reply_to = if total == 1 {
-                            None
-                        } else {
-                            Some(root_msg_id.clone())
-                        };
-
-                        // Pre-parsed patch handling
-                        let metadata = sashiko::patch::PatchsetMetadata {
-                            message_id: message_id.clone(),
-                            subject,
-                            author,
-                            date: timestamp,
-                            received_date: None,
-                            in_reply_to,
-                            references: vec![root_msg_id.clone()],
-                            index,
-                            total,
-                            to: "submitted".to_string(),
-                            cc: "".to_string(),
-                            is_patch_or_cover: true,
-                            version: None,
-                            body: message.clone(),
-                        };
-
-                        let patch = Some(sashiko::patch::Patch {
-                            message_id,
-                            body: message,
-                            diff,
-                            part_index: index,
-                        });
-
-                        let source = if group.starts_with("git-import") {
-                            MessageSource::GitImport
-                        } else {
-                            MessageSource::GitFetch
-                        };
-
-                        if let Err(e) = tx
-                            .send(ParsedArticle {
-                                group,
-                                article_id,
-                                source,
-                                metadata: Some(metadata),
-                                patch,
-                                baseline: base_commit,
-                                failed_error: None,
-                                skip_filters: None,
-                                only_filters: None,
-                                mr_url,
-                                mr_title,
-                                mr_number,
-                                receipt: None,
-                            })
-                            .await
-                        {
-                            error!("Failed to send pre-parsed article: {}", e);
-                        }
+                    Event::IngestionFailed { .. } | Event::PatchSubmitted { .. } => {
+                        unreachable!("handled inline before spawning parser task");
                     }
                     Event::RawMboxSubmitted {
                         raw,
@@ -945,72 +1390,29 @@ async fn run_daemon(
                         only_subjects,
                         submitted_at,
                     } => {
-                        let messages = sashiko::ingestor::split_mbox(raw.as_bytes());
-                        let count = messages.len();
-
-                        if count > 100 {
-                            error!(
-                                "Too many messages in mbox submission: {} (limit 100)",
-                                count
-                            );
-                            return;
-                        }
-
-                        info!("Processing {} messages from raw mbox submission", count);
-
-                        for msg_raw in messages {
-                            let msg_id = sashiko::ingestor::extract_message_id(&msg_raw);
-                            let group_clone = group.clone();
-                            let tx_clone = tx.clone();
-                            let baseline_clone = baseline.clone();
-                            let skip_subjects_clone = skip_subjects.clone();
-                            let only_subjects_clone = only_subjects.clone();
-
-                            // Offload parsing
-                            let parse_result = tokio::task::spawn_blocking(move || {
-                                sashiko::patch::parse_email(&msg_raw)
-                            })
-                            .await;
-
-                            match parse_result {
-                                Ok(Ok((metadata, patch_opt))) => {
-                                    // Do not override group "api-submit" to allow grouping logic to trigger
-                                    let effective_group = group_clone;
-
-                                    if let Err(e) = tx_clone
-                                        .send(ParsedArticle {
-                                            group: effective_group,
-                                            article_id: submission_id.clone(),
-                                            source,
-                                            metadata: {
-                                                let mut m = metadata;
-                                                if submitted_at.is_some() {
-                                                    m.received_date = submitted_at;
-                                                }
-                                                Some(m)
-                                            },
-                                            patch: patch_opt,
-                                            baseline: baseline_clone,
-                                            failed_error: None,
-                                            skip_filters: skip_subjects_clone,
-                                            only_filters: only_subjects_clone,
-                                            mr_url: None,
-                                            mr_title: None,
-                                            mr_number: None,
-                                            receipt: None,
-                                        })
-                                        .await
-                                    {
+                        let submission = RawMboxSubmission {
+                            raw,
+                            submission_id,
+                            source,
+                            group,
+                            baseline,
+                            skip_subjects,
+                            only_subjects,
+                            submitted_at,
+                        };
+                        // Offload parsing
+                        let articles =
+                            tokio::task::spawn_blocking(move || submission.into_articles()).await;
+                        match articles {
+                            Ok(Some(articles)) => {
+                                for article in articles {
+                                    if let Err(e) = tx.send(article).await {
                                         error!("Failed to send parsed article: {}", e);
                                     }
                                 }
-                                Ok(Err(e)) => {
-                                    info!("Parse error for {}: {}", msg_id, e);
-                                }
-                                Err(e) => {
-                                    error!("Join error in parser: {}", e);
-                                }
                             }
+                            Ok(None) => {}
+                            Err(e) => error!("Join error in parser: {}", e),
                         }
                     }
                     Event::ArticleFetched {
@@ -1091,17 +1493,23 @@ async fn run_daemon(
                 }
             });
         }
-        info!("Parser Dispatcher finished");
+        debug!("Parser Dispatcher finished");
     });
 
     // DB Worker (Transactional Batching)
-    let worker_db = db.clone();
+    let worker_db = db.with_auto_review(settings.review.auto_review);
+    if !settings.review.auto_review {
+        info!(
+            "Automatic reviews disabled (review.auto_review = false); completed patchsets wait in Awaiting Review until a manual rerun"
+        );
+    }
     let mapping = settings.subsystems.mapping.clone();
     let email_policy_path = settings.review.email_policy_path.clone();
+    let review_settings = settings.review.clone();
     let mut policy =
         sashiko::email_policy::EmailPolicyConfig::load_async(&email_policy_path).await?;
     let db_worker_handle = tokio::spawn(async move {
-        info!("DB Worker started");
+        debug!("DB Worker started");
 
         let mut buffer = Vec::with_capacity(100);
         let mut total_processed = 0;
@@ -1147,8 +1555,29 @@ async fn run_daemon(
                     }
                 };
                 let mut receipt = article.receipt.take();
-                match process_parsed_article(&worker_db, article, git_patch_id, &policy, &mapping)
-                    .await
+                let ingest_src = if article.mr_url.is_some() {
+                    sashiko::metrics::IngestSource::Forge
+                } else {
+                    match article.source {
+                        MessageSource::Nntp => sashiko::metrics::IngestSource::Nntp,
+                        MessageSource::ApiInject | MessageSource::ApiFetchThread => {
+                            sashiko::metrics::IngestSource::Api
+                        }
+                        MessageSource::GitFetch
+                        | MessageSource::GitImport
+                        | MessageSource::GitArchive => sashiko::metrics::IngestSource::Git,
+                    }
+                };
+                let was_failed_event = article.failed_error.is_some();
+                match process_parsed_article(
+                    &worker_db,
+                    article,
+                    git_patch_id,
+                    &policy,
+                    &mapping,
+                    &review_settings,
+                )
+                .await
                 {
                     ProcessStatus::Ingested => {
                         // The article is on disk, so the fetch loop may finally
@@ -1156,11 +1585,19 @@ async fn run_daemon(
                         if let Some(receipt) = receipt.as_mut() {
                             receipt.settle();
                         }
+                        if was_failed_event {
+                            sashiko::metrics::inc_ingest_error(ingest_src);
+                        } else {
+                            sashiko::metrics::inc_messages_ingested(ingest_src, 1);
+                        }
                         total_ingested += 1;
                     }
                     // The receipt is dropped unsettled, which reports the
                     // article as lost and keeps the mark below it.
-                    ProcessStatus::Error => total_errors += 1,
+                    ProcessStatus::Error => {
+                        sashiko::metrics::inc_ingest_error(ingest_src);
+                        total_errors += 1;
+                    }
                 }
                 total_processed += 1;
 
@@ -1280,8 +1717,8 @@ async fn run_daemon(
             smtp_settings,
             settings.server.log_sign_in_links,
         );
-        if let Some(hb) = email_worker_heartbeat {
-            email_worker = email_worker.with_heartbeat(hb);
+        if let Some(ref hb) = email_worker_heartbeat {
+            email_worker = email_worker.with_heartbeat(Arc::clone(hb));
         }
         let email_worker = Arc::new(email_worker);
 
@@ -1312,20 +1749,39 @@ async fn run_daemon(
         })
     };
 
-    let forge_handle = if settings.forge.enabled {
-        let forge_worker = Arc::new(sashiko::worker::forge::ForgeWorker::new(
-            db.clone(),
-            settings.forge.clone(),
-            settings.review.max_retries,
-        ));
-        Some(spawn_supervised_worker("ForgeWorker", move || {
-            let worker = Arc::clone(&forge_worker);
+    let (forge_handle, forge_poller_handle) = if settings.forge.enabled {
+        let forge_worker = Arc::new(
+            sashiko::worker::forge::ForgeWorker::new(
+                db.clone(),
+                settings.forge.clone(),
+                settings.review.max_retries,
+            )
+            .with_poller(
+                fetch_tx.clone(),
+                std::path::PathBuf::from(&settings.git.repository_path),
+            ),
+        );
+        let outbox_worker = Arc::clone(&forge_worker);
+        let outbox_handle = spawn_supervised_worker("ForgeWorker", move || {
+            let worker = Arc::clone(&outbox_worker);
             async move {
                 worker.run().await;
             }
-        }))
+        });
+        let poller_handle = if settings.forge.poll_interval_secs > 0 {
+            Some(spawn_supervised_worker("ForgePoller", move || {
+                let worker = Arc::clone(&forge_worker);
+                async move {
+                    worker.run_poller().await;
+                }
+            }))
+        } else {
+            info!("Forge PR poller disabled via settings (forge.poll_interval_secs = 0).");
+            None
+        };
+        (Some(outbox_handle), poller_handle)
     } else {
-        None
+        (None, None)
     };
 
     let bug_worker_handle = if settings.linux_bug.enabled {
@@ -1338,7 +1794,9 @@ async fn run_daemon(
                 settings.git.repository_path.clone(),
             )
             .with_project(project)
-            .with_settings(settings.linux_bug.clone()),
+            .with_settings(settings.linux_bug.clone())
+            .with_effort(settings.effective_effort())
+            .with_max_interactions(settings.ai.max_interactions),
         );
         Some(spawn_supervised_worker("BugWorker", move || {
             let worker = Arc::clone(&bug_worker);
@@ -1403,8 +1861,15 @@ async fn run_daemon(
                 remote.name,
                 sashiko::utils::redact_secret(&remote.url)
             );
-            if let Err(e) =
-                sashiko::git_ops::ensure_remote(&repo_path, &remote.name, &remote.url, false).await
+            let refspecs = remote.refspecs();
+            if let Err(e) = sashiko::git_ops::ensure_remote_with_refspecs(
+                &repo_path,
+                &remote.name,
+                &remote.url,
+                false,
+                refspecs.as_deref(),
+            )
+            .await
             {
                 error!("Failed to ensure custom remote {}: {}", remote.name, e);
             }
@@ -1444,12 +1909,23 @@ async fn run_daemon(
         }
     });
 
+    let stats_backfill_db = db.clone();
+    let stats_backfill_handle = tokio::spawn(async move {
+        sashiko::worker::stats_backfill::run_stats_backfill_loop(stats_backfill_db).await;
+    });
+
     let metrics_db = db.clone();
     let metrics_repo_path = repo_path.clone();
+    let metrics_email_hb = email_worker_heartbeat.clone();
+    let metrics_flush_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let worker_flush_lock = Arc::clone(&metrics_flush_lock);
     let metrics_handle = spawn_supervised_worker("MetricsWorker", move || {
         let metrics_db = Arc::clone(&metrics_db);
         let metrics_repo_path = metrics_repo_path.clone();
+        let metrics_email_hb = metrics_email_hb.clone();
+        let worker_flush_lock = Arc::clone(&worker_flush_lock);
         async move {
+            let mut tick: u64 = 0;
             loop {
                 if let Ok(pending) = metrics_db.count_pending_patches().await {
                     sashiko::metrics::set_pending_patches(pending);
@@ -1457,16 +1933,47 @@ async fn run_daemon(
                 if let Ok(reviewing) = metrics_db.count_reviewing_patches().await {
                     sashiko::metrics::set_reviewing_patches(reviewing);
                 }
-                if let Ok(messages) = metrics_db.count_messages(None, None).await {
+                if let Ok(messages) = metrics_db.count_messages_stored_o1().await {
                     sashiko::metrics::set_messages(messages);
                 }
-                if let Ok(patchsets) = metrics_db.count_patchsets(None, None).await {
+                if let Ok(patchsets) = metrics_db.count_patchsets_stored_o1().await {
                     sashiko::metrics::set_patchsets(patchsets);
                 }
                 match sashiko::git_ops::pack_stats(&metrics_repo_path).await {
                     Ok((packs, bytes)) => sashiko::metrics::set_repo_packs(packs, bytes),
                     Err(e) => warn!("Failed to count packs in the review repository: {}", e),
                 }
+                sashiko::git_ops::refresh_remote_freshness_metrics(&metrics_repo_path).await;
+                let now_ts = chrono::Utc::now().timestamp();
+                if let Some(ref hb) = metrics_email_hb {
+                    let last = hb.load(std::sync::atomic::Ordering::Relaxed);
+                    sashiko::metrics::set_email_worker_heartbeat_age_secs(
+                        now_ts.saturating_sub(last).max(0),
+                    );
+                } else {
+                    sashiko::metrics::set_email_worker_heartbeat_age_secs(-1);
+                }
+
+                {
+                    let _flush_guard = worker_flush_lock.lock().await;
+                    let pending = sashiko::metrics::prepare_runtime_flush();
+                    if !pending.is_empty() {
+                        match metrics_db
+                            .flush_rollup_samples(now_ts, pending.samples())
+                            .await
+                        {
+                            Ok(()) => sashiko::metrics::commit_runtime_flush(&pending),
+                            Err(e) => warn!("Failed to flush runtime metrics rollups: {}", e),
+                        }
+                    }
+                }
+
+                if tick.is_multiple_of(60)
+                    && let Err(e) = metrics_db.reap_expired_rollups(now_ts, 5_000).await
+                {
+                    warn!("Failed to reap expired stats rollups: {}", e);
+                }
+                tick = tick.wrapping_add(1);
                 tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             }
         }
@@ -1501,14 +2008,32 @@ async fn run_daemon(
     if let Some(h) = forge_handle {
         h.abort();
     }
+    if let Some(h) = forge_poller_handle {
+        h.abort();
+    }
     if let Some(h) = bug_worker_handle {
         h.abort();
     }
     commit_graph_handle.abort();
+    stats_backfill_handle.abort();
     sync_handle.abort();
     repack_handle.abort();
     reviewer_handle.abort();
+    // Serialize with any in-flight MetricsWorker flush before aborting it so
+    // an already-committed DB write always updates FLUSH_WATERMARK before the
+    // final shutdown flush reads it.
+    let _metrics_flush_guard = metrics_flush_lock.lock().await;
     metrics_handle.abort();
+    let _ = metrics_handle.await;
+
+    let final_flush = sashiko::metrics::prepare_runtime_flush();
+    if !final_flush.is_empty()
+        && let Ok(()) = db
+            .flush_rollup_samples(chrono::Utc::now().timestamp(), final_flush.samples())
+            .await
+    {
+        sashiko::metrics::commit_runtime_flush(&final_flush);
+    }
 
     // A token from a dead server authenticates nothing, since the next one
     // draws a new secret, but leaving the file behind invites a local tool to
@@ -1523,6 +2048,9 @@ async fn run_daemon(
         );
     }
 
+    // Each CLI runs in a process group of its own, so the terminal's signal
+    // never reached it, and exit() runs no destructor that would.
+    sashiko::ai::cli_common::kill_live_groups();
     info!("Shutdown complete.");
     std::process::exit(0);
 }
@@ -1562,6 +2090,10 @@ where
             let _abort_guard = AbortOnDrop(handle.abort_handle());
             match handle.await {
                 Ok(()) => {
+                    sashiko::metrics::inc_worker_restart(
+                        sashiko::metrics::WorkerKind::from_name(name),
+                        false,
+                    );
                     warn!(
                         "{name} exited unexpectedly; restarting in {}ms...",
                         backoff.as_millis()
@@ -1571,6 +2103,10 @@ where
                     break;
                 }
                 Err(join_err) => {
+                    sashiko::metrics::inc_worker_restart(
+                        sashiko::metrics::WorkerKind::from_name(name),
+                        true,
+                    );
                     error!(
                         "{name} panicked ({join_err}); restarting in {}ms...",
                         backoff.as_millis()
@@ -1794,9 +2330,11 @@ fn watch_for_resize(
 struct ProgressState {
     project: ProjectId,
     patches: std::collections::BTreeMap<i64, PatchState>,
+    design: Option<PatchState>,
     /// The status each patch was last reported with, so the appending display
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
+    last_design_status: Option<String>,
     total_turns: usize,
     terminal_width: usize,
     terminal_rows: usize,
@@ -1821,7 +2359,9 @@ struct ProgressState {
 /// Display label for a stage. Held in the stage tables so that adding a stage
 /// needs no edit here.
 fn stage_short_name(project: ProjectId, stage: &str) -> &'static str {
-    sashiko::workflows::stage_short_label(project, stage).unwrap_or("Unknown")
+    sashiko::workflows::design_assessment::design_stage_short_label(stage)
+        .or_else(|| sashiko::workflows::stage_short_label(project, stage))
+        .unwrap_or("Unknown")
 }
 
 struct TruncatingWriter {
@@ -2002,13 +2542,17 @@ fn release_region_on_panic() {
     }));
 }
 
-/// Gives the screen back when the review is interrupted.
+/// Stops the CLIs a review spawned, and gives the screen back, when the review
+/// is interrupted.
 ///
-/// Ctrl-C kills the process where it stands, reaching neither the release above
-/// nor the panic hook, and the scroll region outlives it: the shell that comes
-/// back is confined to the top of the screen until something resets it. So the
-/// signals that end a review are taken, the reset written, and the process left
-/// to exit with the status that signal would have given it.
+/// Ctrl-C kills the process where it stands, running no destructor. Each CLI
+/// runs in a process group of its own, so the terminal's signal does not reach
+/// it either, and a review nobody will read runs on and bills for it. With a
+/// reserved region the scroll region outlives the process as well: the shell
+/// that comes back is confined to the top of the screen until something resets
+/// it. So the signals that end a review are taken, the CLIs killed, the reset
+/// written when `release_region` is set, and the process left to exit with the
+/// status that signal would have given it.
 ///
 /// Saves and restores the cursor around the reset, as the panic hook does, or a
 /// review interrupted mid-frame reports from the top of the screen.
@@ -2017,22 +2561,25 @@ fn release_region_on_panic() {
 /// hand: the shell that started the review still sees it die of the signal it
 /// sent. The reset is four bytes and the exit follows it, so the window where a
 /// second interrupt would find nothing listening is not one worth covering.
-fn release_region_on_interrupt() {
+fn exit_on_interrupt(release_region: bool) {
     for kind in [
         SignalKind::interrupt(),
         SignalKind::terminate(),
         SignalKind::hangup(),
     ] {
         let Ok(mut signalled) = signal(kind) else {
-            warn!("Progress display cannot give the screen back if interrupted");
+            warn!("An interrupted review cannot stop the CLIs it spawned");
             continue;
         };
 
         tokio::spawn(async move {
             if signalled.recv().await.is_some() {
-                // Scrolling back to the whole screen, leaving the cursor where
-                // the output had reached, and a line to report from.
-                let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+                sashiko::ai::cli_common::kill_live_groups();
+                if release_region {
+                    // Scrolling back to the whole screen, leaving the cursor
+                    // where the output had reached, and a line to report from.
+                    let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+                }
                 std::process::exit(128 + kind.as_raw_value());
             }
         });
@@ -2123,6 +2670,13 @@ fn paint_progress_plain(
         }
         state.last_status.insert(idx, label.clone());
         writeln!(out, "      [Patch {}] {} | {}", idx, p.subject, label)?;
+    }
+    if let Some(ref d) = state.design {
+        let label = status_label(state.project, d, false);
+        if state.last_design_status.as_ref() != Some(&label) {
+            state.last_design_status = Some(label.clone());
+            writeln!(out, "      [Design] {} | {}", d.subject, label)?;
+        }
     }
 
     out.flush()
@@ -2273,9 +2827,9 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         return Ok(());
     }
 
-    // One line per patch and one for the overall bar. Reserving happens once, and
-    // again when that count changes, which it does as the patches become known.
-    let wanted = state.patches.len() + 1;
+    // One line per patch, an optional series design row, and one for the
+    // overall bar. Reserving happens once, and again when that count changes.
+    let wanted = state.patches.len() + usize::from(state.design.is_some()) + 1;
     if !state.reservation_capable || !worth_reserving(wanted, state.terminal_rows) {
         // A display that has outgrown the screen was holding a region until now,
         // and hands it back on the way to saying its piece a line at a time.
@@ -2298,60 +2852,42 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
     let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
 
     for (&idx, p) in &state.patches {
-        write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
-        let status_str = status_label(state.project, p, true);
-
-        // Calculate available width for subject to guarantee status is never truncated
-        let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
-        let status_len = status_str.chars().count();
-        let available_for_subject = limit
-            .saturating_sub(fixed_overhead)
-            .saturating_sub(status_len);
-
-        let target_subject_width = 30;
-        let subject_width = std::cmp::min(target_subject_width, available_for_subject);
-
-        let mut subject_padded = if p.subject.chars().count() > subject_width {
-            if subject_width > 3 {
-                let taken: String = p.subject.chars().take(subject_width - 3).collect();
-                format!("{}...", taken.trim_end())
-            } else {
-                "...".to_string()
-            }
-        } else {
-            p.subject.clone()
-        };
-
-        let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
-        if padding_chars > 0 {
-            subject_padded.push_str(&" ".repeat(padding_chars));
-        }
-
-        let mut tw = TruncatingWriter::new(limit);
-        let _ = tw.write_segment(out, &format!("      [Patch {}] ", idx), None, false);
-        let _ = tw.write_segment(out, &subject_padded, None, false);
-        let _ = tw.write_segment(out, " | ", None, false);
-
-        let (status_color, status_bold) = match &p.status {
-            PatchStatus::Queued => (None, false),
-            PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
-            PatchStatus::Reviewing => (Some(Color::Cyan), true),
-            PatchStatus::Finished => (Some(Color::Green), true),
-            PatchStatus::Failed => (Some(Color::Red), true),
-        };
-        let _ = tw.write_segment(out, &status_str, status_color, status_bold);
-
+        paint_progress_row(
+            state.project,
+            &format!("      [Patch {}] ", idx),
+            p,
+            top + lines_printed,
+            limit,
+            out,
+        )?;
+        lines_printed += 1;
+    }
+    if let Some(ref d) = state.design {
+        paint_progress_row(
+            state.project,
+            "      [Design]  ",
+            d,
+            top + lines_printed,
+            limit,
+            out,
+        )?;
         lines_printed += 1;
     }
 
-    let total_patches = state.patches.len();
+    let total_patches = state.patches.len() + usize::from(state.design.is_some());
     if total_patches > 0 {
         let total_stages: usize = state
             .patches
             .values()
+            .chain(state.design.iter())
             .map(|p| patch_stage_total(state.project, p))
             .sum();
-        let completed_stages: usize = state.patches.values().map(|p| p.completed_stages).sum();
+        let completed_stages: usize = state
+            .patches
+            .values()
+            .chain(state.design.iter())
+            .map(|p| p.completed_stages)
+            .sum();
         let width = 20;
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
@@ -2391,6 +2927,58 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         split = state.terminal_rows - state.reserved
     )?;
     out.flush()
+}
+
+fn paint_progress_row(
+    project: ProjectId,
+    prefix: &str,
+    p: &PatchState,
+    row: usize,
+    limit: usize,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    write!(out, "\x1b[{row};1H\x1b[2K")?;
+    let status_str = status_label(project, p, true);
+
+    let fixed_overhead = prefix.chars().count() + 3; // prefix + " | "
+    let status_len = status_str.chars().count();
+    let available_for_subject = limit
+        .saturating_sub(fixed_overhead)
+        .saturating_sub(status_len);
+
+    let target_subject_width = 30;
+    let subject_width = std::cmp::min(target_subject_width, available_for_subject);
+
+    let mut subject_padded = if p.subject.chars().count() > subject_width {
+        if subject_width > 3 {
+            let taken: String = p.subject.chars().take(subject_width - 3).collect();
+            format!("{}...", taken.trim_end())
+        } else {
+            "...".to_string()
+        }
+    } else {
+        p.subject.clone()
+    };
+
+    let padding_chars = subject_width.saturating_sub(subject_padded.chars().count());
+    if padding_chars > 0 {
+        subject_padded.push_str(&" ".repeat(padding_chars));
+    }
+
+    let mut tw = TruncatingWriter::new(limit);
+    let _ = tw.write_segment(out, prefix, None, false);
+    let _ = tw.write_segment(out, &subject_padded, None, false);
+    let _ = tw.write_segment(out, " | ", None, false);
+
+    let (status_color, status_bold) = match &p.status {
+        PatchStatus::Queued => (None, false),
+        PatchStatus::PreScreening | PatchStatus::Planning => (Some(Color::Cyan), false),
+        PatchStatus::Reviewing => (Some(Color::Cyan), true),
+        PatchStatus::Finished => (Some(Color::Green), true),
+        PatchStatus::Failed => (Some(Color::Red), true),
+    };
+    let _ = tw.write_segment(out, &status_str, status_color, status_bold);
+    Ok(())
 }
 
 /// Stages this patch will have run by the time it is finished.
@@ -2442,6 +3030,7 @@ async fn handle_review_command(
     baseline: Option<String>,
     mut settings: Settings,
     report_preexisting: bool,
+    related_preexisting: RelatedPreexistingMode,
     custom_prompt: Option<String>,
     prompts: PathBuf,
     format: OutputFormat,
@@ -2456,17 +3045,18 @@ async fn handle_review_command(
     let display = OutputStream::detect(color, &std::io::stderr(), terminal.as_ref());
 
     let repo_path = current_git_toplevel()?;
+    sashiko::ai::validate_provider_credentials(&settings.ai)?;
 
     // The repository a local review works in: the checkout it was run in, which
     // no settings file can name. The command-line overrides were merged onto
     // these settings before dispatch.
     settings.git.repository_path = repo_path.to_string_lossy().into_owned();
 
-    if project.uses_maintainers()
-        && sashiko::maintainers::get_global_maintainers().is_none()
-        && let Ok(idx) = sashiko::maintainers::MaintainersIndex::from_top_of_trunk(&repo_path)
-    {
-        sashiko::maintainers::init_global_maintainers(Arc::new(idx));
+    if sashiko::maintainers::get_global_maintainers().is_none() {
+        let idx = sashiko::maintainers::MaintainersIndex::load_for_project(project, &repo_path);
+        if idx.is_ready_for_reconcile() {
+            sashiko::maintainers::init_global_maintainers(idx);
+        }
     }
     eprintln!("Reviewing: {}", input);
     eprintln!("Using prompts: {}", prompts.display());
@@ -2477,7 +3067,7 @@ async fn handle_review_command(
     {
         eprint_colored(display.color, Color::Yellow, "WARNING:")?;
         eprintln!(
-            " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
+            " Working directory is dirty. The review reads commits only, so uncommitted changes are not reviewed."
         );
         if !agent && std::io::stdin().is_terminal() {
             eprint!("Do you want to proceed? [y/N]: ");
@@ -2495,8 +3085,10 @@ async fn handle_review_command(
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         project,
         patches: std::collections::BTreeMap::new(),
+        design: None,
         total_turns: 0,
         last_status: std::collections::BTreeMap::new(),
+        last_design_status: None,
         terminal_width: display.size.1,
         terminal_rows: display.size.0,
         color_choice: display.color,
@@ -2637,6 +3229,75 @@ async fn handle_review_command(
                     render_progress(&mut s);
                 }
             }
+            ProgressEvent::DesignReviewQueued { subject } => {
+                s.design = Some(PatchState {
+                    index: 0,
+                    subject,
+                    status: PatchStatus::Queued,
+                    planned_stages: sashiko::workflows::design_assessment::DESIGN_STAGE_NAMES
+                        .iter()
+                        .map(|n| (*n).to_string())
+                        .collect(),
+                    active_stages: std::collections::BTreeSet::new(),
+                    completed_stages: 0,
+                    active_stage_turns: std::collections::HashMap::new(),
+                    preliminary_stages: 0,
+                });
+            }
+            ProgressEvent::DesignReviewAttempt {
+                attempt,
+                max_attempts,
+            } => {
+                if attempt > 1 {
+                    info!(
+                        "Series design assessment retry (attempt {}/{})",
+                        attempt, max_attempts
+                    );
+                    if let Some(ref mut d) = s.design {
+                        d.status = PatchStatus::Queued;
+                        d.active_stages.clear();
+                        d.active_stage_turns.clear();
+                        d.completed_stages = 0;
+                    }
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewStageStarted { stage } => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Reviewing;
+                    d.active_stages.insert(stage);
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewStageTurn { stage, turn, .. } => {
+                if let Some(ref mut d) = s.design {
+                    d.active_stage_turns.insert(stage, turn);
+                }
+                s.total_turns += 1;
+                render_progress(&mut s);
+            }
+            ProgressEvent::DesignReviewStageFinished { stage } => {
+                if let Some(ref mut d) = s.design {
+                    d.active_stages.remove(&stage);
+                    d.active_stage_turns.remove(&stage);
+                    d.completed_stages += 1;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewFinished => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Finished;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::DesignReviewFailed => {
+                if let Some(ref mut d) = s.design {
+                    d.status = PatchStatus::Failed;
+                    d.active_stages.clear();
+                    d.active_stage_turns.clear();
+                    render_progress(&mut s);
+                }
+            }
             ProgressEvent::ReviewComplete { partial } => {
                 // The region goes back before this prints, and the frame it was
                 // holding stays: it is the review's final state, a hundred per
@@ -2644,14 +3305,21 @@ async fn handle_review_command(
                 // it, start below the frame instead of inside it or over it.
                 finish_progress(&mut s);
                 eprintln!("Review {}", if partial { "incomplete" } else { "complete" });
+                let any_stage_completed = s.patches.values().any(|p| p.completed_stages > 0)
+                    || s.design.as_ref().is_some_and(|d| d.completed_stages > 0);
+                if partial && cfg!(feature = "cache") && any_stage_completed {
+                    eprintln!(
+                        "Run it again with --resume to continue from the answers it recorded"
+                    );
+                }
             }
         }
     };
 
     if display.reservation_capable {
         release_region_on_panic();
-        release_region_on_interrupt();
     }
+    exit_on_interrupt(display.reservation_capable);
 
     // Only a display that draws again has a size to be wrong about: appended
     // lines are never drawn twice.
@@ -2671,6 +3339,7 @@ async fn handle_review_command(
             custom_prompt,
             agent,
             report_preexisting,
+            related_preexisting,
         },
         &settings,
         Some(&progress),
@@ -2708,7 +3377,7 @@ async fn handle_review_command(
         }
     }
 
-    if result_has_error(&result) {
+    if result_is_incomplete(&result) {
         std::process::exit(3);
     }
     if result_has_high_or_critical_findings(&result) {
@@ -2860,6 +3529,28 @@ fn write_benchmark_report(
             sum.total_detection_rate_pct
         ),
     )?;
+    if sum.attribution_expected_entries > 0 {
+        write!(out, "  Attribution Acc:    ")?;
+        write_bold(
+            out,
+            &format!(
+                "{}/{} ({:.1}%)\n",
+                sum.attributed, sum.attribution_scored_entries, sum.attribution_rate_pct
+            ),
+        )?;
+    }
+    if sum.suppression_evaluated_entries > 0 {
+        write!(out, "  FP Suppression:     ")?;
+        write_bold(
+            out,
+            &format!(
+                "{}/{} ({:.1}%)\n",
+                sum.suppressed,
+                sum.suppression_evaluated_entries,
+                sum.false_positive_suppression_rate_pct
+            ),
+        )?;
+    }
 
     if sum.missed > 0 {
         writeln!(out, "\nMiss Diagnosis:")?;
@@ -2981,6 +3672,420 @@ fn write_benchmark_report(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_scan_command(
+    project: ProjectId,
+    paths: Vec<PathBuf>,
+    git_ref: Option<String>,
+    repo_override: Option<PathBuf>,
+    mut settings: Settings,
+    concurrency: usize,
+    max_files: usize,
+    max_chunks: Option<usize>,
+    exclude: Vec<String>,
+    min_severity: sashiko::db::SeverityFloor,
+    submit_bugs: bool,
+    custom_prompt: Option<String>,
+    prompts: PathBuf,
+    format: OutputFormat,
+    color: ColorMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let terminal = terminfo::Database::from_env().ok();
+    let report = OutputStream::detect(color, &std::io::stdout(), terminal.as_ref());
+
+    #[cfg(not(feature = "server"))]
+    if submit_bugs {
+        return Err(
+            "--submit-bugs requires a sashiko binary built with the 'server' feature enabled"
+                .into(),
+        );
+    }
+
+    if submit_bugs && settings.database.url.trim().is_empty() {
+        return Err(
+            "database.url must be configured in Settings.toml when --submit-bugs is enabled".into(),
+        );
+    }
+
+    let repo_path = if let Some(repo) = repo_override {
+        repo
+    } else if let Ok(top) = current_git_toplevel() {
+        top
+    } else if !settings.git.repository_path.trim().is_empty() {
+        PathBuf::from(&settings.git.repository_path)
+    } else {
+        return Err(
+            "could not determine git repository path; pass --repo <PATH> or run inside a git checkout"
+                .into(),
+        );
+    };
+    settings.git.repository_path = repo_path.to_string_lossy().into_owned();
+    sashiko::ai::validate_provider_credentials(&settings.ai)?;
+
+    if sashiko::maintainers::get_global_maintainers().is_none() {
+        let repo_for_maintainers = repo_path.clone();
+        if let Ok(idx) = tokio::task::spawn_blocking(move || {
+            sashiko::maintainers::MaintainersIndex::load_for_project(project, &repo_for_maintainers)
+        })
+        .await
+            && idx.is_ready_for_reconcile()
+        {
+            sashiko::maintainers::init_global_maintainers(idx);
+        }
+    }
+
+    let progress = move |event: sashiko::scan::ScanProgressEvent| match event {
+        sashiko::scan::ScanProgressEvent::ResolvedTargets {
+            target_sha,
+            files_count,
+            chunks_count,
+        } => {
+            eprintln!(
+                "Scanning {} file(s) ({} chunk(s)) at {}...",
+                files_count,
+                chunks_count,
+                &target_sha[..target_sha.len().min(12)]
+            );
+        }
+        sashiko::scan::ScanProgressEvent::ChunkStarted {
+            chunk_id,
+            start_line,
+            end_line,
+            ..
+        } => {
+            eprintln!("  [Scan] {} (lines {}..{})", chunk_id, start_line, end_line);
+        }
+        sashiko::scan::ScanProgressEvent::ChunkStageStarted { chunk_id, stage } => {
+            eprintln!("  [Scan] {} -> {}", chunk_id, stage);
+        }
+        sashiko::scan::ScanProgressEvent::ChunkFinished {
+            chunk_id,
+            findings_count,
+            early_exited,
+        } => {
+            if early_exited {
+                eprintln!("  [Scan] {} | Early exit (benign)", chunk_id);
+            } else {
+                eprintln!(
+                    "  [Scan] {} | Finished ({} candidate finding(s))",
+                    chunk_id, findings_count
+                );
+            }
+        }
+        sashiko::scan::ScanProgressEvent::ChunkFailed { chunk_id, error } => {
+            eprintln!("  [Scan] {} | Failed: {}", chunk_id, error);
+        }
+        sashiko::scan::ScanProgressEvent::CandidateVerifyStarted {
+            index,
+            total,
+            problem,
+        } => {
+            eprintln!("  [Verify] ({}/{}) {}", index, total, problem);
+        }
+        sashiko::scan::ScanProgressEvent::CandidateVerified {
+            canonical_title,
+            severity,
+        } => {
+            eprintln!("  [Verify] {} | Verified ({})", canonical_title, severity);
+        }
+        sashiko::scan::ScanProgressEvent::CandidateDiscarded { problem, reason } => {
+            eprintln!("  [Verify] {} | Discarded ({})", problem, reason);
+        }
+        sashiko::scan::ScanProgressEvent::CandidateFailed { problem, error } => {
+            eprintln!("  [BugPipeline] Failed to verify '{}': {}", problem, error);
+        }
+        sashiko::scan::ScanProgressEvent::BugSubmitted {
+            canonical_title,
+            bugid,
+            is_duplicate,
+        } => {
+            if is_duplicate {
+                eprintln!("  [BugRepo] Duplicate of {} ({})", bugid, canonical_title);
+            } else {
+                eprintln!("  [BugRepo] Opened {} ({})", bugid, canonical_title);
+            }
+        }
+    };
+
+    exit_on_interrupt(false);
+
+    let summary = sashiko::scan::run_scan(
+        sashiko::scan::ScanOptions {
+            project,
+            repo_path,
+            paths,
+            git_ref,
+            concurrency,
+            max_files,
+            max_chunks,
+            exclude,
+            min_severity,
+            submit_bugs,
+            prompts,
+            custom_prompt,
+            stages: settings.review.stages.clone(),
+            effort: settings.effective_effort(),
+        },
+        &settings,
+        Some(&progress),
+    )
+    .await?;
+
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        OutputFormat::Text => {
+            let mut stdout = StandardStream::stdout(report.color);
+            write_scan_result(&mut stdout, &summary)?;
+        }
+    }
+
+    let code = scan_exit_code(&summary);
+    if code != 0 {
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "server")]
+#[allow(clippy::too_many_arguments)]
+async fn handle_bugs_evaluate_security_command(
+    project: ProjectId,
+    bug: Option<String>,
+    limit: usize,
+    re_evaluate: bool,
+    concurrency_override: Option<usize>,
+    db_override: Option<PathBuf>,
+    mut settings: Settings,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(db_path) = db_override {
+        settings.database.url = db_path.to_string_lossy().into_owned();
+    }
+    if settings.database.url.trim().is_empty() {
+        return Err(
+            "[database] url must be set in Settings.toml or supplied via --db <PATH>".into(),
+        );
+    }
+
+    let db = Arc::new(Database::new(&settings.database).await?);
+    db.migrate().await?;
+
+    let provider = sashiko::ai::create_provider(&settings)?;
+    let concurrency = concurrency_override
+        .unwrap_or(settings.linux_bug.concurrency)
+        .max(1);
+    let worker = sashiko::worker::bug_worker::BugWorker::new(
+        db.clone(),
+        provider,
+        settings.git.repository_path.clone(),
+    )
+    .with_project(project)
+    .with_settings(settings.linux_bug.clone())
+    .with_effort(settings.effective_effort())
+    .with_max_interactions(settings.ai.max_interactions);
+
+    exit_on_interrupt(false);
+
+    if let Some(bug_ref) = bug {
+        let res = worker.evaluate_single_bug_security(&bug_ref).await;
+        sashiko::ai::cli_common::kill_live_groups();
+        let (updated_bug, evaluation) = res?;
+        match format {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "bugid": updated_bug.bugid,
+                        "title": updated_bug.problem(),
+                        "lifecycle_status": updated_bug.lifecycle_status,
+                        "security_evaluation": evaluation,
+                    }))?
+                );
+            }
+            OutputFormat::Text => {
+                println!(
+                    "{}: {} {:.1} ({})",
+                    updated_bug.bugid,
+                    evaluation.qualitative_rating,
+                    evaluation.score,
+                    evaluation.security_class
+                );
+                if let Some(ref vec) = evaluation.cvss_vector {
+                    println!("  CVSS v4.0: {vec}");
+                }
+                if let (Some(v31_vec), Some(v31_score)) =
+                    (&evaluation.cvss_v31_vector, evaluation.cvss_v31_score)
+                {
+                    println!("  CVSS v3.1: {v31_vec} ({v31_score:.1})");
+                }
+                println!("  Summary:   {}", evaluation.summary);
+            }
+        }
+        return Ok(());
+    }
+
+    let queued_for_reeval = if re_evaluate {
+        let queue_cap = if limit == usize::MAX {
+            None
+        } else {
+            Some(limit)
+        };
+        db.queue_bugs_for_security_reeval(queue_cap).await?
+    } else {
+        0
+    };
+
+    let (succeeded, failed) = worker
+        .evaluate_bugs_security_batch(limit, concurrency)
+        .await;
+    sashiko::ai::cli_common::kill_live_groups();
+    match format {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "queued_for_reevaluation": queued_for_reeval,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                }))?
+            );
+        }
+        OutputFormat::Text => {
+            if re_evaluate {
+                println!("Queued {queued_for_reeval} bug(s) for security re-evaluation.");
+            }
+            println!("Security evaluation complete: {succeeded} succeeded, {failed} failed.");
+        }
+    }
+
+    if failed > 0 && succeeded == 0 {
+        return Err(format!("all {failed} security evaluation(s) failed").into());
+    }
+    Ok(())
+}
+
+fn scan_exit_code(summary: &sashiko::scan::ScanSummary) -> i32 {
+    if summary.chunks_failed > 0 || summary.candidates_failed > 0 {
+        3
+    } else if !summary.findings.is_empty() {
+        1
+    } else {
+        0
+    }
+}
+
+fn clean_scan_message(min_severity: Option<sashiko::db::SeverityFloor>) -> &'static str {
+    match min_severity {
+        None | Some(sashiko::db::SeverityFloor::High) => "\nNo High or Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Medium) => {
+            "\nNo Medium, High, or Critical defects found.\n"
+        }
+        Some(sashiko::db::SeverityFloor::Critical) => "\nNo Critical defects found.\n",
+        Some(sashiko::db::SeverityFloor::Low) => "\nNo verified defects found.\n",
+    }
+}
+
+fn write_scan_result(
+    out: &mut impl WriteColor,
+    summary: &sashiko::scan::ScanSummary,
+) -> std::io::Result<()> {
+    let candidate_failures_suffix = if summary.candidates_failed > 0 {
+        format!(
+            ", {} candidate verification(s) failed",
+            summary.candidates_failed
+        )
+    } else {
+        String::new()
+    };
+    writeln!(
+        out,
+        "\nScan Summary ({}): {} file(s), {} chunk(s) ({} analyzed, {} early-exited, {} failed{})",
+        &summary.target_sha[..summary.target_sha.len().min(12)],
+        summary.files_scanned,
+        summary.chunks_total,
+        summary.chunks_analyzed,
+        summary.chunks_early_exited,
+        summary.chunks_failed,
+        candidate_failures_suffix
+    )?;
+
+    let incomplete = summary.chunks_failed > 0 || summary.candidates_failed > 0;
+    if incomplete {
+        write_colored(
+            out,
+            Color::Yellow,
+            &format!(
+                "\nWarning: scan incomplete ({} chunk(s) and {} candidate verification(s) failed).\n",
+                summary.chunks_failed, summary.candidates_failed
+            ),
+        )?;
+    }
+
+    if summary.findings.is_empty() {
+        if !incomplete {
+            write_colored(out, Color::Green, clean_scan_message(summary.min_severity))?;
+        }
+    } else {
+        writeln!(out, "\nVerified Findings ({}):", summary.findings.len())?;
+        for (idx, bug) in summary.findings.iter().enumerate() {
+            writeln!(out)?;
+            write!(out, "{}. ", idx + 1)?;
+            let badge_color = if bug.severity.eq_ignore_ascii_case("Critical") {
+                Color::Red
+            } else {
+                Color::Yellow
+            };
+            write_colored(
+                out,
+                badge_color,
+                &format!("[{}]", bug.severity.to_uppercase()),
+            )?;
+            writeln!(out, " {}", bug.canonical_title)?;
+            if !bug.subsystems.is_empty() {
+                writeln!(out, "   Subsystems: {}", bug.subsystems.join(", "))?;
+            }
+            if let Some(ref intro) = bug.introduced_in_commit {
+                writeln!(out, "   Introduced: {}", intro)?;
+            }
+            if let Some(ref bugid) = bug.submitted_bugid {
+                writeln!(out, "   Bug ID:     {} (newly discovered)", bugid)?;
+            } else if let Some(ref dup_bugid) = bug.duplicate_of_bugid {
+                writeln!(out, "   Bug ID:     {} (duplicate)", dup_bugid)?;
+            }
+            if let Some(locs) = bug.locations.as_array() {
+                for loc in locs {
+                    if let Some(formatted) = format_location(loc) {
+                        writeln!(out, "   Location:   {}", formatted)?;
+                    }
+                }
+            }
+            writeln!(out)?;
+            for line in bug.canonical_description.lines() {
+                writeln!(out, "   {}", line)?;
+            }
+            if !bug.severity_explanation.trim().is_empty() {
+                writeln!(out)?;
+                writeln!(out, "   Severity Rationale:")?;
+                for line in bug.severity_explanation.lines() {
+                    writeln!(out, "   {}", line)?;
+                }
+            }
+        }
+    }
+
+    if summary.tokens_in > 0 || summary.tokens_out > 0 || summary.tokens_cached > 0 {
+        writeln!(
+            out,
+            "\nTokens: {} in / {} out / {} cached",
+            summary.tokens_in, summary.tokens_out, summary.tokens_cached
+        )?;
+    }
+    Ok(())
+}
+
 fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cwd = std::env::current_dir()?;
     let output = sashiko::git_cmd::in_dir(&cwd)
@@ -3008,6 +4113,153 @@ fn print_review_result(
     write_review_result(&mut stdout, result, input, report_preexisting)
 }
 
+/// The related pre-existing mode `sashiko review` runs in. Only the Linux
+/// workflow has the selection and disclosure-check stages, so asking for it
+/// on another project is an error rather than a review that silently
+/// reports nothing.
+fn related_preexisting_mode(
+    project: ProjectId,
+    requested: bool,
+    min_severity: sashiko::db::SeverityFloor,
+) -> Result<RelatedPreexistingMode, String> {
+    if !requested {
+        return Ok(RelatedPreexistingMode::Disabled);
+    }
+    if project != ProjectId::Linux {
+        return Err(format!(
+            "--report-related-preexisting is only supported for --project linux, not {}",
+            project.as_str()
+        ));
+    }
+    Ok(RelatedPreexistingMode::Enabled { min_severity })
+}
+
+/// Prints the related pre-existing bugs of `--report-related-preexisting`,
+/// each with the note the review wrote for the author. Like other
+/// pre-existing bugs they do not affect the exit code.
+fn write_related_preexisting(out: &mut impl WriteColor, review: &Value) -> std::io::Result<()> {
+    let Some(items) = review
+        .get("related_preexisting")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty())
+    else {
+        return Ok(());
+    };
+    writeln!(out, "\nRelated Pre-existing Findings:")?;
+    for item in items {
+        let severity = item
+            .get("severity")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown");
+        let problem = sashiko::related_preexisting::problem_of(item).trim();
+        writeln!(out, "- [{severity}] {problem}")?;
+        if let Some(note) = item.get("report_text").and_then(Value::as_str) {
+            let rendered =
+                sashiko::related_preexisting::render_report_text_with_footnote(note, None);
+            for line in rendered.trim().lines() {
+                writeln!(out, "    {line}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prints the experimental series-level design assessment when `[review] design`
+/// or `--design` was enabled. Like pre-existing findings, design concerns are
+/// advisory and do not set a non-zero exit code.
+fn write_design_assessment(out: &mut impl WriteColor, review: &Value) -> std::io::Result<()> {
+    let Some(da) = review.get("design_assessment") else {
+        return Ok(());
+    };
+    let verdict = da
+        .get("verdict")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let verdict_color = match verdict {
+        "sound" => Color::Green,
+        "much_better_alternative" => Color::Red,
+        "concerns" => Color::Yellow,
+        _ => Color::Cyan,
+    };
+
+    write!(out, "\nDesign Assessment (experimental): ")?;
+    write_colored(out, verdict_color, verdict)?;
+    writeln!(out)?;
+
+    if let Some(problem) = da
+        .get("problem_statement")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        write_indented_field(out, "Problem", problem)?;
+    }
+
+    let concerns = da
+        .get("concerns")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if concerns.is_empty() {
+        if let Some(reason) = da
+            .get("verdict_reason")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            write_indented_field(out, "Note", reason)?;
+        }
+        return Ok(());
+    }
+
+    for item in concerns {
+        let sig = item
+            .get("significance")
+            .and_then(Value::as_str)
+            .unwrap_or("important")
+            .to_ascii_uppercase();
+        let cat = item
+            .get("category")
+            .and_then(Value::as_str)
+            .unwrap_or("other");
+        let summary = item
+            .get("summary")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let patch_prefix = item
+            .get("patch_index")
+            .and_then(Value::as_u64)
+            .map(|idx| format!("Patch {idx}: "))
+            .unwrap_or_default();
+
+        writeln!(out, "- [{sig} | {cat}] {patch_prefix}{summary}")?;
+        if let Some(req) = item
+            .get("request")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            write_indented_field(out, "Request", req)?;
+        }
+        if let Some(anchors) = item.get("anchors").and_then(Value::as_array) {
+            for anchor in anchors.iter().take(2) {
+                let kind = anchor.get("kind").and_then(Value::as_str).unwrap_or("");
+                let reference = anchor.get("ref").and_then(Value::as_str).unwrap_or("");
+                let quote = anchor
+                    .get("quote")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if !reference.is_empty() && !quote.is_empty() {
+                    writeln!(out, "    Anchor ({kind} {reference}): {quote}")?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn write_review_result(
     out: &mut impl WriteColor,
     result: &Value,
@@ -3020,6 +4272,17 @@ fn write_review_result(
         writeln!(out)?;
         write_colored(out, Color::Red, "Error: ")?;
         writeln!(out, "{}", error)?;
+    }
+    for lost in result_failed_stages(result) {
+        let field = |key: &str| lost.get(key).and_then(Value::as_str).unwrap_or("?");
+        write_colored(out, Color::Red, "\nIncomplete: ")?;
+        writeln!(
+            out,
+            "patch {} lost stage '{}': {}",
+            lost.get("patch_index").and_then(Value::as_i64).unwrap_or(0),
+            field("stage"),
+            field("error")
+        )?;
     }
 
     let Some(review) = result.get("review") else {
@@ -3034,14 +4297,26 @@ fn write_review_result(
 
     let counts = count_findings_slice(&patch_findings);
     let total = counts.critical + counts.high + counts.medium + counts.low;
-    let has_preexisting = report_preexisting && !preexisting_findings.is_empty();
+    let has_related = review
+        .get("related_preexisting")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
+    let has_preexisting = (report_preexisting && !preexisting_findings.is_empty()) || has_related;
+    let has_design_concerns = review
+        .get("design_assessment")
+        .and_then(|da| da.get("concerns"))
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty());
 
-    if total == 0 && !result_has_error(result) {
-        write_colored(
-            out,
-            Color::Green,
-            no_patch_findings_message(has_preexisting),
-        )?;
+    if total == 0 && !result_is_incomplete(result) {
+        let msg = if has_preexisting {
+            no_patch_findings_message(true)
+        } else if has_design_concerns {
+            "\nNo bug findings.\n"
+        } else {
+            no_patch_findings_message(false)
+        };
+        write_colored(out, Color::Green, msg)?;
     } else if total > 0 {
         writeln!(out, "\nFindings:")?;
         write_finding_counts(out, &counts)?;
@@ -3054,6 +4329,9 @@ fn write_review_result(
         write_finding_counts(out, &preexisting_counts)?;
         write_grouped_findings(out, &preexisting_findings, true)?;
     }
+
+    write_related_preexisting(out, review)?;
+    write_design_assessment(out, review)?;
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
         && !inline.trim().is_empty()
@@ -3324,6 +4602,7 @@ fn eprint_colored(color_choice: ColorChoice, color: Color, text: &str) -> std::i
 }
 
 #[cfg(feature = "server")]
+#[derive(Debug, PartialEq, Eq)]
 enum ProcessStatus {
     Ingested,
     Error,
@@ -3346,6 +4625,7 @@ async fn process_parsed_article(
     git_patch_id: Option<String>,
     policy: &sashiko::email_policy::EmailPolicyConfig,
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
+    review_settings: &sashiko::settings::ReviewSettings,
 ) -> ProcessStatus {
     let ParsedArticle {
         group,
@@ -3369,7 +4649,7 @@ async fn process_parsed_article(
 
     // Handle ingestion failure
     if let Some(err) = failed_error {
-        info!("Handling ingestion failure for {}: {}", article_id, err);
+        debug!("Handling ingestion failure for {}: {}", article_id, err);
         if let Err(e) = worker_db.update_patchset_error(&root_msg_id, &err).await {
             error!("Failed to update patchset error in DB: {}", e);
         }
@@ -3395,13 +4675,37 @@ async fn process_parsed_article(
 
     if sashiko::email_router::EmailRouter::is_ignored_author(policy, &author_email) {
         if metadata.is_patch_or_cover {
-            info!(
+            debug!(
                 "Ignoring patch/cover from {} according to email policy",
                 author_email
             );
         }
         metadata.is_patch_or_cover = false;
         patch_opt = None;
+    }
+
+    if source == MessageSource::Nntp
+        && (metadata.is_patch_or_cover || patch_opt.is_some())
+        && let Some(ingest_filter) = policy.ingest_filter_for_nntp_group(&group)
+    {
+        let subject_prefixes = sashiko::patch::get_subject_prefixes(&metadata.subject);
+        let touched_paths = match patch_opt.as_ref() {
+            Some(p) => sashiko::baseline::extract_files_from_diff(&p.diff),
+            None if metadata.index == 0 => {
+                sashiko::patch::extract_files_from_diffstat(&metadata.body)
+            }
+            None => Vec::new(),
+        };
+        if !ingest_filter.allows_submission(&subject_prefixes, &touched_paths) {
+            tracing::debug!(
+                "Skipping non-matching NNTP patch/cover {} in {} (subject: {:?})",
+                metadata.message_id,
+                group,
+                metadata.subject
+            );
+            metadata.is_patch_or_cover = false;
+            patch_opt = None;
+        }
     }
 
     // Resolve baseline ID if provided.  A baseline that does not name an
@@ -3570,10 +4874,7 @@ async fn process_parsed_article(
     let maintainer_sections: Vec<sashiko::db::AttributedSubsystem> = patch_opt
         .as_ref()
         .map(|p| sashiko::maintainers::sections_for_diff(&p.diff))
-        .unwrap_or_default()
-        .into_iter()
-        .map(sashiko::db::AttributedSubsystem::from_maintainers)
-        .collect();
+        .unwrap_or_default();
 
     if group.starts_with("git-import") || group == "git-fetch" {
         let (label, email) = if let Some(url) = &mr_url {
@@ -3652,11 +4953,55 @@ async fn process_parsed_article(
     } else {
         metadata.subject.clone()
     };
-    info!(
+    debug!(
         "Article: group={}, id={}, author={}, subject=\"{}\"",
         group, article_id, metadata.author, subject
     );
     */
+
+    if !metadata.is_patch_or_cover
+        && let Some(ref patch) = patch_opt
+        && metadata.index == 1
+        && metadata.total == 1
+        && sashiko::patch::is_promotable_reply_patch_subject(&metadata.subject)
+    {
+        match worker_db
+            .find_in_thread_followup_version(
+                thread_id,
+                &metadata.message_id,
+                &metadata.author,
+                &metadata.subject,
+                git_patch_id.as_deref(),
+                &patch.diff,
+            )
+            .await
+        {
+            Ok(Some(next_version)) => {
+                metadata.is_patch_or_cover = true;
+                metadata.version = Some(next_version);
+                metadata.subject =
+                    sashiko::patch::promote_reply_patch_subject(&metadata.subject, next_version);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to check in-thread follow-up version for {}: {}",
+                    metadata.message_id, e
+                );
+                error!("{}", err_msg);
+                fail_fetching_patchset_logged(worker_db, &root_msg_id, &err_msg).await;
+                if root_msg_id != metadata.message_id {
+                    fail_fetching_patchset_logged(worker_db, &metadata.message_id, &err_msg).await;
+                }
+                if let Some(ref reply_to) = metadata.in_reply_to
+                    && reply_to != &root_msg_id
+                {
+                    fail_fetching_patchset_logged(worker_db, reply_to, &err_msg).await;
+                }
+                return ProcessStatus::Error;
+            }
+        }
+    }
 
     let cover_letter_id: Option<String> = if group == "git-fetch" {
         // Always use root_msg_id for git-fetch to match the placeholder ID
@@ -3717,7 +5062,7 @@ async fn process_parsed_article(
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
             let mr_ver = worker_db
-                .get_mr_version_for_commit_range(*number, &root_msg_id)
+                .get_mr_version_for_commit_range_in_repo(*number, mr_url.as_deref(), &root_msg_id)
                 .await
                 .unwrap_or(1);
             (
@@ -3752,7 +5097,7 @@ async fn process_parsed_article(
         };
 
         match worker_db
-            .create_patchset(
+            .create_patchset_with_default_priority(
                 thread_id,
                 cover_letter_id.as_deref(),
                 metadata.message_id.as_str(),
@@ -3772,10 +5117,18 @@ async fn process_parsed_article(
                 strict_author,
                 skip_filters.as_ref(),
                 only_filters.as_ref(),
+                review_settings.default_priority,
             )
             .await
         {
             Ok(Some(patchset_id)) => {
+                if let Some(cid) = sashiko::patch::parse_b4_change_id(&metadata.body)
+                    && let Err(e) = worker_db
+                        .set_patchset_change_id_if_unset(patchset_id, &cid)
+                        .await
+                {
+                    warn!("Failed to set change_id on patchset {}: {}", patchset_id, e);
+                }
                 if mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
                     let slug = if let (Some(url), Some(num)) = (&mr_url, mr_number) {
                         sashiko::forge::extract_repo_name_from_mr_url(url)
@@ -3813,6 +5166,70 @@ async fn process_parsed_article(
                     }
                 }
 
+                let priority = review_settings.calculate_priority(&subject);
+                if let Err(e) = worker_db
+                    .update_patchset_priority_on_ingest(
+                        patchset_id,
+                        priority,
+                        review_settings.default_priority,
+                    )
+                    .await
+                {
+                    warn!("Failed to set priority on patchset {}: {}", patchset_id, e);
+                }
+
+                if review_settings.batch_window_secs > 0 && !review_settings.batch_tiers.is_empty()
+                {
+                    let (series_author, series_date) =
+                        match worker_db.get_patchset_author_and_date(patchset_id).await {
+                            Ok(Some((a, d))) => (a, d),
+                            _ => (
+                                author.clone(),
+                                metadata.received_date.unwrap_or(metadata.date),
+                            ),
+                        };
+                    let window_duration = review_settings.batch_window_secs as i64;
+                    let window_start = series_date.saturating_sub(window_duration);
+                    let window_end = series_date.saturating_add(window_duration);
+                    match worker_db
+                        .count_recent_patchsets_by_author(&series_author, window_start, window_end)
+                        .await
+                    {
+                        Ok(count) => {
+                            let mut matched_priority: Option<i64> = None;
+                            for tier in &review_settings.batch_tiers {
+                                if count >= tier.min_size {
+                                    matched_priority = Some(match matched_priority {
+                                        Some(p) => p.min(tier.priority),
+                                        None => tier.priority,
+                                    });
+                                }
+                            }
+                            if let Some(batch_prio) = matched_priority
+                                && let Err(e) = worker_db
+                                    .deprioritize_author_batch(
+                                        &series_author,
+                                        window_start,
+                                        window_end,
+                                        batch_prio,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    "Failed to deprioritize author batch for {}: {}",
+                                    series_author, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to count recent patchsets for {}: {}",
+                                series_author, e
+                            );
+                        }
+                    }
+                }
+
                 for &sid in &subsystem_ids {
                     if let Err(e) = worker_db.add_subsystem_to_patchset(patchset_id, sid).await {
                         error!("Failed to link patchset to subsystem: {}", e);
@@ -3835,6 +5252,9 @@ async fn process_parsed_article(
                         patchset_id, e
                     );
                 }
+                if let Ok(true) = worker_db.record_patchset_ingested_rollup(patchset_id).await {
+                    sashiko::metrics::inc_patchsets_ingested(1);
+                }
 
                 if let Some(patch) = patch_opt {
                     match worker_db
@@ -3854,6 +5274,10 @@ async fn process_parsed_article(
                                 {
                                     error!("Failed to link patch to subsystem: {}", e);
                                 }
+                            }
+                            if let Ok(true) = worker_db.record_patch_ingested_rollup(patch_id).await
+                            {
+                                sashiko::metrics::inc_patches_ingested(1);
                             }
                         }
                         Err(e) => {
@@ -4058,6 +5482,73 @@ fn resolve_root_msg_id(source: MessageSource, article_id: &str) -> String {
     }
 }
 
+/// A raw mbox accepted over the API, before it is split into articles.
+#[cfg(feature = "server")]
+struct RawMboxSubmission {
+    raw: String,
+    submission_id: String,
+    source: MessageSource,
+    group: String,
+    baseline: Option<String>,
+    skip_subjects: Option<Vec<String>>,
+    only_subjects: Option<Vec<String>>,
+    submitted_at: Option<i64>,
+}
+
+#[cfg(feature = "server")]
+impl RawMboxSubmission {
+    /// Splits and parses the mbox into articles that all carry the submission
+    /// ID, which is what lets the grouping logic tie the messages together.
+    /// Returns None when the mbox exceeds the message limit.
+    fn into_articles(self) -> Option<Vec<ParsedArticle>> {
+        let messages = sashiko::ingestor::split_mbox(self.raw.as_bytes());
+        let count = messages.len();
+        if count > 100 {
+            error!(
+                "Too many messages in mbox submission: {} (limit 100)",
+                count
+            );
+            return None;
+        }
+        info!("Processing {} messages from raw mbox submission", count);
+
+        let mut articles = Vec::with_capacity(count);
+        for msg_raw in messages {
+            match sashiko::patch::parse_email(&msg_raw) {
+                Ok((mut metadata, patch)) => {
+                    if self.submitted_at.is_some() {
+                        metadata.received_date = self.submitted_at;
+                    }
+                    articles.push(ParsedArticle {
+                        // The group stays "api-submit" so grouping logic triggers.
+                        group: self.group.clone(),
+                        article_id: self.submission_id.clone(),
+                        source: self.source,
+                        metadata: Some(metadata),
+                        patch,
+                        baseline: self.baseline.clone(),
+                        failed_error: None,
+                        skip_filters: self.skip_subjects.clone(),
+                        only_filters: self.only_subjects.clone(),
+                        mr_url: None,
+                        mr_title: None,
+                        mr_number: None,
+                        receipt: None,
+                    });
+                }
+                Err(e) => {
+                    debug!(
+                        "Parse error for {}: {}",
+                        sashiko::ingestor::extract_message_id(&msg_raw),
+                        e
+                    );
+                }
+            }
+        }
+        Some(articles)
+    }
+}
+
 #[cfg(feature = "server")]
 fn is_strict_author(source: MessageSource, total_parts: u32) -> bool {
     match source {
@@ -4100,17 +5591,15 @@ fn identify_subsystems(
             }
         }
 
-        // Fallback for known kernel lists if no mapping is provided
+        // Fallback for known mailing lists if no mapping is provided
         if !matched {
             let bare_email = sashiko::email_policy::extract_bare_email(&lower_email);
             if bare_email == "linux-kernel@vger.kernel.org" {
                 subsystems.push(("LKML".to_string(), bare_email));
             } else if bare_email == "netdev@vger.kernel.org" {
                 subsystems.push(("netdev".to_string(), bare_email));
-            } else if let Some((name, domain)) = bare_email.split_once('@')
-                && sashiko::email_router::KNOWN_MAILING_LIST_DOMAINS
-                    .iter()
-                    .any(|&d| d.eq_ignore_ascii_case(domain))
+            } else if sashiko::email_router::is_known_mailing_list_bare(&bare_email)
+                && let Some((name, _)) = bare_email.split_once('@')
             {
                 subsystems.push((name.to_string(), bare_email));
             }
@@ -4158,6 +5647,9 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "server")]
+    mod api_injection;
+
     use super::*;
 
     #[test]
@@ -4251,7 +5743,9 @@ mod tests {
         ProgressState {
             project: ProjectId::Linux,
             patches: std::collections::BTreeMap::new(),
+            design: None,
             last_status: std::collections::BTreeMap::new(),
+            last_design_status: None,
             total_turns: 0,
             terminal_width: display.size.1,
             terminal_rows: display.size.0,
@@ -5035,6 +6529,158 @@ mod tests {
     }
 
     #[test]
+    fn test_review_parses_related_preexisting_flags() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["sashiko", "review"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all)
+        };
+        let Some(Commands::Review {
+            report_related_preexisting,
+            related_preexisting_min_severity,
+            ..
+        }) = parse(&["--report-related-preexisting"]).unwrap().command
+        else {
+            panic!("expected the review subcommand");
+        };
+        assert!(report_related_preexisting);
+        assert_eq!(
+            related_preexisting_min_severity,
+            sashiko::db::SeverityFloor::High
+        );
+
+        let Some(Commands::Review {
+            related_preexisting_min_severity,
+            ..
+        }) = parse(&[
+            "--report-related-preexisting",
+            "--related-preexisting-min-severity",
+            "medium",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected the review subcommand");
+        };
+        assert_eq!(
+            related_preexisting_min_severity,
+            sashiko::db::SeverityFloor::Medium
+        );
+
+        assert!(parse(&["--report-preexisting", "--report-related-preexisting"]).is_err());
+        assert!(parse(&["--related-preexisting-min-severity", "low"]).is_err());
+    }
+
+    #[test]
+    fn test_related_preexisting_mode_is_linux_only() {
+        use sashiko::db::SeverityFloor;
+        assert_eq!(
+            related_preexisting_mode(ProjectId::Sashiko, false, SeverityFloor::High),
+            Ok(RelatedPreexistingMode::Disabled)
+        );
+        assert_eq!(
+            related_preexisting_mode(ProjectId::Linux, true, SeverityFloor::Medium),
+            Ok(RelatedPreexistingMode::Enabled {
+                min_severity: SeverityFloor::Medium
+            })
+        );
+        let err = related_preexisting_mode(ProjectId::Qemu, true, SeverityFloor::High).unwrap_err();
+        assert!(err.contains("only supported for --project linux"), "{err}");
+    }
+
+    #[test]
+    fn test_write_review_result_renders_related_preexisting() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "related_preexisting": [{
+                    "description": "mm: lock held on the -EINVAL return",
+                    "severity": "High",
+                    "report_text": "> return -EINVAL;\n\nNot introduced by this patch, but ...",
+                }],
+            },
+        });
+        let mut out = termcolor::NoColor::new(Vec::new());
+        write_review_result(&mut out, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(text.contains("Related Pre-existing Findings:"), "{text}");
+        assert!(text.contains("No patch-introduced issues found."), "{text}");
+        assert!(
+            text.contains("- [High] mm: lock held on the -EINVAL return"),
+            "{text}"
+        );
+        assert!(text.contains("    > return -EINVAL;"), "{text}");
+    }
+
+    #[test]
+    fn test_write_review_result_names_a_lost_stage() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "failed_stages": [{
+                    "stage": "execution-flow",
+                    "error": "LLM output was truncated by provider (e.g. hit max tokens)",
+                    "patch_index": 1,
+                }],
+            },
+        });
+        let mut out = termcolor::NoColor::new(Vec::new());
+        write_review_result(&mut out, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(out.into_inner()).unwrap();
+        assert!(
+            text.contains(
+                "Incomplete: patch 1 lost stage 'execution-flow': LLM output was truncated"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("No issues found"), "{text}");
+        assert!(!text.contains("No patch-introduced issues found"), "{text}");
+    }
+
+    #[test]
+    fn test_worker_parses_the_related_preexisting_floor() {
+        let cli = Cli::try_parse_from([
+            "sashiko",
+            "worker",
+            "--related-preexisting-min-severity",
+            "High",
+        ])
+        .unwrap();
+        let Some(Commands::Worker {
+            related_preexisting_min_severity,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected the worker subcommand");
+        };
+        assert_eq!(
+            related_preexisting_min_severity,
+            Some(sashiko::db::SeverityFloor::High)
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "sashiko",
+                "worker",
+                "--related-preexisting-min-severity",
+                "unknown",
+            ])
+            .is_err()
+        );
+        // Reporting every pre-existing bug and only related ones are exclusive.
+        assert!(
+            Cli::try_parse_from([
+                "sashiko",
+                "worker",
+                "--report-preexisting",
+                "--related-preexisting-min-severity",
+                "high",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn test_cli_parsing() {
         let args = vec!["sashiko", "--download", "100", "--track", "--no-api"];
         let cli = Cli::parse_from(args);
@@ -5141,6 +6787,7 @@ mod tests {
             "--baseline",
             "main",
             "--no-ai",
+            "--resume",
             "--report-preexisting",
             "--format",
             "json",
@@ -5155,6 +6802,7 @@ mod tests {
                 baseline,
                 settings,
                 no_ai,
+                resume,
                 report_preexisting,
                 format,
                 agent,
@@ -5165,6 +6813,7 @@ mod tests {
                 assert_eq!(baseline.as_deref(), Some("main"));
                 assert!(settings.is_none());
                 assert!(no_ai);
+                assert!(resume);
                 assert!(report_preexisting);
                 assert!(matches!(format, OutputFormat::Json));
                 assert!(agent);
@@ -5178,12 +6827,73 @@ mod tests {
 
         let after = Cli::parse_from(["sashiko", "review", "--effort", "dynamic"]);
         assert_eq!(cli_overrides(&after).effort, Some(EffortMode::Dynamic));
+        assert!(!cli_overrides(&after).cheap);
+
+        let cheap = Cli::parse_from(["sashiko", "review", "--cheap"]);
+        assert!(cli_overrides(&cheap).cheap);
+        assert!(!cli_overrides(&cheap).design);
+
+        let design = Cli::parse_from(["sashiko", "review", "--design"]);
+        assert!(cli_overrides(&design).design);
+    }
+
+    #[test]
+    fn test_write_review_result_renders_design_assessment_section() {
+        let result = serde_json::json!({
+            "review": {
+                "findings": [],
+                "design_assessment": {
+                    "verdict": "concerns",
+                    "verdict_reason": "Module parameter adds driver-specific uAPI.",
+                    "problem_statement": "Device resets under heavy polling need configurable rx copybreak thresholds.",
+                    "comparison_summary": "Ethtool netlink already exposes rx-copybreak.",
+                    "concerns": [
+                        {
+                            "category": "interface",
+                            "patch_index": 1,
+                            "disposition": "stands",
+                            "significance": "important",
+                            "confidence": "high",
+                            "summary": "Exposes rx_copybreak via module_param instead of ethtool.",
+                            "request": "Implement tunable RX_COPYBREAK via ethtool_ops.",
+                            "quote": "module_param(rx_copybreak, uint, 0644);",
+                            "anchors": [
+                                {
+                                    "kind": "maintainer_note",
+                                    "ref": "netdev.md",
+                                    "quote": "Do not add new module parameters in network drivers."
+                                }
+                            ],
+                            "reasoning": "Violates netdev uAPI policy."
+                        }
+                    ],
+                    "all_candidates": [],
+                    "dismissed_concerns": []
+                }
+            },
+            "tokens_in": 100,
+            "tokens_out": 20,
+            "tokens_cached": 50
+        });
+
+        let mut buf = termcolor::Buffer::no_color();
+        write_review_result(&mut buf, &result, "HEAD", false).unwrap();
+        let text = String::from_utf8(buf.into_inner()).unwrap();
+        assert!(text.contains("\nNo bug findings.\n"));
+        assert!(text.contains("Design Assessment (experimental): concerns"));
+        assert!(text.contains("[IMPORTANT | interface] Patch 1: Exposes rx_copybreak"));
+        assert!(text.contains("Request: Implement tunable RX_COPYBREAK via ethtool_ops."));
+        assert!(text.contains("Anchor (maintainer_note netdev.md): Do not add new module"));
+        assert!(!result_has_high_or_critical_findings(&result));
     }
 
     #[test]
     fn test_cli_benchmark() {
-        let positional =
-            Cli::parse_from(["sashiko", "benchmark", "benchmarks/benchmark_smoke.json"]);
+        let positional = Cli::parse_from([
+            "sashiko",
+            "benchmark",
+            "projects/linux/benchmarks/benchmark_tiny.json",
+        ]);
         match &positional.command {
             Some(Commands::Benchmark {
                 file,
@@ -5194,7 +6904,7 @@ mod tests {
             }) => {
                 assert_eq!(
                     file.as_deref(),
-                    Some(Path::new("benchmarks/benchmark_smoke.json"))
+                    Some(Path::new("projects/linux/benchmarks/benchmark_tiny.json"))
                 );
                 assert!(file_flag.is_none());
                 assert!(!analyze_only);
@@ -5207,7 +6917,7 @@ mod tests {
             "sashiko",
             "benchmark",
             "--file",
-            "benchmarks/benchmark_tiny.json",
+            "projects/linux/benchmarks/benchmark_small.json",
             "--analyze-only",
             "--concurrency",
             "4",
@@ -5234,7 +6944,7 @@ mod tests {
                 assert!(file.is_none());
                 assert_eq!(
                     file_flag.as_deref(),
-                    Some(Path::new("benchmarks/benchmark_tiny.json"))
+                    Some(Path::new("projects/linux/benchmarks/benchmark_small.json"))
                 );
                 assert!(analyze_only);
                 assert_eq!(concurrency, Some(4));
@@ -5330,6 +7040,21 @@ mod tests {
             "b.a.t.m.a.n".to_string(),
             "b.a.t.m.a.n@lists.open-mesh.org".to_string()
         )));
+
+        // GCC shared domain: public mailing lists match, personal developer emails do not.
+        let gcc_to = "gcc-patches@gcc.gnu.org, fortran@gcc.gnu.org";
+        let gcc_cc = "Jakub Jelinek <jakub@gcc.gnu.org>, rguenth@gcc.gnu.org";
+        let gcc_subsystems = identify_subsystems(gcc_to, gcc_cc, &[]);
+        assert_eq!(
+            gcc_subsystems,
+            vec![
+                ("fortran".to_string(), "fortran@gcc.gnu.org".to_string()),
+                (
+                    "gcc-patches".to_string(),
+                    "gcc-patches@gcc.gnu.org".to_string()
+                ),
+            ]
+        );
     }
 
     #[cfg(feature = "server")]
@@ -5589,5 +7314,698 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_run, 1);
         supervisor.abort();
+    }
+
+    #[cfg(feature = "server")]
+    async fn test_db() -> Database {
+        let db = Database::new(&sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_submission(
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) -> Database {
+        let db = test_db().await;
+        ingest_api_messages(&db, source, submission_id, messages).await;
+        db
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+    ) {
+        ingest_api_messages_at(db, source, submission_id, messages, 2000).await;
+    }
+
+    #[cfg(feature = "server")]
+    async fn ingest_api_messages_at(
+        db: &Database,
+        source: MessageSource,
+        submission_id: &str,
+        messages: &[&[u8]],
+        received_date: i64,
+    ) {
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let review_settings = Settings::new().unwrap().review;
+
+        for raw in messages {
+            let (mut metadata, patch) = sashiko::patch::parse_email(raw).unwrap();
+            metadata.received_date = Some(received_date);
+            let article = ParsedArticle {
+                group: "api-submit".to_string(),
+                article_id: submission_id.to_string(),
+                source,
+                metadata: Some(metadata),
+                patch,
+                baseline: None,
+                failed_error: None,
+                skip_filters: None,
+                only_filters: None,
+                mr_url: None,
+                mr_title: None,
+                mr_number: None,
+                receipt: None,
+            };
+            assert_eq!(
+                process_parsed_article(db, article, None, &policy, &[], &review_settings).await,
+                ProcessStatus::Ingested
+            );
+        }
+    }
+
+    #[cfg(feature = "server")]
+    async fn assert_single_patch_submission_resolves(
+        db: &Database,
+        submission_id: &str,
+        identity: &str,
+    ) {
+        assert_eq!(db.count_patchsets(None, None).await.unwrap(), 1);
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1, "the submission must create one patchset");
+        assert_eq!(pending[0].total_parts, Some(1));
+        assert_eq!(pending[0].received_parts, Some(1));
+        assert_eq!(pending[0].message_id.as_deref(), Some(identity));
+        let body = db
+            .get_message_body(pending[0].message_id.as_deref().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        for trailer in [
+            "base-commit: 1111111111111111111111111111111111111111",
+            "prerequisite-patch-id: 2222222222222222222222222222222222222222",
+            "prerequisite-message-id: <prerequisite@example.com>",
+            "Based-on: <base@example.com>",
+        ] {
+            assert!(body.contains(trailer), "review body must retain {trailer}");
+        }
+        let patchset_id = db
+            .find_patchset_id_by_msgid("patch@example.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending[0].id, patchset_id);
+        for msgid in [submission_id, "patch@example.com", identity] {
+            let details = db
+                .get_patchset_details_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("details must resolve for {msgid}"));
+            assert_eq!(details["id"], patchset_id);
+            let summary = db
+                .get_patchset_summary_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("summary must resolve for {msgid}"));
+            assert_eq!(summary["id"], patchset_id);
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_inject_single_patch_resolves_submission_id() {
+        let submission_id = "sashiko-inject-single@sashiko.local";
+        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\nbase-commit: 1111111111111111111111111111111111111111\nprerequisite-patch-id: 2222222222222222222222222222222222222222\nprerequisite-message-id: <prerequisite@example.com>\nBased-on: <base@example.com>\n";
+        let db = ingest_api_submission(MessageSource::ApiInject, submission_id, &[raw]).await;
+        assert_single_patch_submission_resolves(&db, submission_id, "patch@example.com").await;
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_inject_single_patch_with_cover_resolves_submission_id() {
+        let submission_id = "sashiko-inject-cover@sashiko.local";
+        let cover: &[u8] = b"Message-ID: <cover@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 0/1] Fix a bug\r\n\r\nCover letter\r\nbase-commit: 1111111111111111111111111111111111111111\nprerequisite-patch-id: 2222222222222222222222222222222222222222\nprerequisite-message-id: <prerequisite@example.com>\nBased-on: <base@example.com>\n";
+        let patch: &[u8] = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH 1/1] Fix a bug\r\nIn-Reply-To: <cover@example.com>\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        for messages in [[cover, patch], [patch, cover]] {
+            let db =
+                ingest_api_submission(MessageSource::ApiInject, submission_id, &messages).await;
+            assert_single_patch_submission_resolves(&db, submission_id, "cover@example.com").await;
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_fetch_thread_single_patch_keeps_message_identity() {
+        let raw = b"Message-ID: <patch@example.com>\r\nFrom: Author <author@example.com>\r\nSubject: [PATCH] Fix a bug\r\n\r\ndiff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        let db = ingest_api_submission(
+            MessageSource::ApiFetchThread,
+            "thread-root@example.com",
+            &[raw],
+        )
+        .await;
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].message_id.as_deref(), Some("patch@example.com"));
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_api_submit_multipart_without_cover_groups_into_single_patchset() {
+        let db_settings = sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let mapping = Vec::new();
+
+        let submission_id = "inject-multipart-test".to_string();
+        let author = "Test Author <author@example.com>".to_string();
+
+        let article1 = ParsedArticle {
+            group: "api-submit".to_string(),
+            article_id: submission_id.clone(),
+            source: MessageSource::ApiInject,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "part1@example.com".to_string(),
+                subject: "[PATCH 1/2] First part".to_string(),
+                author: author.clone(),
+                date: 1000,
+                received_date: Some(2000),
+                in_reply_to: None,
+                references: vec![],
+                index: 1,
+                total: 2,
+                to: "linux-kernel@vger.kernel.org".to_string(),
+                cc: "".to_string(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "diff 1".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "part1@example.com".to_string(),
+                body: "diff 1".to_string(),
+                diff: "diff 1".to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        let article2 = ParsedArticle {
+            group: "api-submit".to_string(),
+            article_id: submission_id.clone(),
+            source: MessageSource::ApiInject,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "part2@example.com".to_string(),
+                subject: "[PATCH 2/2] Second part".to_string(),
+                author: author.clone(),
+                date: 1001,
+                received_date: Some(2001),
+                in_reply_to: None,
+                references: vec![],
+                index: 2,
+                total: 2,
+                to: "linux-kernel@vger.kernel.org".to_string(),
+                cc: "".to_string(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "diff 2".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "part2@example.com".to_string(),
+                body: "diff 2".to_string(),
+                diff: "diff 2".to_string(),
+                part_index: 2,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        let settings = sashiko::settings::Settings::new().unwrap();
+        let review_settings = settings.review;
+
+        let status1 =
+            process_parsed_article(&db, article1, None, &policy, &mapping, &review_settings).await;
+        assert_eq!(status1, ProcessStatus::Ingested);
+
+        let status2 =
+            process_parsed_article(&db, article2, None, &policy, &mapping, &review_settings).await;
+        assert_eq!(status2, ProcessStatus::Ingested);
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "both parts must merge into a single patchset"
+        );
+        assert_eq!(pending[0].total_parts, Some(2));
+        assert_eq!(pending[0].received_parts, Some(2));
+        assert_eq!(pending[0].status.as_deref(), Some("Pending"));
+        for msgid in [
+            submission_id.as_str(),
+            "part1@example.com",
+            "part2@example.com",
+        ] {
+            let details = db
+                .get_patchset_details_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(details["id"], pending[0].id);
+            let summary = db
+                .get_patchset_summary_by_msgid(msgid, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(summary["id"], pending[0].id);
+        }
+    }
+
+    #[test]
+    fn test_cli_scan() {
+        let args = vec![
+            "sashiko",
+            "scan",
+            "fs/smb/server/",
+            "net/core/dev.c",
+            "--ref",
+            "v6.12",
+            "-m",
+            "claude-opus-4-7",
+            "--concurrency",
+            "8",
+            "--max-files",
+            "50",
+            "--max-chunks",
+            "20",
+            "--exclude",
+            "trace.h",
+            "--submit-bugs",
+            "--format",
+            "json",
+        ];
+        let cli = Cli::parse_from(args);
+        let overrides = cli_overrides(&cli);
+        assert_eq!(overrides.effort, None);
+        assert_eq!(overrides.ai_model.as_deref(), Some("claude-opus-4-7"));
+        match cli.command {
+            Some(Commands::Scan {
+                paths,
+                git_ref,
+                model,
+                concurrency,
+                max_files,
+                max_chunks,
+                exclude,
+                min_severity,
+                submit_bugs,
+                format,
+                ..
+            }) => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        PathBuf::from("fs/smb/server/"),
+                        PathBuf::from("net/core/dev.c")
+                    ]
+                );
+                assert_eq!(git_ref.as_deref(), Some("v6.12"));
+                assert_eq!(model.as_deref(), Some("claude-opus-4-7"));
+                assert_eq!(concurrency, 8);
+                assert_eq!(max_files, 50);
+                assert_eq!(max_chunks, Some(20));
+                assert_eq!(exclude, vec!["trace.h".to_string()]);
+                assert_eq!(min_severity, sashiko::db::SeverityFloor::Medium);
+                assert!(submit_bugs);
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected scan command"),
+        }
+
+        let cli_high = Cli::parse_from([
+            "sashiko",
+            "scan",
+            "mm/memcontrol.c",
+            "--min-severity",
+            "high",
+        ]);
+        match cli_high.command {
+            Some(Commands::Scan { min_severity, .. }) => {
+                assert_eq!(min_severity, sashiko::db::SeverityFloor::High);
+            }
+            _ => panic!("expected scan command"),
+        }
+    }
+
+    #[test]
+    fn test_bugs_evaluate_security_cli_parses_overrides() {
+        let args = [
+            "sashiko",
+            "bugs",
+            "evaluate-security",
+            "--all",
+            "--re-evaluate",
+            "--concurrency",
+            "16",
+            "--db",
+            "/tmp/bugs.db",
+            "--repo",
+            "/tmp/linux",
+            "-m",
+            "gemini-3-flash-preview",
+            "--effort",
+            "high",
+            "--format",
+            "json",
+        ];
+        let cli = Cli::parse_from(args);
+        let overrides = cli_overrides(&cli);
+        assert_eq!(overrides.repository_path.as_deref(), Some("/tmp/linux"));
+        assert_eq!(
+            overrides.ai_model.as_deref(),
+            Some("gemini-3-flash-preview")
+        );
+        assert_eq!(overrides.effort, Some(EffortMode::High));
+        match cli.command {
+            Some(Commands::Bugs {
+                command:
+                    BugsMainCommand::EvaluateSecurity {
+                        bug,
+                        all,
+                        re_evaluate,
+                        concurrency,
+                        db,
+                        format,
+                        ..
+                    },
+            }) => {
+                assert!(bug.is_none());
+                assert!(all);
+                assert!(re_evaluate);
+                assert_eq!(concurrency, Some(16));
+                assert_eq!(db.as_deref(), Some(Path::new("/tmp/bugs.db")));
+                assert!(matches!(format, OutputFormat::Json));
+            }
+            _ => panic!("expected bugs evaluate-security command"),
+        }
+    }
+
+    #[test]
+    fn test_scan_exit_code_and_incomplete_report() {
+        let mut summary = sashiko::scan::ScanSummary {
+            target_sha: "abcdef0123456789abcdef0123456789abcdef01".to_string(),
+            files_scanned: 2,
+            chunks_total: 2,
+            chunks_analyzed: 2,
+            ..Default::default()
+        };
+        assert_eq!(scan_exit_code(&summary), 0);
+
+        let mut clean_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut clean_buf, &summary).unwrap();
+        let clean_text = String::from_utf8(clean_buf.into_inner()).unwrap();
+        assert!(clean_text.contains("No High or Critical defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Medium);
+        let mut med_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut med_buf, &summary).unwrap();
+        let med_text = String::from_utf8(med_buf.into_inner()).unwrap();
+        assert!(med_text.contains("No Medium, High, or Critical defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Low);
+        let mut low_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut low_buf, &summary).unwrap();
+        let low_text = String::from_utf8(low_buf.into_inner()).unwrap();
+        assert!(low_text.contains("No verified defects found."));
+
+        summary.min_severity = Some(sashiko::db::SeverityFloor::Critical);
+        let mut crit_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut crit_buf, &summary).unwrap();
+        let crit_text = String::from_utf8(crit_buf.into_inner()).unwrap();
+        assert!(crit_text.contains("No Critical defects found."));
+        summary.min_severity = None;
+
+        // Partial chunk failure or candidate verification failure must exit 3
+        // and never claim a clean scan.
+        summary.chunks_analyzed = 1;
+        summary.chunks_failed = 1;
+        assert_eq!(scan_exit_code(&summary), 3);
+
+        let mut chunk_fail_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut chunk_fail_buf, &summary).unwrap();
+        let chunk_fail_text = String::from_utf8(chunk_fail_buf.into_inner()).unwrap();
+        assert!(chunk_fail_text.contains("Warning: scan incomplete"));
+        assert!(!chunk_fail_text.contains("No High or Critical defects found."));
+
+        summary.chunks_failed = 0;
+        summary.candidates_failed = 1;
+        assert_eq!(scan_exit_code(&summary), 3);
+
+        let mut cand_fail_buf = termcolor::NoColor::new(Vec::new());
+        write_scan_result(&mut cand_fail_buf, &summary).unwrap();
+        let cand_fail_text = String::from_utf8(cand_fail_buf.into_inner()).unwrap();
+        assert!(cand_fail_text.contains("1 candidate verification(s) failed"));
+        assert!(!cand_fail_text.contains("No High or Critical defects found."));
+
+        // Clean execution with a verified finding exits 1.
+        summary.candidates_failed = 0;
+        summary.findings.push(sashiko::scan::VerifiedScanBug {
+            canonical_title: "smb: server: use-after-free in smb2_close()".to_string(),
+            canonical_description: "Trigger / Preconditions: x\nFailure Mechanism: y\nImpact: z"
+                .to_string(),
+            severity: "High".to_string(),
+            severity_explanation: "UAF".to_string(),
+            subsystems: vec!["SMB3 SERVER (KSMBD)".to_string()],
+            source_files: vec!["fs/smb/server/smb2pdu.c".to_string()],
+            locations: serde_json::json!([]),
+            introduced_in_commit: None,
+            verified_on_sha: summary.target_sha.clone(),
+            submitted_bugid: None,
+            duplicate_of_bugid: None,
+        });
+        assert_eq!(scan_exit_code(&summary), 1);
+    }
+
+    #[test]
+    fn test_format_cli_and_settings_errors_are_human_readable() {
+        let str_err: Box<dyn std::error::Error> =
+            "/home/user/.config/sashiko.toml already exists; use --force to overwrite it".into();
+        let formatted = format_cli_error(str_err.as_ref());
+        assert_eq!(
+            formatted,
+            "/home/user/.config/sashiko.toml already exists; use --force to overwrite it"
+        );
+        assert!(!formatted.starts_with('"'));
+
+        let user_cfg = Settings::user_config_path();
+        let unknown_field_err = config::ConfigError::Message(
+            "unknown field `explicit_prompt_caching`, expected one of `max_tokens` for key `ai.gemini`"
+                .to_string(),
+        );
+        let settings_msg = format_settings_load_error(&user_cfg, &unknown_field_err);
+        assert!(settings_msg.contains(&user_cfg.display().to_string()));
+        assert!(settings_msg.contains("sashiko init --force"));
+
+        #[cfg(feature = "server")]
+        {
+            let daemon_msg = format_daemon_startup_error(
+                &user_cfg,
+                "[database] url must be set; a daemon has nowhere to store patchsets or reviews without one",
+            );
+            assert!(daemon_msg.contains(&user_cfg.display().to_string()));
+            assert!(daemon_msg.contains("sashiko review"));
+        }
+    }
+
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_nntp_ingest_filter_skips_non_project_traffic_on_shared_list() {
+        let db = Database::new(&sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        db.ensure_mailing_list("linux-ext4", "org.kernel.vger.linux-ext4")
+            .await
+            .unwrap();
+
+        let policy = sashiko::email_policy::EmailPolicyConfig::parse_content(
+            r#"
+            ["linux-ext4@vger.kernel.org"]
+            reply_to = ["author", "list"]
+
+            ["linux-ext4@vger.kernel.org".ingest_filter]
+            allowed_subject_prefixes = ["e2fsprogs"]
+            ignored_subject_prefixes = ["fstests", "xfstests"]
+            allowed_paths = ["e2fsck/", "lib/ext2fs/"]
+            ignored_paths = ["fs/", "tests/ext4/"]
+            "#,
+        )
+        .unwrap();
+
+        let review_settings = Settings::new().unwrap().review;
+
+        let cover_body = concat!(
+            "Cover letter\n\n",
+            " fs/ext4/inode.c | 10 +++++-----\n",
+            " 1 file changed, 5 insertions(+), 5 deletions(-)\n",
+        );
+        let kernel_diff = concat!(
+            "diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c\n",
+            "--- a/fs/ext4/inode.c\n",
+            "+++ b/fs/ext4/inode.c\n",
+            "@@ -1 +1 @@\n-old\n+new\n",
+        );
+        let e2fs_diff = concat!(
+            "diff --git a/e2fsck/pass1.c b/e2fsck/pass1.c\n",
+            "--- a/e2fsck/pass1.c\n",
+            "+++ b/e2fsck/pass1.c\n",
+            "@@ -1 +1 @@\n-old\n+new\n",
+        );
+
+        let kernel_cover = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "1".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "kern-cover@example.com".to_string(),
+                subject: "[PATCH 0/2] ext4: fix delayed alloc".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1000,
+                received_date: Some(1000),
+                in_reply_to: None,
+                references: vec![],
+                index: 0,
+                total: 2,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: cover_body.to_string(),
+            }),
+            patch: None,
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+        let kernel_patch = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "2".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "kern-p1@example.com".to_string(),
+                subject: "[PATCH 1/2] ext4: fix inode".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1001,
+                received_date: Some(1001),
+                in_reply_to: Some("kern-cover@example.com".to_string()),
+                references: vec!["kern-cover@example.com".to_string()],
+                index: 1,
+                total: 2,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "commit msg".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "kern-p1@example.com".to_string(),
+                body: "commit msg".to_string(),
+                diff: kernel_diff.to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+        let e2fs_patch = ParsedArticle {
+            group: "org.kernel.vger.linux-ext4".to_string(),
+            article_id: "3".to_string(),
+            source: MessageSource::Nntp,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: "e2fs-p1@example.com".to_string(),
+                subject: "[PATCH] e2fsck: fix extent check".to_string(),
+                author: "Dev <dev@example.com>".to_string(),
+                date: 1002,
+                received_date: Some(1002),
+                in_reply_to: None,
+                references: vec![],
+                index: 1,
+                total: 1,
+                to: "linux-ext4@vger.kernel.org".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: "commit msg".to_string(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: "e2fs-p1@example.com".to_string(),
+                body: "commit msg".to_string(),
+                diff: e2fs_diff.to_string(),
+                part_index: 1,
+            }),
+            baseline: None,
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        };
+
+        for article in [kernel_cover, kernel_patch, e2fs_patch] {
+            let status =
+                process_parsed_article(&db, article, None, &policy, &[], &review_settings).await;
+            assert_eq!(status, ProcessStatus::Ingested);
+        }
+
+        let pending = db.get_pending_patchsets(10).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].subject.as_deref(),
+            Some("[PATCH] e2fsck: fix extent check")
+        );
+        let skipped = db
+            .get_patchset_summary_by_msgid("kern-cover@example.com", None, None)
+            .await
+            .unwrap();
+        assert!(skipped.is_none());
+        let stored_msg = db
+            .get_message_id_by_msg_id("kern-cover@example.com")
+            .await
+            .unwrap();
+        assert!(
+            stored_msg.is_some(),
+            "filtered NNTP messages remain stored in messages for thread continuity"
+        );
     }
 }

@@ -29,12 +29,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
-use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::claude_cli::log_and_redact_stderr;
+use super::cli_common::{
+    IDLE_TIMEOUT, build_prompt, parse_inner_response, spawn_cli, write_prompt_and_wait,
+};
 use crate::ai::{AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities};
 
 pub struct CopilotCliProvider {
@@ -69,30 +70,21 @@ impl AiProvider for CopilotCliProvider {
         // prompts (subsystem guides + diff + tool definitions) routinely
         // exceed that and cause spawn() to fail with E2BIG. Stdin has no such
         // limit and the timing is equivalent in copilot's non-interactive mode.
-        let mut child = Command::new("copilot")
+        let mut command = Command::new("copilot");
+        command
             .args(build_copilot_args(&self.model))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .stderr(Stdio::piped());
+
+        let child = spawn_cli(&mut command)
             .map_err(|e| anyhow::anyhow!("Failed to spawn copilot CLI: {}. Is it installed?", e))?;
 
-        // Write the prompt to copilot's stdin and close the pipe so it
-        // proceeds to non-interactive (--print-like) mode.
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin
-                .write_all(prompt.as_bytes())
-                .await
-                .map_err(|e| anyhow::anyhow!("copilot CLI stdin write failed: {}", e))?;
-            drop(stdin);
-        }
-
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
+        // Closing stdin is what puts copilot in non-interactive (--print-like)
+        // mode; write_prompt_and_wait() drops the handle once the prompt is in.
+        let output = write_prompt_and_wait("copilot-cli", child, prompt, IDLE_TIMEOUT)
             .await
-            .map_err(|_| anyhow::anyhow!("copilot CLI timed out after 10 minutes"))?
-            .map_err(|e| anyhow::anyhow!("copilot CLI wait error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("copilot CLI {}", e))?;
 
         let stderr = log_and_redact_stderr("copilot-cli", &output.stderr);
 
@@ -174,7 +166,7 @@ pub fn parse_jsonl_events(raw: &str) -> Result<AiResponse> {
 
     // If we captured structured content, try to parse it for tool calls
     if let Some(text) = &content {
-        return parse_inner_response(text, usage);
+        return parse_inner_response("copilot-cli", text, usage);
     }
 
     // No assistant.message events found — return empty

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use anyhow::Result;
+use axum::body::Bytes;
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
-use bytes::Bytes;
 use hmac::{Hmac, Mac, digest::KeyInit};
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -539,6 +539,252 @@ pub fn extract_owner_repo_from_mr_url(url: &str) -> Option<String> {
     }
 }
 
+fn is_valid_github_repo_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg.len() <= 100
+        && seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Normalize a GitHub repository identifier (`"owner/repo"`, HTTPS clone/PR URL,
+/// or SSH `git@github.com:owner/repo.git` URL) into a canonical `"owner/repo"`
+/// slug. Returns `None` if the input names a non-GitHub host or contains path
+/// traversal / invalid segment characters.
+pub fn normalize_github_repo_slug(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let raw_path = if let Some(rest) = trimmed.strip_prefix("git@") {
+        let (host, path) = rest.split_once(':')?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        std::borrow::Cow::Borrowed(path)
+    } else if trimmed.contains("://") {
+        let parsed = url::Url::parse(trimmed).ok()?;
+        if !matches!(parsed.scheme(), "http" | "https" | "ssh") {
+            return None;
+        }
+        if !parsed.username().is_empty() && parsed.scheme() != "ssh" {
+            return None;
+        }
+        if parsed.password().is_some() {
+            return None;
+        }
+        let host = parsed.host_str()?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        std::borrow::Cow::Owned(parsed.path().to_string())
+    } else {
+        std::borrow::Cow::Borrowed(trimmed)
+    };
+
+    let without_pull = raw_path
+        .split_once("/pull/")
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(raw_path.as_ref());
+    let cleaned = without_pull.trim_matches('/').trim_end_matches(".git");
+    let mut parts = cleaned.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if !is_valid_github_repo_segment(owner) || !is_valid_github_repo_segment(repo) {
+        return None;
+    }
+    Some(format!("{owner}/{repo}"))
+}
+
+/// Inspect the `origin` remote of `repo_path` and return its normalized GitHub
+/// `"owner/repo"` slug when `origin` points to `github.com`.
+pub async fn detect_github_repo_from_git_dir(repo_path: &std::path::Path) -> Option<String> {
+    let mut cmd = crate::git_cmd::in_dir_async(repo_path);
+    cmd.args([
+        "-c",
+        "safe.bareRepository=all",
+        "remote",
+        "get-url",
+        "origin",
+    ]);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let url = String::from_utf8(output.stdout).ok()?;
+    normalize_github_repo_slug(&url)
+}
+
+/// Open pull request metadata returned by the GitHub Pulls REST API.
+#[derive(Debug, Clone)]
+pub struct GitHubPolledPullRequest {
+    pub metadata: ForgeMetadata,
+    pub updated_at: i64,
+}
+
+/// One page of open pull requests returned by the GitHub Pulls REST API.
+#[derive(Debug, Clone)]
+pub struct GitHubPullsPage {
+    pub items: Vec<GitHubPolledPullRequest>,
+    pub raw_count: usize,
+    pub skipped_count: usize,
+}
+
+/// Fetch one page of open pull requests from GitHub's Pulls REST API sorted by
+/// `updated` descending. Malformed items are logged and skipped rather than
+/// aborting the entire repository poll.
+pub async fn list_github_open_pull_requests(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    token: Option<&str>,
+    page: u32,
+    per_page: u32,
+) -> Result<GitHubPullsPage, String> {
+    let repo = normalize_github_repo_slug(repo)
+        .ok_or_else(|| format!("invalid GitHub repository slug: {}", loggable(repo)))?;
+    let per_page = per_page.clamp(1, 100);
+    let page = page.max(1);
+    let url = format!(
+        "{}/repos/{}/pulls?state=open&sort=updated&direction=desc&per_page={}&page={}",
+        api_base.trim_end_matches('/'),
+        repo,
+        per_page,
+        page
+    );
+
+    let mut req = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "sashiko")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.header("Authorization", format!("Bearer {}", tok));
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("GitHub pulls GET failed for {}: {}", repo, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let redacted = crate::utils::redact_secret(&text);
+        return Err(format!(
+            "GitHub pulls API returned {} for {}: {}",
+            status, repo, redacted
+        ));
+    }
+
+    let items: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+        format!(
+            "invalid JSON array from GitHub pulls endpoint for {} ({}): {}",
+            repo, status, e
+        )
+    })?;
+
+    let raw_count = items.len();
+    let mut skipped_count = 0usize;
+    let mut out = Vec::with_capacity(raw_count);
+    for pr in items {
+        let Some(pr_number) = pr["number"].as_i64().filter(|&n| n > 0) else {
+            tracing::warn!("Skipping GitHub PR item with invalid number in {}", repo);
+            skipped_count += 1;
+            continue;
+        };
+        let Some(head_sha) = pr["head"]["sha"]
+            .as_str()
+            .filter(|s| is_valid_git_sha(s))
+            .map(str::to_string)
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with invalid head.sha",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+        let Some(base_sha) = pr["base"]["sha"]
+            .as_str()
+            .filter(|s| is_valid_git_sha(s))
+            .map(str::to_string)
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with invalid base.sha",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+        let Some(updated_at) = pr["updated_at"]
+            .as_str()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.timestamp())
+        else {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with missing or invalid updated_at",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        };
+
+        let clone_url = pr["base"]["repo"]["clone_url"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("https://github.com/{}.git", repo));
+        if !is_safe_repo_url(&clone_url)
+            || crate::fetcher::url_has_embedded_credentials(Some(&clone_url))
+        {
+            tracing::warn!(
+                "Skipping GitHub PR {}#{} with unsafe clone_url",
+                repo,
+                pr_number
+            );
+            skipped_count += 1;
+            continue;
+        }
+
+        let pr_title = pr["title"].as_str().map(str::to_string);
+        let pr_url = pr["html_url"]
+            .as_str()
+            .map(str::to_string)
+            .or_else(|| Some(format!("https://github.com/{}/pull/{}", repo, pr_number)));
+        let author = pr["user"]["login"].as_str().map(str::to_string);
+
+        out.push(GitHubPolledPullRequest {
+            metadata: ForgeMetadata {
+                repo_url: Some(clone_url),
+                base_sha,
+                head_sha,
+                pr_number,
+                pr_title,
+                pr_url,
+                author,
+            },
+            updated_at,
+        });
+    }
+
+    Ok(GitHubPullsPage {
+        items: out,
+        raw_count,
+        skipped_count,
+    })
+}
+
 /// Summary and findings for one commit in a pull request series.
 #[derive(Debug, Clone)]
 pub struct PatchReviewSummaryItem {
@@ -547,6 +793,19 @@ pub struct PatchReviewSummaryItem {
     pub commit_id: Option<String>,
     pub subject: String,
     pub inline_review: Option<String>,
+    pub failed: bool,
+}
+
+/// Banner prefix emitted in forge PR comments when one or more commits failed
+/// to complete review.
+pub const INCOMPLETE_REVIEW_MARKER: &str = "⚠ **Review incomplete**";
+
+/// Return true when `body` was produced by `compose_pr_review_comment` for an
+/// incomplete review (banner immediately following the `### Sashiko review` header).
+pub fn is_incomplete_pr_review_comment(body: &str) -> bool {
+    body.split_once("\n\n").is_some_and(|(header, rest)| {
+        header.starts_with("### Sashiko review") && rest.starts_with(INCOMPLETE_REVIEW_MARKER)
+    })
 }
 
 /// Maximum byte length of a GitHub issue/PR comment body (GitHub's hard limit
@@ -554,13 +813,15 @@ pub struct PatchReviewSummaryItem {
 const MAX_GITHUB_COMMENT_BYTES: usize = 60_000;
 
 /// Compose the markdown comment posted to a pull request thread when a review
-/// completes. Always produces a comment: clean pull requests receive a short
-/// confirmation with a link to the full review trace.
+/// finishes. Clean pull requests receive a short confirmation; partially or
+/// wholly failed pull requests receive an explicit incomplete-review banner
+/// alongside any findings discovered in completed commits.
 pub fn compose_pr_review_comment(
     version: Option<u32>,
     total_commits: usize,
     series_summary: Option<&str>,
     patches: &[PatchReviewSummaryItem],
+    patchset_failed: bool,
     target_url: &str,
 ) -> String {
     let header = match version {
@@ -580,6 +841,9 @@ pub fn compose_pr_review_comment(
         format!("{} commits", total_commits)
     };
 
+    let failed_patches: Vec<&PatchReviewSummaryItem> =
+        patches.iter().filter(|p| p.failed).collect();
+
     let patches_with_findings: Vec<&PatchReviewSummaryItem> = patches
         .iter()
         .filter(|p| {
@@ -590,7 +854,7 @@ pub fn compose_pr_review_comment(
         })
         .collect();
 
-    if patches_with_findings.is_empty() {
+    if !patchset_failed && failed_patches.is_empty() && patches_with_findings.is_empty() {
         return format!(
             "{header}\n\n✓ **No issues found** across {commit_word}.\n\n[Full review log on {link_host}]({target_url})\n"
         );
@@ -599,6 +863,27 @@ pub fn compose_pr_review_comment(
     let mut out = String::with_capacity(2048);
     out.push_str(&header);
     out.push_str("\n\n");
+
+    if !failed_patches.is_empty() {
+        let failed_count = failed_patches.len();
+        let listed: Vec<String> = failed_patches
+            .iter()
+            .take(5)
+            .map(|p| format!("`{}/{}`", p.part_index, p.total_parts))
+            .collect();
+        let listed_str = if failed_count > 5 {
+            format!("{}, +{} more", listed.join(", "), failed_count - 5)
+        } else {
+            listed.join(", ")
+        };
+        out.push_str(&format!(
+            "{INCOMPLETE_REVIEW_MARKER} — {failed_count} of {commit_word} failed to complete review ({listed_str}).\n\n"
+        ));
+    } else if patchset_failed {
+        out.push_str(&format!(
+            "{INCOMPLETE_REVIEW_MARKER} — review failed to complete.\n\n"
+        ));
+    }
 
     if let Some(summary) = series_summary.map(str::trim).filter(|s| !s.is_empty()) {
         out.push_str("<details>\n<summary>Series summary</summary>\n\n");
@@ -611,7 +896,7 @@ pub fn compose_pr_review_comment(
             .commit_id
             .as_deref()
             .filter(|s| s.len() >= 8)
-            .map(|s| &s[..8]);
+            .map(|s| crate::utils::utf8_prefix(s, 8));
         let title_line = match short_sha {
             Some(sha) => format!(
                 "#### Commit {}/{} — `{}` {}\n\n",
@@ -745,6 +1030,288 @@ pub async fn post_github_pr_comment(
         let text = resp.text().await.unwrap_or_default();
         Err(format!("GitHub returned {}: {}", status, text))
     }
+}
+
+/// Source endpoint of a persisted Forge pull/merge request comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgeCommentSource {
+    Review,
+    ReviewComment,
+    IssueComment,
+}
+
+impl ForgeCommentSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ForgeCommentSource::Review => "review",
+            ForgeCommentSource::ReviewComment => "review_comment",
+            ForgeCommentSource::IssueComment => "issue_comment",
+        }
+    }
+}
+
+impl std::str::FromStr for ForgeCommentSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "review" => Ok(ForgeCommentSource::Review),
+            "review_comment" => Ok(ForgeCommentSource::ReviewComment),
+            "issue_comment" => Ok(ForgeCommentSource::IssueComment),
+            other => Err(format!("unknown forge comment source: {other}")),
+        }
+    }
+}
+
+/// Normalized Forge PR review/diff/issue comment ready for `forge_comments` persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForgeFetchedComment {
+    pub provider: String,
+    pub repo: String,
+    pub pr_number: i64,
+    pub comment_source: ForgeCommentSource,
+    pub remote_comment_id: i64,
+    pub in_reply_to_id: Option<i64>,
+    pub author: String,
+    pub author_association: Option<String>,
+    pub commit_id: Option<String>,
+    pub file_path: Option<String>,
+    pub line: Option<i64>,
+    pub body: String,
+    pub html_url: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Returns `true` when a forge comment is an outbound review summary posted
+/// by Sashiko: the body starts with `### Sashiko review` and `author` is
+/// Sashiko's own account. That account is `sashiko_login` (`forge.bot_login`)
+/// when configured, and otherwise any GitHub App account (`<app>[bot]`),
+/// which a person cannot post as. Anyone else using the header keeps their
+/// comment, and human replies quoting Sashiko (`> ### Sashiko review`) start
+/// with `>` and are preserved too.
+pub fn is_sashiko_pr_review_comment(author: &str, body: &str, sashiko_login: Option<&str>) -> bool {
+    if !body.trim_start().starts_with("### Sashiko review") {
+        return false;
+    }
+    let author = author.trim();
+    match sashiko_login.map(str::trim).filter(|l| !l.is_empty()) {
+        Some(login) => author.eq_ignore_ascii_case(login),
+        None => author.to_ascii_lowercase().ends_with("[bot]"),
+    }
+}
+
+/// Resolves an optional GitHub bearer token from `ForgeSettings` (preferring
+/// GitHub App installation credentials and falling back to `api_token`).
+pub async fn resolve_optional_github_token(
+    client: &reqwest::Client,
+    api_base: &str,
+    settings: &crate::settings::ForgeSettings,
+) -> Option<String> {
+    if let (Some(app_id), Some(installation_id)) = (settings.app_id, settings.installation_id) {
+        let pem_opt = settings
+            .app_private_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                settings
+                    .app_private_key_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+            });
+        if let Some(pem) = pem_opt
+            && let Ok(jwt) = mint_github_app_jwt(app_id, &pem)
+            && let Ok(tok) =
+                exchange_github_installation_token(client, api_base, installation_id, &jwt).await
+        {
+            return Some(tok);
+        }
+    }
+    settings
+        .api_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Safety bound on feedback pages fetched per PR and comment kind (100
+/// comments each); reaching it is logged, never silent.
+const MAX_FEEDBACK_PAGES: u32 = 200;
+const FEEDBACK_PER_PAGE: u32 = 100;
+
+/// Fetches review summaries, inline diff comments, and top-level issue comments
+/// for a GitHub pull request, filtering out empty reviews and Sashiko's own bot
+/// summary comments (see `is_sashiko_pr_review_comment` for `sashiko_login`).
+pub async fn fetch_github_pr_feedback(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    pr_number: i64,
+    token: Option<&str>,
+    sashiko_login: Option<&str>,
+) -> Result<Vec<ForgeFetchedComment>, String> {
+    if pr_number <= 0 {
+        return Err(format!("invalid pull request number: {pr_number}"));
+    }
+    let repo = normalize_github_repo_slug(repo)
+        .ok_or_else(|| format!("invalid GitHub repository slug: {}", loggable(repo)))?;
+
+    let mut all = Vec::new();
+    for (source, subpath) in [
+        (
+            ForgeCommentSource::Review,
+            format!("pulls/{pr_number}/reviews"),
+        ),
+        (
+            ForgeCommentSource::ReviewComment,
+            format!("pulls/{pr_number}/comments"),
+        ),
+        (
+            ForgeCommentSource::IssueComment,
+            format!("issues/{pr_number}/comments"),
+        ),
+    ] {
+        let items = fetch_github_comment_pages(client, api_base, &repo, &subpath, token).await?;
+        for item in items {
+            if let Some(parsed) = parse_github_feedback_item(&repo, pr_number, source, &item)
+                && !is_sashiko_pr_review_comment(&parsed.author, &parsed.body, sashiko_login)
+            {
+                all.push(parsed);
+            }
+        }
+    }
+    all.sort_by_key(|c| (c.created_at, c.remote_comment_id));
+    Ok(all)
+}
+
+async fn fetch_github_comment_pages(
+    client: &reqwest::Client,
+    api_base: &str,
+    repo: &str,
+    subpath: &str,
+    token: Option<&str>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::new();
+    for page in 1..=MAX_FEEDBACK_PAGES {
+        let url = format!(
+            "{}/repos/{}/{}?per_page={}&page={}",
+            api_base.trim_end_matches('/'),
+            repo,
+            subpath,
+            FEEDBACK_PER_PAGE,
+            page
+        );
+        let mut req = client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "sashiko")
+            .header("X-GitHub-Api-Version", "2022-11-28");
+        if let Some(tok) = token.map(str::trim).filter(|s| !s.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {tok}"));
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("GitHub feedback GET failed for {repo}/{subpath}: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let redacted = crate::utils::redact_secret(&text);
+            return Err(format!(
+                "GitHub feedback API returned {status} for {repo}/{subpath}: {redacted}"
+            ));
+        }
+        let page_items: Vec<serde_json::Value> = resp.json().await.map_err(|e| {
+            format!("invalid JSON array from GitHub {repo}/{subpath} ({status}): {e}")
+        })?;
+        let count = page_items.len();
+        out.extend(page_items);
+        if count < FEEDBACK_PER_PAGE as usize {
+            return Ok(out);
+        }
+    }
+    tracing::warn!(
+        "GitHub feedback for {repo}/{subpath} stopped at the {MAX_FEEDBACK_PAGES}-page safety bound ({} comments)",
+        out.len()
+    );
+    Ok(out)
+}
+
+fn parse_github_feedback_item(
+    repo: &str,
+    pr_number: i64,
+    source: ForgeCommentSource,
+    item: &serde_json::Value,
+) -> Option<ForgeFetchedComment> {
+    let remote_comment_id = item["id"].as_i64().filter(|&id| id > 0)?;
+    let body = item["body"].as_str().unwrap_or("").trim();
+    if body.is_empty() {
+        return None;
+    }
+    let author = item["user"]["login"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let ts_str = item["submitted_at"]
+        .as_str()
+        .or_else(|| item["created_at"].as_str())?;
+    let created_at = chrono::DateTime::parse_from_rfc3339(ts_str)
+        .ok()?
+        .timestamp();
+    let updated_at = item["updated_at"]
+        .as_str()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+        .unwrap_or(created_at);
+
+    let commit_id = item["original_commit_id"]
+        .as_str()
+        .or_else(|| item["commit_id"].as_str())
+        .filter(|sha| is_valid_git_sha(sha))
+        .map(str::to_ascii_lowercase);
+    let file_path = item["path"]
+        .as_str()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string);
+    let line = item["line"]
+        .as_i64()
+        .or_else(|| item["original_line"].as_i64())
+        .filter(|&l| l > 0);
+    let in_reply_to_id = item["in_reply_to_id"].as_i64().filter(|&id| id > 0);
+    let author_association = item["author_association"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let html_url = item["html_url"]
+        .as_str()
+        .and_then(crate::prior_context::safe_external_reference_url);
+
+    Some(ForgeFetchedComment {
+        provider: "github".to_string(),
+        repo: repo.to_string(),
+        pr_number,
+        comment_source: source,
+        remote_comment_id,
+        in_reply_to_id,
+        author,
+        author_association,
+        commit_id,
+        file_path,
+        line,
+        body: body.to_string(),
+        html_url,
+        created_at,
+        updated_at,
+    })
 }
 
 /// Registry for forge providers
@@ -1528,6 +2095,7 @@ mod tests {
                 commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
                 subject: "first clean patch".to_string(),
                 inline_review: None,
+                failed: false,
             },
             PatchReviewSummaryItem {
                 part_index: 2,
@@ -1535,6 +2103,7 @@ mod tests {
                 commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
                 subject: "second clean patch".to_string(),
                 inline_review: Some("No issues found.".to_string()),
+                failed: false,
             },
         ];
         let body = compose_pr_review_comment(
@@ -1542,10 +2111,12 @@ mod tests {
             2,
             None,
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def",
         );
         assert!(body.starts_with("### Sashiko review\n\n"));
         assert!(body.contains("✓ **No issues found** across 2 commits."));
+        assert!(!is_incomplete_pr_review_comment(&body));
         assert!(
             body.contains(
                 "[Full review log on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-abc..def)"
@@ -1562,6 +2133,7 @@ mod tests {
                 commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
                 subject: "clean commit".to_string(),
                 inline_review: None,
+                failed: false,
             },
             PatchReviewSummaryItem {
                 part_index: 2,
@@ -1569,6 +2141,7 @@ mod tests {
                 commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
                 subject: "commit with bug".to_string(),
                 inline_review: Some("Severity: HIGH\nMissing check on input buffer.".to_string()),
+                failed: false,
             },
         ];
         let body = compose_pr_review_comment(
@@ -1576,6 +2149,7 @@ mod tests {
             2,
             Some("Series summary text here."),
             &patches,
+            false,
             "https://sashiko.sashiko.dev/#/patchset/mr-501-v3",
         );
         assert!(body.starts_with("### Sashiko review — v3\n\n"));
@@ -1583,11 +2157,176 @@ mod tests {
         assert!(!body.contains("clean commit"));
         assert!(body.contains("#### Commit 2/2 — `fedcba09` commit with bug"));
         assert!(body.contains("Severity: HIGH\nMissing check on input buffer."));
+        assert!(!is_incomplete_pr_review_comment(&body));
         assert!(
             body.contains(
                 "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/mr-501-v3)"
             )
         );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_partial_failure_without_findings() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 3,
+                commit_id: Some("1234567890abcdef1234567890abcdef12345678".to_string()),
+                subject: "first clean patch".to_string(),
+                inline_review: None,
+                failed: false,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 3,
+                commit_id: Some("abcdef1234567890abcdef1234567890abcdef12".to_string()),
+                subject: "failed commit".to_string(),
+                inline_review: None,
+                failed: true,
+            },
+            PatchReviewSummaryItem {
+                part_index: 3,
+                total_parts: 3,
+                commit_id: Some("fedcba0987654321fedcba0987654321fedcba09".to_string()),
+                subject: "third clean patch".to_string(),
+                inline_review: Some("No issues found.".to_string()),
+                failed: false,
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(1),
+            3,
+            None,
+            &patches,
+            false,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(!body.contains("No issues found"));
+        assert!(body.contains(
+            "⚠ **Review incomplete** — 1 of 3 commits failed to complete review (`2/3`)."
+        ));
+        assert!(
+            body.contains(
+                "[Full review and stage logs on sashiko.sashiko.dev](https://sashiko.sashiko.dev/#/patchset/sashiko-733)"
+            )
+        );
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_partial_failure_preserves_findings() {
+        let patches = vec![
+            PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 3,
+                commit_id: Some("1111111122222222333333334444444455555555".to_string()),
+                subject: "timed out commit".to_string(),
+                inline_review: None,
+                failed: true,
+            },
+            PatchReviewSummaryItem {
+                part_index: 2,
+                total_parts: 3,
+                commit_id: Some("aaaaaaaa22222222333333334444444455555555".to_string()),
+                subject: "commit with real bug".to_string(),
+                inline_review: Some("Severity: MEDIUM\nUnbounded retry loop.".to_string()),
+                failed: false,
+            },
+            PatchReviewSummaryItem {
+                part_index: 3,
+                total_parts: 3,
+                commit_id: Some("bbbbbbbb22222222333333334444444455555555".to_string()),
+                subject: "clean commit".to_string(),
+                inline_review: None,
+                failed: false,
+            },
+        ];
+        let body = compose_pr_review_comment(
+            Some(2),
+            3,
+            Some("Series overview."),
+            &patches,
+            false,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-733",
+        );
+        assert!(body.starts_with("### Sashiko review — v2\n\n"));
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains(
+            "⚠ **Review incomplete** — 1 of 3 commits failed to complete review (`1/3`)."
+        ));
+        assert!(body.contains("<details>\n<summary>Series summary</summary>"));
+        assert!(body.contains("#### Commit 2/3 — `aaaaaaaa` commit with real bug"));
+        assert!(body.contains("Severity: MEDIUM\nUnbounded retry loop."));
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_many_failures_and_self_quote() {
+        let many_failed: Vec<PatchReviewSummaryItem> = (1..=7)
+            .map(|idx| PatchReviewSummaryItem {
+                part_index: idx,
+                total_parts: 7,
+                commit_id: None,
+                subject: format!("patch {idx}"),
+                inline_review: None,
+                failed: true,
+            })
+            .collect();
+        let body = compose_pr_review_comment(
+            None,
+            7,
+            None,
+            &many_failed,
+            false,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-700",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains(
+            "7 of 7 commits failed to complete review (`1/7`, `2/7`, `3/7`, `4/7`, `5/7`, +2 more)."
+        ));
+
+        // A completed review whose finding quotes INCOMPLETE_REVIEW_MARKER must not
+        // be misclassified as an incomplete review comment.
+        let completed_quoting_marker = compose_pr_review_comment(
+            None,
+            1,
+            None,
+            &[PatchReviewSummaryItem {
+                part_index: 1,
+                total_parts: 1,
+                commit_id: None,
+                subject: "forge: tweak banner".to_string(),
+                inline_review: Some(format!(
+                    "Check usage of `{INCOMPLETE_REVIEW_MARKER}` in src/forge.rs."
+                )),
+                failed: false,
+            }],
+            false,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-701",
+        );
+        assert!(!is_incomplete_pr_review_comment(&completed_quoting_marker));
+    }
+
+    #[test]
+    fn test_compose_pr_review_comment_failed_patchset_without_failed_commits() {
+        let patches = vec![PatchReviewSummaryItem {
+            part_index: 1,
+            total_parts: 1,
+            commit_id: None,
+            subject: "clean commit".to_string(),
+            inline_review: None,
+            failed: false,
+        }];
+        let body = compose_pr_review_comment(
+            None,
+            1,
+            None,
+            &patches,
+            true,
+            "https://sashiko.sashiko.dev/#/patchset/sashiko-702",
+        );
+        assert!(is_incomplete_pr_review_comment(&body));
+        assert!(body.contains("⚠ **Review incomplete** — review failed to complete."));
+        assert!(!body.contains("No issues found"));
     }
 
     #[test]
@@ -1657,5 +2396,213 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
         let (_action, metadata) = forge.parse_payload(&body).expect("valid payload");
         assert_eq!(metadata.author.as_deref(), Some("dependabot[bot]"));
         assert!(metadata.author.as_deref().is_some_and(is_dependabot_author));
+    }
+
+    #[test]
+    fn test_normalize_github_repo_slug() {
+        assert_eq!(
+            normalize_github_repo_slug("sashiko-dev/sashiko"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug(" https://github.com/sashiko-dev/sashiko.git "),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("https://github.com/sashiko-dev/sashiko/pull/735"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("git@github.com:sashiko-dev/sashiko.git"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+        assert_eq!(
+            normalize_github_repo_slug("ssh://git@github.com/sashiko-dev/sashiko.git"),
+            Some("sashiko-dev/sashiko".to_string())
+        );
+
+        for invalid in [
+            "",
+            "sashiko-dev",
+            "sashiko-dev/sashiko/extra",
+            "../sashiko",
+            "sashiko-dev/..",
+            "https://gitlab.com/sashiko-dev/sashiko.git",
+            "git@gitlab.com:sashiko-dev/sashiko.git",
+            "https://user:pass@github.com/sashiko-dev/sashiko.git",
+            "sashiko-dev/sashiko?foo=bar",
+        ] {
+            assert_eq!(
+                normalize_github_repo_slug(invalid),
+                None,
+                "{invalid} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_detect_github_repo_from_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = crate::git_cmd::in_dir_async(dir.path())
+            .args(["-c", "safe.bareRepository=all", "init", "--bare"])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(detect_github_repo_from_git_dir(dir.path()).await, None);
+
+        let status = crate::git_cmd::in_dir_async(dir.path())
+            .args([
+                "-c",
+                "safe.bareRepository=all",
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/sashiko-dev/sashiko.git",
+            ])
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success());
+
+        assert_eq!(
+            detect_github_repo_from_git_dir(dir.path()).await,
+            Some("sashiko-dev/sashiko".to_string())
+        );
+    }
+
+    #[test]
+    fn test_sashiko_review_comment_requires_sashiko_author() {
+        let body = "### Sashiko review\n\nNo issues found.";
+        assert!(is_sashiko_pr_review_comment("sashiko-bot[bot]", body, None));
+        // A person pasting the header keeps their comment.
+        assert!(!is_sashiko_pr_review_comment("maintainer1", body, None));
+        assert!(!is_sashiko_pr_review_comment(
+            "maintainer1",
+            "> ### Sashiko review\nfix",
+            None
+        ));
+        // A configured login is the only identity accepted.
+        assert!(is_sashiko_pr_review_comment(
+            "Sashiko-Poster",
+            body,
+            Some("sashiko-poster")
+        ));
+        assert!(!is_sashiko_pr_review_comment(
+            "other-app[bot]",
+            body,
+            Some("sashiko-poster")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_github_pr_feedback_parses_all_sources_and_skips_sashiko_bot() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new()
+            .route(
+                "/repos/sashiko-dev/sashiko/pulls/42/reviews",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 1001,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "MEMBER",
+                            "body": "",
+                            "state": "APPROVED",
+                            "submitted_at": "2026-03-01T10:00:00Z"
+                        },
+                        {
+                            "id": 1002,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "MEMBER",
+                            "body": "Please avoid holding the mutex across await.",
+                            "commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#pullrequestreview-1002",
+                            "submitted_at": "2026-03-01T10:05:00Z"
+                        }
+                    ]))
+                }),
+            )
+            .route(
+                "/repos/sashiko-dev/sashiko/pulls/42/comments",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 2001,
+                            "user": { "login": "reviewer2" },
+                            "author_association": "CONTRIBUTOR",
+                            "body": "Off-by-one when buffer is empty.",
+                            "path": "src/db.rs",
+                            "line": 120,
+                            "original_commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#discussion_r2001",
+                            "created_at": "2026-03-01T10:10:00Z",
+                            "updated_at": "2026-03-01T10:10:00Z"
+                        },
+                        {
+                            "id": 2002,
+                            "in_reply_to_id": 2001,
+                            "user": { "login": "pr-author" },
+                            "author_association": "NONE",
+                            "body": "Good catch, will fix in v2.",
+                            "path": "src/db.rs",
+                            "line": 120,
+                            "original_commit_id": "1111111111111111111111111111111111111111",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#discussion_r2002",
+                            "created_at": "2026-03-01T10:15:00Z",
+                            "updated_at": "2026-03-01T10:15:00Z"
+                        }
+                    ]))
+                }),
+            )
+            .route(
+                "/repos/sashiko-dev/sashiko/issues/42/comments",
+                get(|| async {
+                    Json(serde_json::json!([
+                        {
+                            "id": 3001,
+                            "user": { "login": "sashiko-bot[bot]" },
+                            "author_association": "NONE",
+                            "body": "### Sashiko review\n\n✓ **No issues found** across 1 commit.",
+                            "created_at": "2026-03-01T10:20:00Z"
+                        },
+                        {
+                            "id": 3002,
+                            "user": { "login": "maintainer1" },
+                            "author_association": "OWNER",
+                            "body": "> ### Sashiko review\nI still see a race in shutdown.",
+                            "html_url": "https://github.com/sashiko-dev/sashiko/pull/42#issuecomment-3002",
+                            "created_at": "2026-03-01T10:25:00Z"
+                        }
+                    ]))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let client = reqwest::Client::new();
+        let api_base = format!("http://{addr}");
+        let comments =
+            fetch_github_pr_feedback(&client, &api_base, "sashiko-dev/sashiko", 42, None, None)
+                .await
+                .unwrap();
+
+        assert_eq!(comments.len(), 4);
+        assert_eq!(comments[0].comment_source, ForgeCommentSource::Review);
+        assert_eq!(comments[0].remote_comment_id, 1002);
+        assert_eq!(
+            comments[1].comment_source,
+            ForgeCommentSource::ReviewComment
+        );
+        assert_eq!(comments[1].file_path.as_deref(), Some("src/db.rs"));
+        assert_eq!(comments[2].in_reply_to_id, Some(2001));
+        assert_eq!(comments[3].comment_source, ForgeCommentSource::IssueComment);
+        assert_eq!(comments[3].remote_comment_id, 3002);
     }
 }

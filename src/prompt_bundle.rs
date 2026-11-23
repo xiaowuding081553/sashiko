@@ -63,11 +63,51 @@ pub fn sashiko_severity_guide() -> &'static str {
         .expect("sashiko/severity.md must exist in prompt bundle")
 }
 
+/// Returns the compiled-in content of `gcc/severity.md`.
+pub fn gcc_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "gcc/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("gcc/severity.md must exist in prompt bundle")
+}
+
+/// Returns the compiled-in content of `qemu/severity.md`.
+pub fn qemu_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "qemu/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("qemu/severity.md must exist in prompt bundle")
+}
+
+/// Returns the compiled-in content of `zephyr/severity.md`.
+pub fn zephyr_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "zephyr/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("zephyr/severity.md must exist in prompt bundle")
+}
+
+/// Returns the compiled-in content of `e2fsprogs/severity.md`.
+pub fn e2fsprogs_severity_guide() -> &'static str {
+    PROMPT_BUNDLE_FILES
+        .iter()
+        .find(|(path, _)| *path == "e2fsprogs/severity.md")
+        .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+        .expect("e2fsprogs/severity.md must exist in prompt bundle")
+}
+
 /// Returns the compiled-in severity guide for `project`.
 pub fn severity_guide(project: ProjectId) -> &'static str {
     match project {
         ProjectId::Linux => kernel_severity_guide(),
         ProjectId::Sashiko => sashiko_severity_guide(),
+        ProjectId::Gcc => gcc_severity_guide(),
+        ProjectId::Qemu => qemu_severity_guide(),
+        ProjectId::Zephyr => zephyr_severity_guide(),
+        ProjectId::E2fsprogs => e2fsprogs_severity_guide(),
     }
 }
 
@@ -142,6 +182,9 @@ mod tests {
         assert!(guide.contains("# Severity Levels"));
         assert!(guide.contains("## Critical"));
         assert!(guide.contains("## High"));
+        assert!(guide.contains("Documentation/process/threat-model.rst"));
+        assert!(guide.contains("kselftests"));
+        assert!(guide.contains("debugfs"));
     }
 
     #[test]
@@ -151,6 +194,14 @@ mod tests {
         assert!(guide.contains("Sashiko is not an operating system kernel"));
         assert_eq!(severity_guide(ProjectId::Linux), kernel_severity_guide());
         assert_eq!(severity_guide(ProjectId::Sashiko), sashiko_severity_guide());
+        assert_eq!(severity_guide(ProjectId::Gcc), gcc_severity_guide());
+    }
+
+    #[test]
+    fn test_gcc_severity_guide_not_empty() {
+        let guide = gcc_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("wrong-code"));
     }
 
     #[test]
@@ -185,7 +236,7 @@ mod tests {
             "sashiko/false-positive-guide.md",
             "sashiko/prompt-injection.md",
             "sashiko/github-summary-template.md",
-            "sashiko/subsystem/subsystem.md",
+            "sashiko/maintainers/general.md",
         ];
         for path in required_framing {
             assert!(
@@ -193,65 +244,112 @@ mod tests {
                 "missing framing file in bundle: {path}"
             );
         }
-
-        assert_index_guides_bundled("sashiko");
     }
 
     #[test]
-    fn test_kernel_subsystem_index_guides_are_bundled() {
-        // The pre-screen offers the kernel index's guides by name, and a name
-        // with no file behind it loads as nothing, so a guide renamed or
-        // removed by a sync would be lost without any error.
-        assert_index_guides_bundled("kernel");
+    fn test_kernel_prompt_bundle_integrity() {
+        // The files the Linux review loads by name; a name with no file
+        // behind it loads as nothing, so a missing one would go unnoticed.
+        for path in [
+            "kernel/severity.md",
+            "kernel/false-positive-guide.md",
+            "kernel/inline-template.md",
+            "kernel/callstack.md",
+            "kernel/locking.md",
+            "kernel/performance.md",
+        ] {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing file in bundle: {path}"
+            );
+        }
+    }
+    #[test]
+    fn test_gcc_prompt_bundle_integrity() {
+        let required_framing = [
+            "gcc/review-core.md",
+            "gcc/severity.md",
+            "gcc/false-positive-guide.md",
+            "gcc/inline-template.md",
+            "gcc/maintainers/general.md",
+            "gcc/maintainers/c-cpp-frontend.md",
+            "gcc/maintainers/middle-end.md",
+            "gcc/maintainers/rtl-backend.md",
+            "gcc/maintainers/libstdcxx.md",
+            "gcc/notes/profile.toml",
+            "gcc/notes/17/manifest.json",
+            "gcc/notes/17/units/tree-optimization.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing GCC framing file in bundle: {path}"
+            );
+        }
     }
 
-    /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in
-    /// the bundle, under subsystem/ or patterns/.
-    fn assert_index_guides_bundled(project: &str) {
-        let index_path = format!("{project}/subsystem/subsystem.md");
-        let subsystem_index = PROMPT_BUNDLE_FILES
-            .iter()
-            .find(|(p, _)| *p == index_path)
-            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .unwrap_or_else(|| panic!("{index_path} must be valid UTF-8"));
-
-        let mut referenced_guides = Vec::new();
-        for line in subsystem_index.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('|') && trimmed.ends_with('|') {
-                let cols: Vec<&str> = trimmed.split('|').map(str::trim).collect();
-                // Markdown table row: ["", "Component/Pattern", "Triggers", "File", ""]
-                if cols.len() >= 4 {
-                    let file_col = cols[cols.len() - 2];
-                    if file_col.ends_with(".md") && !file_col.contains(' ') {
-                        referenced_guides.push(file_col);
-                    }
-                }
-            } else if trimmed.starts_with('-')
-                && let Some(start) = trimmed.find('(')
-                && let Some(end) = trimmed[start + 1..].find(')')
-            {
-                let candidate = trimmed[start + 1..start + 1 + end].trim();
-                if candidate.ends_with(".md") && !candidate.contains(' ') {
-                    referenced_guides.push(candidate);
-                }
-            }
+    #[test]
+    fn test_qemu_prompt_bundle_integrity() {
+        let required_framing = [
+            "qemu/review-core.md",
+            "qemu/severity.md",
+            "qemu/false-positive-guide.md",
+            "qemu/report-template.md",
+            "qemu/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing QEMU framing file in bundle: {path}"
+            );
         }
+    }
 
-        assert!(
-            !referenced_guides.is_empty(),
-            "should parse referenced guides from subsystem.md"
+    #[test]
+    fn test_zephyr_prompt_bundle_integrity() {
+        let required_framing = [
+            "zephyr/review-core.md",
+            "zephyr/severity.md",
+            "zephyr/false-positive-guide.md",
+            "zephyr/report-template.md",
+            "zephyr/maintainers/general.md",
+        ];
+        for path in required_framing {
+            assert!(
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing Zephyr framing file in bundle: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_e2fsprogs_prompt_bundle_integrity() {
+        let guide = e2fsprogs_severity_guide();
+        assert!(guide.contains("# Severity Levels"));
+        assert!(guide.contains("e2fsprogs"));
+        assert_eq!(
+            severity_guide(ProjectId::E2fsprogs),
+            e2fsprogs_severity_guide()
         );
 
-        for guide in referenced_guides {
-            let in_subsystem = format!("{project}/subsystem/{guide}");
-            let in_patterns = format!("{project}/patterns/{guide}");
-            let found = PROMPT_BUNDLE_FILES
-                .iter()
-                .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
+        let required_framing = [
+            "e2fsprogs/review-core.md",
+            "e2fsprogs/severity.md",
+            "e2fsprogs/false-positive-guide.md",
+            "e2fsprogs/inline-template.md",
+            "e2fsprogs/maintainers/general.md",
+            "e2fsprogs/maintainers/libext2fs.md",
+            "e2fsprogs/maintainers/e2fsck.md",
+            "e2fsprogs/maintainers/tools.md",
+            "e2fsprogs/maintainers/fuse.md",
+            "e2fsprogs/maintainers/support-libs.md",
+            "e2fsprogs/maintainers/tests.md",
+            "e2fsprogs/notes/profile.toml",
+        ];
+        for path in required_framing {
             assert!(
-                found,
-                "guide {guide} referenced in {index_path} not found in bundle under subsystem/ or patterns/"
+                PROMPT_BUNDLE_FILES.iter().any(|(p, _)| *p == path),
+                "missing e2fsprogs framing file in bundle: {path}"
             );
         }
     }

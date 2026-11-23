@@ -17,7 +17,7 @@ use crate::email_policy::EmailPolicyConfig;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub struct PatchworkWorker {
     db: Arc<Database>,
@@ -96,7 +96,7 @@ impl PatchworkWorker {
 
             match self.db.lock_pending_patchwork().await {
                 Ok(Some(entry)) => {
-                    info!(
+                    debug!(
                         "Processing patchwork check ID {} for msgid {}",
                         entry.id, entry.patch_msg_id
                     );
@@ -118,6 +118,10 @@ impl PatchworkWorker {
                     {
                         Ok(()) => {
                             info!("Successfully posted patchwork check ID {}", entry.id);
+                            crate::metrics::inc_outbox_event(
+                                crate::metrics::OutboxChannel::Patchwork,
+                                crate::metrics::OutboxOutcome::Sent,
+                            );
                             if let Err(e) = self.db.mark_patchwork_sent(entry.id).await {
                                 error!("Failed to mark patchwork {} as sent: {}", entry.id, e);
                             }
@@ -125,13 +129,17 @@ impl PatchworkWorker {
                         Err(e) => {
                             match &e {
                                 crate::patchwork::PatchworkCheckError::NotIndexedYet => {
-                                    info!("Patchwork check ID {} not ready yet: {}", entry.id, e);
+                                    debug!("Patchwork check ID {} not ready yet: {}", entry.id, e);
                                 }
                                 crate::patchwork::PatchworkCheckError::Api(_) => {
                                     error!("Patchwork check failed for ID {}: {}", entry.id, e);
                                 }
                             }
                             if entry.retry_count + 1 >= self.max_retries as i64 {
+                                crate::metrics::inc_outbox_event(
+                                    crate::metrics::OutboxChannel::Patchwork,
+                                    crate::metrics::OutboxOutcome::Failed,
+                                );
                                 if let Err(db_err) = self
                                     .db
                                     .mark_patchwork_failed(entry.id, &e.to_string())

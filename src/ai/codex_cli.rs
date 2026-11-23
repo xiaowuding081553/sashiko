@@ -19,13 +19,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use super::claude_cli::{build_prompt, log_and_redact_stderr, parse_inner_response};
+use super::claude_cli::log_and_redact_stderr;
+use super::cli_common::{
+    IDLE_TIMEOUT, build_prompt, parse_inner_response, spawn_cli, write_prompt_and_wait,
+};
 use crate::ai::{
     AiProvider, AiRequest, AiResponse, AiUsage, ProviderCapabilities, cache_identity_with,
 };
@@ -64,24 +64,19 @@ impl AiProvider for CodexCliProvider {
             args.push(format!("model_reasoning_effort={effort}"));
         }
 
-        let mut child = Command::new("codex")
+        let mut command = Command::new("codex");
+        command
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
+            .stderr(Stdio::piped());
+
+        let child = spawn_cli(&mut command)
             .map_err(|e| anyhow::anyhow!("Failed to spawn codex CLI: {}. Is it installed?", e))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(prompt.as_bytes()).await?;
-            stdin.flush().await?;
-        }
-
-        let output = timeout(Duration::from_secs(600), child.wait_with_output())
+        let output = write_prompt_and_wait("codex-cli", child, prompt, IDLE_TIMEOUT)
             .await
-            .map_err(|_| anyhow::anyhow!("codex CLI timed out after 10 minutes"))?
-            .map_err(|e| anyhow::anyhow!("codex CLI wait error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("codex CLI {}", e))?;
 
         let stderr = log_and_redact_stderr("codex-cli", &output.stderr);
 
@@ -107,10 +102,10 @@ impl AiProvider for CodexCliProvider {
         let raw = String::from_utf8_lossy(&output.stdout);
 
         // Codex outputs line-delimited JSON events:
-        //   {"type": "item.completed", "item": {"text": "..."}}
+        //   {"type": "item.completed", "item": {"type": "agent_message", "text": "..."}}
         //   {"type": "turn.completed", "usage": {"input_tokens": N, "output_tokens": N}}
         //   {"type": "error", "message": "..."}
-        let mut text_parts = Vec::new();
+        let mut final_message: Option<String> = None;
         let mut usage: Option<AiUsage> = None;
 
         for line in raw.lines() {
@@ -124,8 +119,11 @@ impl AiProvider for CodexCliProvider {
                 }
                 match event["type"].as_str() {
                     Some("item.completed") => {
-                        if let Some(text) = event["item"]["text"].as_str() {
-                            text_parts.push(text.to_string());
+                        // Earlier messages are commentary between codex's own
+                        // tool runs, and reasoning items carry text too. Only
+                        // the last message is the answer.
+                        if let Some(text) = agent_message_text(&event) {
+                            final_message = Some(text.to_string());
                         }
                     }
                     Some("turn.completed") => {
@@ -147,14 +145,13 @@ impl AiProvider for CodexCliProvider {
             }
         }
 
-        let response_text = text_parts.join("\n");
-        if response_text.is_empty() {
+        let Some(response_text) = final_message.filter(|t| !t.is_empty()) else {
             // Fall back to raw output if no events parsed
-            warn!("codex-cli: no item.completed events found, using raw output");
-            return parse_inner_response(&raw, usage);
-        }
+            warn!("codex-cli: no agent_message events found, using raw output");
+            return parse_inner_response("codex-cli", &raw, usage);
+        };
 
-        parse_inner_response(&response_text, usage)
+        parse_inner_response("codex-cli", &response_text, usage)
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -186,6 +183,13 @@ impl CodexCliProvider {
         }
         Ok(())
     }
+}
+
+fn agent_message_text(event: &Value) -> Option<&str> {
+    let item = &event["item"];
+    (item["type"] == "agent_message")
+        .then(|| item["text"].as_str())
+        .flatten()
 }
 
 /// Returns the explanation an error event carries. A rejected invocation
@@ -330,6 +334,20 @@ mod tests {
         assert!(!err.contains("sk-secret"));
         assert!(!err.contains("tok-123"));
         assert!(!err.contains("user:pass"));
+    }
+
+    #[test]
+    fn only_agent_messages_carry_the_answer() {
+        let message: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"agent_message","text":"answer"}}"#,
+        )
+        .unwrap();
+        let reasoning: Value = serde_json::from_str(
+            r#"{"type":"item.completed","item":{"type":"reasoning","text":"thinking"}}"#,
+        )
+        .unwrap();
+        assert_eq!(agent_message_text(&message), Some("answer"));
+        assert_eq!(agent_message_text(&reasoning), None);
     }
 
     #[test]
